@@ -317,6 +317,10 @@ struct server_slot {
             return 0;
         }
 
+        if (common_sampler_grammar_is_active(smpl.get())) {
+            return 0;
+        }
+
         const int n_draft_min = common_speculative_n_min(spec.get(), task->params.speculative);
 
         // determine the max draft that fits the current slot state

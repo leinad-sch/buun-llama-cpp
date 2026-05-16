@@ -1499,9 +1499,31 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
 
     // partial offload: if any recurrent layer's state lives on CPU, fall back to CPU replay
     // (GPU graph uses DeviceToDevice copies that crash when the state buffer is host memory)
-    for (int li = 0; li < (int) rec_ids.size(); ++li) {
-        ggml_tensor * s_tensor = mem_recurrent->s_l[rec_ids[li]];
-        if (s_tensor && s_tensor->buffer && ggml_backend_buffer_is_host(s_tensor->buffer)) {
+    // Also detect multi-device splits — if states span GPUs, fall back to CPU replay.
+    {
+        ggml_backend_dev_t first_dev = nullptr;
+        bool has_host = false;
+        bool multi_device = false;
+        for (int li = 0; li < (int) rec_ids.size(); ++li) {
+            ggml_tensor * s_tensor = mem_recurrent->s_l[rec_ids[li]];
+            if (s_tensor && s_tensor->buffer && ggml_backend_buffer_is_host(s_tensor->buffer)) {
+                has_host = true;
+                break;
+            }
+            if (s_tensor && s_tensor->buffer) {
+                auto * buft = ggml_backend_buffer_get_type(s_tensor->buffer);
+                auto * dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+                if (dev) {
+                    if (!first_dev) {
+                        first_dev = dev;
+                    } else if (dev != first_dev) {
+                        multi_device = true;
+                    }
+                }
+            }
+        }
+        if (has_host || multi_device) {
+            // TODO: per-device GPU replay — build separate graphs per device instead of full CPU fallback
             tape_replay_cpu(mem_recurrent, cell_idx, n_accepted);
             return;
         }

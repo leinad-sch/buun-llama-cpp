@@ -1611,6 +1611,10 @@ extern "C" {
     // Returns the seed used by the sampler if applicable, LLAMA_DEFAULT_SEED otherwise
     LLAMA_API uint32_t llama_sampler_get_seed(const struct llama_sampler * smpl);
 
+    // Returns true if a grammar sampler is actively constraining output
+    // For lazy grammars, returns false until the trigger has fired
+    LLAMA_API bool llama_sampler_grammar_is_constraining(const struct llama_sampler * smpl);
+
     /// @details Sample and accept a token from the idx-th output of the last evaluation
     //
     // Shorthand for:

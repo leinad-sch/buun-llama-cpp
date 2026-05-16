@@ -672,6 +672,16 @@ uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {
     return llama_sampler_get_seed(gsmpl->chain);
 }
 
+bool common_sampler_grammar_is_active(const struct common_sampler * gsmpl) {
+    if (!gsmpl || !gsmpl->grmr) {
+        return false;
+    }
+    if (!grammar_should_apply(const_cast<common_sampler *>(gsmpl))) {
+        return false;
+    }
+    return llama_sampler_grammar_is_constraining(gsmpl->grmr);
+}
+
 // helpers
 
 llama_token_data_array * common_sampler_get_candidates(struct common_sampler * gsmpl, bool do_sort) {

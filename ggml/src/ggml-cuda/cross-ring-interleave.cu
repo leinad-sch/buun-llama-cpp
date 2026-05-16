@@ -179,10 +179,21 @@ extern "C" const float * dflash_cross_ring_gpu_interleave(
 }
 
 // D2D copy: from device source to device destination (raw pointers).
-// No sync needed — the drafter's graph execution orders against this on the same stream.
+// Uses peer copy when source and destination are on different devices.
 extern "C" void dflash_cross_ring_gpu_set_tensor(
         void * d_dst, const void * d_src, size_t offset, size_t size) {
     if (!d_dst || !d_src || size == 0) return;
-    cudaMemcpyAsync((char *)d_dst + offset, d_src, size,
-                     cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+
+    cudaPointerAttributes dst_attr, src_attr;
+    cudaPointerGetAttributes(&dst_attr, (const char *)d_dst + offset);
+    cudaPointerGetAttributes(&src_attr, d_src);
+
+    if (dst_attr.type == cudaMemoryTypeDevice && src_attr.type == cudaMemoryTypeDevice
+            && dst_attr.device != src_attr.device) {
+        cudaMemcpyPeerAsync((char *)d_dst + offset, dst_attr.device,
+                            d_src, src_attr.device, size, cudaStreamPerThread);
+    } else {
+        cudaMemcpyAsync((char *)d_dst + offset, d_src, size,
+                         cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+    }
 }

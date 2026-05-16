@@ -8,6 +8,7 @@
 #include <cuda_fp16.h>
 #endif
 #include "ggml-common.h"
+#include <mutex>
 
 // === InnerQ per-channel equalization ===
 // Scale K channels before L2 norm + FWHT to reduce quantization error on anisotropic distributions.
@@ -45,6 +46,8 @@ static float * h_extract_gpu_buf = nullptr;
 static int   * h_extract_gpu_pos = nullptr;
 static int     h_extract_max = 0;
 static int     h_extract_state = 0;  // 0=uninit, 1=collecting, 2=done
+static std::once_flag h_extract_init_flag;
+static std::mutex     h_extract_check_mutex;
 
 static void turbo_extract_init(int max_samples) {
 	int cur_device;
@@ -60,6 +63,9 @@ static void turbo_extract_init(int max_samples) {
 		cudaMemcpyToSymbol(d_extract_buf_ptr, &h_extract_gpu_buf, sizeof(float *));
 		cudaMemcpyToSymbol(d_extract_pos_ptr, &h_extract_gpu_pos, sizeof(int *));
 		cudaMemcpyToSymbol(d_extract_max_val, &max_samples, sizeof(int));
+		if (id != cur_device) {
+			cudaDeviceEnablePeerAccess(cur_device, 0);
+		}
 	}
 	cudaSetDevice(cur_device);
 	h_extract_max = max_samples;

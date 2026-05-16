@@ -647,17 +647,22 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
 
-    // Post-rotation extraction: one-time init
+    // Post-rotation extraction: thread-safe one-time init
     if (h_extract_state == 0 && (dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO3_TCQ || dst->type == GGML_TYPE_TURBO2_TCQ)) {
-        static const char * env = getenv("TURBO_EXTRACT");
-        if (env && atoi(env) > 0) {
-            turbo_extract_init(atoi(env));
-        } else {
-            h_extract_state = -1;
-        }
+        std::call_once(h_extract_init_flag, []() {
+            const char * env = getenv("TURBO_EXTRACT");
+            if (env && atoi(env) > 0) {
+                turbo_extract_init(atoi(env));
+            } else {
+                h_extract_state = -1;
+            }
+        });
     }
     // Check if extraction buffer is full
-    if (h_extract_state == 1) turbo_extract_check_done();
+    if (h_extract_state == 1) {
+        std::lock_guard<std::mutex> lock(h_extract_check_mutex);
+        turbo_extract_check_done();
+    }
 
     // InnerQ: one-time init on first turbo SET_ROWS call
     if (innerq_state == 0 && (dst->type == GGML_TYPE_TURBO2_0 || dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO3_TCQ || dst->type == GGML_TYPE_TURBO2_TCQ)) {
