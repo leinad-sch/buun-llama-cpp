@@ -194,6 +194,7 @@ struct server_slot {
 
     // Hybrid model: recurrent state backup for speculative decoding
     bool has_draft_backup = false;
+    llama_seq_id seq_id_backup = -1;
     int  n_tokens_before_draft = 0; // prompt token count before draft tokens were added
 
     void reset() {
@@ -222,6 +223,7 @@ struct server_slot {
         n_draft_total = 0;
         n_draft_accepted = 0;
         has_draft_backup = false;
+        seq_id_backup = -1;
         n_tokens_before_draft = 0;
 
         task_prev = std::move(task);
@@ -421,6 +423,11 @@ struct server_slot {
             t_token_generation = (ggml_time_us() - t_start_generation) / 1e3;
 
             state = SLOT_STATE_IDLE;
+
+            // clean up speculative backup sequence to avoid orphaned KV cells
+            if (has_draft_backup && seq_id_backup >= 0) {
+                llama_memory_seq_rm(llama_get_memory(ctx), seq_id_backup, -1, -1);
+            }
 
             // do not keep context of the child slots - the parent's context is enough
             if (task->is_child()) {
@@ -2031,9 +2038,29 @@ private:
                             SRV_ERR("failed to launch slot with parent task, id_task = %d\n", id_task);
                             break; // drop the task
                         }
-                    } else if (!launch_slot_with_task(*slot, std::move(task))) {
-                        SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
-                        break; // drop the task
+                    } else {
+                        // Unified KV: check if launching this task would overflow the shared cell pool.
+                        // Use max(current, planned) since a just-launched slot hasn't filled yet.
+                        if (params_base.kv_unified && task.n_tokens() > 0) {
+                            int64_t cells_committed = 0;
+                            for (const auto & s : slots) {
+                                if (s.is_processing() && s.task) {
+                                    cells_committed += std::max((int64_t) s.prompt.n_tokens(), (int64_t) s.task->n_tokens());
+                                }
+                            }
+                            const int64_t cells_available = (int64_t) slot->n_ctx - cells_committed;
+                            if (cells_available < (int64_t) task.n_tokens()) {
+                                SRV_DBG("defer task %d: needs %d tokens but only %" PRId64 " cells available (%" PRId64 " committed by active slots)\n",
+                                        id_task, task.n_tokens(), cells_available, cells_committed);
+                                queue_tasks.defer(std::move(task));
+                                break;
+                            }
+                        }
+
+                        if (!launch_slot_with_task(*slot, std::move(task))) {
+                            SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
+                            break; // drop the task
+                        }
                     }
 
                     if (params_base.cache_idle_slots) {
@@ -2498,6 +2525,7 @@ private:
                         llama_memory_seq_rm(mem, seq_backup, -1, -1);
                         llama_memory_seq_cp(mem, slot.id, seq_backup, -1, -1);
                         slot.has_draft_backup = true;
+                        slot.seq_id_backup = seq_backup;
                     }
 
                     // add all drafted tokens to the batch
@@ -3389,7 +3417,7 @@ private:
                 slot.prompt.tokens.insert(llama_tokens(ids.begin(), ids.end() - 1));
 
                 if (slot.has_draft_backup) {
-                    const llama_seq_id seq_backup = slot.id + n_parallel_user;
+                    const llama_seq_id seq_backup = slot.seq_id_backup;
                     const bool all_accepted = (ids.size() == n_draft + 1);
 
                     if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
@@ -3433,6 +3461,7 @@ private:
                     }
 
                     slot.has_draft_backup = false;
+                    slot.seq_id_backup = -1;
                 } else {
                     llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
                 }
