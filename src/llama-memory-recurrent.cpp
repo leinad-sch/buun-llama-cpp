@@ -520,12 +520,12 @@ bool llama_memory_recurrent::resize(uint32_t new_mem_size) {
         }
 
         if (old_r_l[i]) {
-            ggml_tensor * r = ggml_new_tensor_1d(ctx, old_r_l[i]->type, hparams.n_embd_r() * new_mem_size);
+            ggml_tensor * r = ggml_new_tensor_2d(ctx, old_r_l[i]->type, hparams.n_embd_r(), new_mem_size);
             ggml_format_name(r, "cache_r_l%d", i);
             r_l[i] = r;
         }
         if (old_s_l[i]) {
-            ggml_tensor * s = ggml_new_tensor_1d(ctx, old_s_l[i]->type, hparams.n_embd_s() * new_mem_size);
+            ggml_tensor * s = ggml_new_tensor_2d(ctx, old_s_l[i]->type, hparams.n_embd_s(), new_mem_size);
             ggml_format_name(s, "cache_s_l%d", i);
             s_l[i] = s;
         }
