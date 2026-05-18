@@ -406,6 +406,11 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_Q5_0,
     GGML_TYPE_Q5_1,
+    GGML_TYPE_TURBO2_0,
+    GGML_TYPE_TURBO3_0,
+    GGML_TYPE_TURBO4_0,
+    GGML_TYPE_TURBO3_TCQ,
+    GGML_TYPE_TURBO2_TCQ,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
@@ -938,6 +943,48 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             exit(0);
         }
         params.lr.init();
+
+        // DFlash-safe defaults. The drafter's block_size=16 / internal max
+        // batch=64 means it only needs a tiny graph, and multi-slot target
+        // activation memory scales as n_ubatch * n_parallel — stock ub=512
+        // with np=auto=4 OOMs a 24 GB GPU. So cap to keep first-run users
+        // from hitting OOM. The tradeoff: target prefill is ~30% slower at
+        // ub=64 vs ub=512. Users who want faster prefill pass -ub explicitly
+        // (and can also pass -b to keep -b >= -ub).
+        // We scan argv instead of comparing to params_org because the stock
+        // default is 2048 — a user passing `-b 2048` to lift the cap would
+        // look identical to not passing anything with a naive value check.
+        if (params.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+            auto arg_passed = [argc, argv](std::initializer_list<const char *> names) {
+                for (int i = 1; i < argc; ++i) {
+                    for (const char * n : names) {
+                        if (strcmp(argv[i], n) == 0) return true;
+                    }
+                }
+                return false;
+            };
+            const bool b_passed   = arg_passed({"-b", "--batch-size"});
+            const bool ub_passed  = arg_passed({"-ub", "--ubatch-size"});
+            const bool cd_passed  = arg_passed({"-cd", "--ctx-size-draft"});
+
+            if (!cd_passed && params.speculative.draft.n_ctx == 0) {
+                LOG_INF("dflash: setting -cd to 256 (drafter doesn't need the full main ctx; pass -cd N to override)\n");
+                params.speculative.draft.n_ctx = 256;
+            }
+            bool capped = false;
+            if (!b_passed && params.n_batch > 256) {
+                params.n_batch = 256;
+                capped = true;
+            }
+            if (!ub_passed && params.n_ubatch > 64) {
+                params.n_ubatch = 64;
+                capped = true;
+            }
+            if (capped) {
+                LOG_INF("dflash: capped -b/-ub to 256/64 for OOM safety. "
+                        "Pass -ub 512 -b 2048 for ~30%% faster prompt prefill at +2-3 GB VRAM.\n");
+            }
+        }
     } catch (const std::invalid_argument & ex) {
         fprintf(stderr, "%s\n", ex.what());
         ctx_arg.params = params_org;
@@ -1386,6 +1433,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                                    string_format("error: unknown value for --flash-attn: '%s'\n", value.c_str()));
                            }
                        }).set_env("LLAMA_ARG_FLASH_ATTN"));
+    add_opt(common_arg(
+        {"--no-fused-gdn"},
+        "disable fused Gated Delta Net kernels (use decomposed ops instead)",
+        [](common_params & params) {
+            params.no_fused_gdn = true;
+        }
+    ));
     add_opt(common_arg(
         {"-p", "--prompt"}, "PROMPT",
         "prompt to start generation with; for system message, use -sys",
@@ -3500,6 +3554,41 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--draft", "--draft-n", "--draft-max"}, "N",
+        string_format("number of tokens to draft for speculative decoding (default: %d)", params.speculative.n_max),
+        [](common_params & params, int value) {
+            params.speculative.n_max = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_DRAFT_MAX"));
+    add_opt(common_arg(
+        {"--draft-min", "--draft-n-min"}, "N",
+        string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.n_min),
+        [](common_params & params, int value) {
+            params.speculative.n_min = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_DRAFT_MIN"));
+    add_opt(common_arg(
+        {"--tree-budget"}, "N",
+        string_format("DDTree node budget for tree verification (default: %d, 0 = flat)", params.speculative.tree_budget),
+        [](common_params & params, int value) {
+            params.speculative.tree_budget = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE}).set_env("LLAMA_ARG_TREE_BUDGET"));
+    add_opt(common_arg(
+        {"--dflash-max-slots"}, "N",
+        string_format("max concurrent server slots with DFlash state; higher slots fall back to non-speculative decode (default: %d)", params.speculative.dflash_max_slots),
+        [](common_params & params, int value) {
+            params.speculative.dflash_max_slots = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_SPECULATIVE}).set_env("LLAMA_ARG_DFLASH_MAX_SLOTS"));
+    add_opt(common_arg(
+        {"--draft-topk"}, "N",
+        string_format("top-K candidates per drafter position for tree branching (default: %d)", params.speculative.draft_topk),
+        [](common_params & params, int value) {
+            params.speculative.draft_topk = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE}).set_env("LLAMA_ARG_DRAFT_TOPK"));
+    add_opt(common_arg(
         {"--spec-draft-type-k", "-ctkd", "--cache-type-k-draft"}, "TYPE",
         string_format(
             "KV cache data type for K for the draft model\n"
@@ -3580,6 +3669,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("minimum speculative decoding probability (greedy) (default: %.2f)", (double)params.speculative.draft.p_min),
         [](common_params & params, const std::string & value) {
             params.speculative.draft.p_min = std::stof(value);
+            params.speculative.p_min       = std::stof(value);
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN"));
     add_opt(common_arg(
@@ -3617,6 +3707,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.mparams.path = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MODEL"));
+    add_opt(common_arg(
+        {"--spec-draft-replace", "--spec-replace"}, "TARGET", "DRAFT",
+        "translate the string in TARGET into DRAFT if the draft model and main model are not compatible",
+        [](common_params & params, const std::string & tgt, const std::string & dft) {
+            params.speculative.draft.replacements.push_back({ tgt, dft });
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--spec-type"}, common_speculative_all_types_str(),
         string_format("comma-separated list of types of speculative decoding to use (default: %s)\n",
@@ -3757,16 +3854,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
 
     add_opt(common_arg(
         {"--draft", "--draft-n", "--draft-max"}, "N",
-        "the argument has been removed. use --spec-draft-n-max or --spec-ngram-mod-n-max",
-        [](common_params & /*params*/, int /*value*/) {
-            arg_removed("use --spec-draft-n-max or --spec-ngram-mod-n-max");
+        string_format("(compat alias for --spec-draft-n-max) max draft tokens (default: %d)", params.speculative.draft.n_max),
+        [](common_params & params, int value) {
+            params.speculative.draft.n_max = value;
+            params.speculative.n_max       = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_DRAFT_MAX"));
     add_opt(common_arg(
         {"--draft-min", "--draft-n-min"}, "N",
-        "the argument has been removed. use --spec-draft-n-min or --spec-ngram-mod-n-min",
-        [](common_params & /*params*/, int /*value*/) {
-            arg_removed("use --spec-draft-n-min or --spec-ngram-mod-n-min");
+        string_format("(compat alias for --spec-draft-n-min) min draft tokens (default: %d)", params.speculative.draft.n_min),
+        [](common_params & params, int value) {
+            params.speculative.draft.n_min = value;
+            params.speculative.n_min       = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_DRAFT_MIN"));
     add_opt(common_arg(
@@ -4119,6 +4218,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.ngram_mod.n_max = 64;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--spec-dflash-default"},
+        string_format("enable default DFlash speculative decoding config (requires -md)"),
+        [](common_params & params) {
+            params.speculative.type = COMMON_SPECULATIVE_TYPE_DFLASH;
+            params.speculative.p_min = 0.0f;
+            params.speculative.n_max = 7;
+            params.speculative.n_min = 0;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SPECULATIVE}));
 
     return ctx_arg;
 }

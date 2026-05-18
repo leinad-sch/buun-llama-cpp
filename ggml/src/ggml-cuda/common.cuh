@@ -407,11 +407,11 @@ struct ggml_cuda_unroll<1> {
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ int warp_reduce_sum(int x) {
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
-    return __reduce_add_sync(0xffffffff, x);
+    return __reduce_add_sync(0xFFFFFFFFULL, x);
 #else
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
-        x += __shfl_xor_sync(0xffffffff, x, offset, width);
+        x += __shfl_xor_sync(0xFFFFFFFFULL, x, offset, width);
     }
     return x;
 #endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
@@ -421,7 +421,7 @@ template<int width = WARP_SIZE>
 static __device__ __forceinline__ float warp_reduce_sum(float x) {
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
-        x += __shfl_xor_sync(0xffffffff, x, offset, width);
+        x += __shfl_xor_sync(0xFFFFFFFFULL, x, offset, width);
     }
     return x;
 }
@@ -430,8 +430,8 @@ template<int width = WARP_SIZE>
 static __device__ __forceinline__ float2 warp_reduce_sum(float2 a) {
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
-        a.x += __shfl_xor_sync(0xffffffff, a.x, offset, width);
-        a.y += __shfl_xor_sync(0xffffffff, a.y, offset, width);
+        a.x += __shfl_xor_sync(0xFFFFFFFFULL, a.x, offset, width);
+        a.y += __shfl_xor_sync(0xFFFFFFFFULL, a.y, offset, width);
     }
     return a;
 }
@@ -441,7 +441,7 @@ static __device__ __forceinline__ half2 warp_reduce_sum(half2 a) {
 #ifdef FP16_AVAILABLE
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
-        a = __hadd2(a, __shfl_xor_sync(0xffffffff, a, offset, width));
+        a = __hadd2(a, __shfl_xor_sync(0xFFFFFFFFULL, a, offset, width));
     }
     return a;
 
@@ -454,11 +454,11 @@ static __device__ __forceinline__ half2 warp_reduce_sum(half2 a) {
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ int warp_reduce_all(int x) {
     if (width == ggml_cuda_get_physical_warp_size()) {
-        return __all_sync(0xffffffff, x);
+        return __all_sync(0xFFFFFFFFULL, x);
     } else {
 #pragma unroll
         for (int offset = width/2; offset > 0; offset >>= 1) {
-            x = __shfl_xor_sync(0xffffffff, x, offset, width) && x;
+            x = __shfl_xor_sync(0xFFFFFFFFULL, x, offset, width) && x;
         }
         return x;
     }
@@ -467,11 +467,11 @@ static __device__ __forceinline__ int warp_reduce_all(int x) {
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ int warp_reduce_any(int x) {
     if (width == ggml_cuda_get_physical_warp_size()) {
-        return __any_sync(0xffffffff, x);
+        return __any_sync(0xFFFFFFFFULL, x);
     } else {
 #pragma unroll
         for (int offset = width/2; offset > 0; offset >>= 1) {
-            x = __shfl_xor_sync(0xffffffff, x, offset, width) || x;
+            x = __shfl_xor_sync(0xFFFFFFFFULL, x, offset, width) || x;
         }
         return x;
     }
@@ -481,7 +481,7 @@ template<int width = WARP_SIZE>
 static __device__ __forceinline__ float warp_reduce_max(float x) {
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
-        x = fmaxf(x, __shfl_xor_sync(0xffffffff, x, offset, width));
+        x = fmaxf(x, __shfl_xor_sync(0xFFFFFFFFULL, x, offset, width));
     }
     return x;
 }
@@ -491,7 +491,7 @@ static __device__ __forceinline__ T warp_prefix_inclusive_sum(T x) {
     const int lane_id = threadIdx.x % width;
 #pragma unroll
     for (int offset = 1; offset < width; offset <<= 1) {
-        const T t = __shfl_up_sync(0xffffffff, x, offset, width);
+        const T t = __shfl_up_sync(0xFFFFFFFFULL, x, offset, width);
         if (lane_id >= offset) {
             x += t;
         }
@@ -504,8 +504,8 @@ static __device__ __forceinline__ float2 warp_prefix_inclusive_sum(float2 a) {
     const int lane_id = threadIdx.x % width;
 #pragma unroll
     for (int offset = 1; offset < width; offset <<= 1) {
-        const float t_x = __shfl_up_sync(0xffffffff, a.x, offset, width);
-        const float t_y = __shfl_up_sync(0xffffffff, a.y, offset, width);
+        const float t_x = __shfl_up_sync(0xFFFFFFFFULL, a.x, offset, width);
+        const float t_y = __shfl_up_sync(0xFFFFFFFFULL, a.y, offset, width);
         if (lane_id >= offset) {
             a.x += t_x;
             a.y += t_y;
@@ -520,7 +520,7 @@ static __device__ __forceinline__ half2 warp_prefix_inclusive_sum(half2 a) {
     const int lane_id = threadIdx.x % width;
 #pragma unroll
     for (int offset = 1; offset < width; offset <<= 1) {
-        const half2 t = __shfl_up_sync(0xffffffff, a, offset, width);
+        const half2 t = __shfl_up_sync(0xFFFFFFFFULL, a, offset, width);
         if (lane_id >= offset) {
             a = __hadd2(a, t);
         }
@@ -647,7 +647,7 @@ static __device__ __forceinline__ half2 warp_reduce_max(half2 x) {
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL || defined(GGML_USE_HIP)
 #pragma unroll
    for (int offset = width/2; offset > 0; offset >>= 1) {
-       x = ggml_cuda_hmax2(x, __shfl_xor_sync(0xffffffff, x, offset, width));
+       x = ggml_cuda_hmax2(x, __shfl_xor_sync(0xFFFFFFFFULL, x, offset, width));
    }
    return x;
 #else

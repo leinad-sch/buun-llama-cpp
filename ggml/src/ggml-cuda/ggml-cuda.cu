@@ -63,6 +63,7 @@
 #include "ggml-cuda/tri.cuh"
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
+#include "ggml-cuda/turbo-wht.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -1644,6 +1645,16 @@ static void ggml_cuda_op_mul_mat_cublas(
     // ldc == nrows of the matrix that cuBLAS writes into
     int64_t ldc = id == ctx.device ? ne0 : row_diff;
 
+    // Guard: cuBLAS requires m >= 1, n >= 1, k >= 1 for Sgemm/GemmEx.
+    // During speculative decoding (DFlash/copyspec), draft verification can
+    // produce non-consecutive token positions which result in zero-size
+    // sub-matrices. cuBLAS treats these as invalid parameters and aborts
+    // with CUBLAS_STATUS_INVALID_VALUE. Zero-size GEMMs are defined as
+    // no-ops (no output written), matching OpenBLAS and MKL behavior.
+    if (row_diff == 0 || src1_ncols == 0 || ne10 == 0 || ne00 == 0 || ldc == 0) {
+        return;
+    }
+
     const int cc = ggml_cuda_info().devices[id].cc;
 
     const bool supports_bf16 = GGML_CUDA_CC_IS_NVIDIA(cc) || GGML_CUDA_CC_IS_AMD(cc) ||
@@ -3086,6 +3097,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_GATED_DELTA_NET:
             ggml_cuda_op_gated_delta_net(ctx, dst);
             break;
+        case GGML_OP_GATED_DELTA_NET_TREE:
+            ggml_cuda_op_gated_delta_net_tree(ctx, dst);
+            break;
+        case GGML_OP_SSM_CONV_TREE:
+            ggml_cuda_op_ssm_conv_tree(ctx, dst);
+            break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
             break;
@@ -3100,6 +3117,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_SOLVE_TRI:
             ggml_cuda_op_solve_tri(ctx, dst);
+            break;
+        case GGML_OP_TURBO_WHT:
+            ggml_cuda_op_turbo_wht(ctx, dst);
             break;
         case GGML_OP_FILL:
             ggml_cuda_op_fill(ctx, dst);
@@ -3298,6 +3318,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     }
 
     graph->uid = cgraph->uid;
+
 
     // Check if the graph size has changed
     if ((int)graph->node_props.size() != cgraph->n_nodes) {
@@ -3671,10 +3692,12 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
             add = cgraph->nodes[node_idx+2];
         }
 
-        GGML_ASSERT(rms_norm->src[0]->type == GGML_TYPE_F32);
-        GGML_ASSERT(rms_norm->type == GGML_TYPE_F32);
+        // fused rms_norm+mul only supports F32
+        if (rms_norm->src[0]->type != GGML_TYPE_F32 ||
+            rms_norm->type != GGML_TYPE_F32) {
+            return false;
+        }
 
-        //rms norm only supports F32
         if (mul->src[0]->type != GGML_TYPE_F32 ||
             mul->src[1]->type != GGML_TYPE_F32 ||
             mul->type != GGML_TYPE_F32) {
@@ -4220,6 +4243,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -4513,6 +4537,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+    ggml_cuda_set_device(cuda_ctx->device);
     CUDA_CHECK(cudaEventRecord((cudaEvent_t)event->context, cuda_ctx->stream()));
 }
 
@@ -4520,6 +4545,10 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     if (ggml_backend_is_cuda(backend)) {
+        // ROCm requires current device to match the stream's device for hipStreamWaitEvent.
+        // In pipeline-parallel multi-GPU, the scheduler alternates between devices and may
+        // call event_wait with a stale current device from the previous split.
+        ggml_cuda_set_device(cuda_ctx->device);
         CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), (cudaEvent_t)event->context, 0));
     } else {
 #if 0
@@ -5180,6 +5209,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
+                    case GGML_TYPE_TURBO2_0:
+                    case GGML_TYPE_TURBO3_0:
+                    case GGML_TYPE_TURBO4_0:
+                    case GGML_TYPE_TURBO3_TCQ:
+                    case GGML_TYPE_TURBO2_TCQ:
                         return true;
                     default:
                         return false;
@@ -5193,7 +5227,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             {
                 return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
                        op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
-                       op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL) &&
+                       op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL ||
+                       op->type == GGML_TYPE_TURBO2_0 || op->type == GGML_TYPE_TURBO3_0 || op->type == GGML_TYPE_TURBO4_0 ||
+                       op->type == GGML_TYPE_TURBO3_TCQ ||
+                       op->type == GGML_TYPE_TURBO2_TCQ) &&
                        op->src[0]->type == GGML_TYPE_F32 &&
                        (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
             } break;
@@ -5338,6 +5375,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             // assumes d_inner % threads == 0
             return op->src[0]->ne[1] % 128 == 0;
         }
+        case GGML_OP_SSM_CONV_TREE: {
+            return op->src[0]->ne[1] % 128 == 0;
+        }
         case GGML_OP_CONT:
             return true;
         case GGML_OP_DIAG_MASK_INF:
@@ -5394,6 +5434,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_RWKV_WKV7:
             return true;
         case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_GATED_DELTA_NET_TREE:
             //TODO: enable once MUSA compiler is solved https://github.com/ggml-org/llama.cpp/pull/19504#issuecomment-4018634327
 #ifdef GGML_USE_MUSA
             return false;
@@ -5411,6 +5452,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_TRI:
         case GGML_OP_DIAG:
         case GGML_OP_SOLVE_TRI:
+        case GGML_OP_TURBO_WHT:
             return true;
 
         default:
@@ -5576,6 +5618,13 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// DFlash GPU cross-attention ring (cross-ring-interleave.cu)
+extern "C" void * dflash_cross_ring_gpu_alloc(int, int, int);
+extern "C" void   dflash_cross_ring_gpu_free(void *);
+extern "C" void   dflash_cross_ring_gpu_write(void *, int, int, const float *, int, int);
+extern "C" const float * dflash_cross_ring_gpu_interleave(void *, int, int, int);
+extern "C" void   dflash_cross_ring_gpu_set_tensor(void *, const void *, size_t, size_t);
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -5598,6 +5647,21 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "dflash_cross_ring_gpu_alloc") == 0) {
+        return (void *)dflash_cross_ring_gpu_alloc;
+    }
+    if (strcmp(name, "dflash_cross_ring_gpu_free") == 0) {
+        return (void *)dflash_cross_ring_gpu_free;
+    }
+    if (strcmp(name, "dflash_cross_ring_gpu_write") == 0) {
+        return (void *)dflash_cross_ring_gpu_write;
+    }
+    if (strcmp(name, "dflash_cross_ring_gpu_interleave") == 0) {
+        return (void *)dflash_cross_ring_gpu_interleave;
+    }
+    if (strcmp(name, "dflash_cross_ring_gpu_set_tensor") == 0) {
+        return (void *)dflash_cross_ring_gpu_set_tensor;
     }
     return nullptr;
 }

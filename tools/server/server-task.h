@@ -570,6 +570,31 @@ struct server_prompt_data {
     }
 };
 
+struct server_prompt_checkpoint {
+    llama_pos pos_min;
+    llama_pos pos_max;
+
+    int64_t n_tokens;
+
+    std::vector<uint8_t> data;
+    std::vector<uint8_t> ring_data; // DFlash ring buffer state
+
+    size_t size() const {
+        return data.size() + ring_data.size();
+    }
+
+    bool empty() const {
+        return data.empty();
+    }
+
+    void clear() {
+        pos_min = 0;
+        pos_max = 0;
+        n_tokens = 0;
+        data.clear();
+    }
+};
+
 struct server_prompt {
     server_tokens tokens;
 

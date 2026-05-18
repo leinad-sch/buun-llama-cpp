@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 #include "llama-memory-recurrent.h"
+#include "ggml.h"
 
 // utility to get one slice from the third dimension
 // input dim:  [x, y, c, b]

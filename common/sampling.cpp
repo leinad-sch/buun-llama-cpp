@@ -279,7 +279,12 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
     // Feed generation prompt tokens to the grammar sampler so it advances past
     // tokens the template already placed in the prompt.
     // Only applies to output-format and tool-call grammars; user-supplied grammars must not be prefilled.
-    if (grmr && !params.grammar_lazy && common_grammar_needs_prefill(params.grammar)) {
+    // Skip prefill for OUTPUT_FORMAT when thinking mode is active — the JSON schema grammar
+    // cannot accept thinking tokens (<think>...) that the template prepends.
+    const bool skip_grammar_prefill =
+        params.grammar.type == COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT &&
+        !params.reasoning_budget_start.empty();
+    if (grmr && !params.grammar_lazy && common_grammar_needs_prefill(params.grammar) && !skip_grammar_prefill) {
         try {
             for (const auto & token : prefill_tokens) {
                 llama_sampler_accept(grmr, token);
@@ -292,8 +297,12 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         }
     }
 
-    // reasoning budget sampler (skip when budget is unlimited unless a lazy grammar is active, which needs rbudget for thinking-block suppression)
-    if (!params.reasoning_budget_start.empty() && !params.reasoning_budget_end.empty() && (params.grammar_lazy || params.reasoning_budget_tokens >= 0)) {
+    // reasoning budget sampler (skip when budget is unlimited unless a lazy grammar or OUTPUT_FORMAT grammar is active,
+    // which needs rbudget for thinking-block suppression so the grammar doesn't constrain reasoning tokens)
+    const bool need_rbudget_for_grammar =
+        params.grammar_lazy ||
+        (grmr && params.grammar.type == COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT);
+    if (!params.reasoning_budget_start.empty() && !params.reasoning_budget_end.empty() && (need_rbudget_for_grammar || params.reasoning_budget_tokens >= 0)) {
         rbudget = common_reasoning_budget_init(
             vocab,
             params.reasoning_budget_start,
@@ -430,9 +439,13 @@ static bool grammar_should_apply(struct common_sampler * gsmpl) {
     if (!gsmpl->rbudget) {
         return true;
     }
+    const auto state = common_reasoning_budget_get_state(gsmpl->rbudget);
     if (gsmpl->params.grammar_lazy) {
         // if grammar is lazy, only apply when reasoning budget is not active
-        const auto state = common_reasoning_budget_get_state(gsmpl->rbudget);
+        return state == REASONING_BUDGET_IDLE || state == REASONING_BUDGET_DONE;
+    }
+    // OUTPUT_FORMAT grammars: suppress during active thinking (grammar can't handle thinking tokens)
+    if (gsmpl->params.grammar.type == COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT) {
         return state == REASONING_BUDGET_IDLE || state == REASONING_BUDGET_DONE;
     }
     return true;
@@ -659,6 +672,16 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {
     return llama_sampler_get_seed(gsmpl->chain);
+}
+
+bool common_sampler_grammar_is_active(const struct common_sampler * gsmpl) {
+    if (!gsmpl || !gsmpl->grmr) {
+        return false;
+    }
+    if (!grammar_should_apply(const_cast<common_sampler *>(gsmpl))) {
+        return false;
+    }
+    return llama_sampler_grammar_is_constraining(gsmpl->grmr);
 }
 
 // helpers

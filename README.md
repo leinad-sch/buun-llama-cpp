@@ -1,34 +1,154 @@
-# llama.cpp
+# buun-llama-cpp
 
-![llama](https://user-images.githubusercontent.com/1991296/230134379-7181e485-c521-4d23-a0d6-f7b3b61ba524.png)
+![buunslamma](buunslamma.png)
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp)](https://github.com/ggml-org/llama.cpp/releases)
-[![Server](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
+> **This is a highly experimental fork of llama.cpp. Use at your own discretion.**
 
-[Manifesto](https://github.com/ggml-org/llama.cpp/discussions/205) / [ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md)
+A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) with **Trellis-Coded Quantization (TCQ)** for KV cache compression. 2-3x more context in the same VRAM, with quality that matches or beats FP16.
 
-LLM inference in C/C++
+**Paper**: [Closing the Gap: Trellis-Coded Quantization for KV Cache at 2-3 Bits](https://huggingface.co/datasets/spiritbuun/turboquant-tcq-kv-cache)
 
-## Recent API changes
+## What is TCQ?
 
-- [Changelog for `libllama` API](https://github.com/ggml-org/llama.cpp/issues/9289)
-- [Changelog for `llama-server` REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+Standard KV cache quantization treats each value independently. TCQ constrains quantization indices to follow a 512-state trellis, enabling a much larger effective codebook at the same bit rate. Combined with FWHT rotation and context-adaptive norm scaling, this achieves **10-44% KL-divergence reduction** over scalar quantization at 2-3 bits per value.
 
-## Hot topics
+At 3.25 bits per value, TCQ produces **lower perplexity than FP16** KV cache (5.802 vs 5.805).
 
-- **Hugging Face cache migration: models downloaded with `-hf` are now stored in the standard Hugging Face cache directory, enabling sharing with other HF tools.**
-- **[guide : using the new WebUI of llama.cpp](https://github.com/ggml-org/llama.cpp/discussions/16938)**
-- [guide : running gpt-oss with llama.cpp](https://github.com/ggml-org/llama.cpp/discussions/15396)
-- [[FEEDBACK] Better packaging for llama.cpp to support downstream consumers 🤗](https://github.com/ggml-org/llama.cpp/discussions/15313)
-- Support for the `gpt-oss` model with native MXFP4 format has been added | [PR](https://github.com/ggml-org/llama.cpp/pull/15091) | [Collaboration with NVIDIA](https://blogs.nvidia.com/blog/rtx-ai-garage-openai-oss) | [Comment](https://github.com/ggml-org/llama.cpp/discussions/15095)
-- Multimodal support arrived in `llama-server`: [#12898](https://github.com/ggml-org/llama.cpp/pull/12898) | [documentation](./docs/multimodal.md)
-- VS Code extension for FIM completions: https://github.com/ggml-org/llama.vscode
-- Vim/Neovim plugin for FIM completions: https://github.com/ggml-org/llama.vim
-- Hugging Face Inference Endpoints now support GGUF out of the box! https://github.com/ggml-org/llama.cpp/discussions/9669
-- Hugging Face GGUF editor: [discussion](https://github.com/ggml-org/llama.cpp/discussions/9268) | [tool](https://huggingface.co/spaces/CISCai/gguf-editor)
+## Build
 
-----
+### NVIDIA (CUDA)
+
+```sh
+cmake -B build \
+  -DGGML_CUDA=ON \
+  -DGGML_NATIVE=ON \
+  -DGGML_CUDA_FA=ON \
+  -DGGML_CUDA_FA_ALL_QUANTS=ON \
+  -DCMAKE_BUILD_TYPE=Release
+
+cmake --build build -j$(nproc)
+```
+
+### AMD (ROCm / HIP)
+
+Tested on ROCm 7.2 + RDNA3 (`gfx1100`, RX 7900 XTX). Other RDNA3/RDNA4 targets should work by swapping `AMDGPU_TARGETS`.
+
+```sh
+cmake -B build \
+  -DGGML_HIP=ON \
+  -DAMDGPU_TARGETS=gfx1100 \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLLAMA_BUILD_SERVER=ON \
+  -DCMAKE_C_COMPILER=/opt/rocm/bin/amdclang \
+  -DCMAKE_CXX_COMPILER=/opt/rocm/bin/amdclang++
+
+cmake --build build -j$(nproc)
+```
+
+#### [For Windows ROCM](https://github.com/lemonade-sdk/llamacpp-rocm/blob/main/docs/manual_instructions.md)
+Test on ROCm 7.13 + AMD Radeon AI PRO R9700
+
+## Recommended configurations
+
+### turbo4 (4.25 bpv) -- lossless quality, great compression
+
+The safe default. Virtually no quality loss vs FP16 with ~3.8x KV cache compression and no speed penalty.
+
+```sh
+./build/bin/llama-server -m model.gguf -ngl 99 -fa \
+  -ctk turbo4 -ctv turbo4
+```
+
+### 3-bit TCQ (3.25 bpv) -- best quality at 3-bit
+
+Beats FP16 quality at short context, stays within 2% at long context. ~5x KV cache compression.
+
+```sh
+./build/bin/llama-server -m model.gguf -ngl 99 -fa \
+  -ctk turbo3_tcq -ctv turbo3_tcq
+```
+
+### 2-bit TCQ (2.25 bpv) -- maximum compression
+
+~7x KV cache compression. Best for fitting very long contexts in limited VRAM.
+
+```sh
+./build/bin/llama-server -m model.gguf -ngl 99 -fa \
+  -ctk turbo2_tcq -ctv turbo2_tcq
+```
+
+### Asymmetric 2.75 bpv -- best 2-bit quality
+
+3-bit keys + 2-bit values. 15-17% lower KLD than the reverse, because adaptive alpha already compensates V quantization error.
+
+```sh
+./build/bin/llama-server -m model.gguf -ngl 99 -fa \
+  -ctk turbo3_tcq -ctv turbo2_tcq
+```
+
+### Scalar turbo3 / turbo2 (3.25 / 2.25 bpv) -- no trellis
+
+Scalar quantization without TCQ. Faster encode, worse quality than TCQ equivalents.
+
+```sh
+# 3-bit scalar
+./build/bin/llama-server -m model.gguf -ngl 99 -fa \
+  -ctk turbo3 -ctv turbo3
+
+# 2-bit scalar
+./build/bin/llama-server -m model.gguf -ngl 99 -fa \
+  -ctk turbo2 -ctv turbo2
+```
+
+## Quality (KL-divergence, Qwen3.5-27B Q6_K, RTX 3090)
+
+Lower is better. Measured against FP16 KV cache base logits.
+
+| Config | bpv | KLD @2K | KLD @7K |
+|--------|-----|---------|---------|
+| turbo3_tcq (symmetric) | 3.25 | 0.058 | 0.074 |
+| turbo3_tcq-K / turbo2_tcq-V | 2.75 | 0.078 | 0.101 |
+| turbo2_tcq (symmetric) | 2.25 | 0.101 | 0.136 |
+
+3-bit TCQ at 2K context achieves **lower perplexity than FP16** (5.802 vs 5.805) due to a mild regularizing effect from norm scaling.
+
+## Speed (Qwen3.5-27B Q6_K, RTX 3090)
+
+| Config | Decode (tg64) | vs q8_0 |
+|--------|---------------|---------|
+| q8_0 | 31.04 tok/s | -- |
+| turbo3_tcq | 30.04 tok/s | 97% |
+| turbo3 (scalar) | 30.04 tok/s | 97% |
+
+Decode speed is constant across context lengths (30 tok/s at 4K, 65K, and 128K). Prefill uses tensor-core MMA path at 99%+ of q8_0 speed.
+
+## Custom codebooks
+
+Trained codebooks are included in `codebooks/`. The defaults are compiled into the CUDA kernels, but you can override them:
+
+```sh
+TURBO_TCQ_CB=codebooks/3bit/product_aware_iter080.bin \
+TURBO_TCQ_CB2=codebooks/2bit/product_aware_iter090.bin \
+./build/bin/llama-server -m model.gguf -ngl 99 -fa \
+  -ctk turbo3_tcq -ctv turbo3_tcq
+```
+
+Codebook training scripts are in `scripts/tcq_train_*.py`.
+
+## How it works
+
+1. **FWHT rotation** with random sign flips converts correlated KV vectors into i.i.d. Gaussian entries
+2. **Viterbi encoding** on a 512-state (3-bit) or 256-state (2-bit) right-shift trellis finds the globally optimal codeword assignment
+3. **O(1) sliding-window decode** -- each value decodes via a bit window lookup, no trellis traversal at inference
+4. **Context-adaptive alpha** -- logarithmic norm scaling formula automatically adjusts dequantization scale per context length
+
+## Supported models
+
+Any GGUF model with `head_dim` that is a multiple of 128 works natively. Models with other head dimensions (e.g., Phi-3 at 96, Qwen3-0.6B at 64) are supported via automatic zero-padding.
+
+Tested on: Qwen3.5-27B, Qwen3-32B, Gemma-3-27B, Gemma-4-31B, Harmonic-Hermes-9B, Phi-3-mini, and others.
+
+---
 
 ## Quick start
 

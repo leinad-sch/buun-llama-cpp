@@ -166,6 +166,10 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_SUFFIX,        // model-free suffix tree speculative decoding
+    COMMON_SPECULATIVE_TYPE_COPYSPEC,      // model-free copy-from-context speculative decoding
+    COMMON_SPECULATIVE_TYPE_RECYCLE,       // model-free token recycling (adjacency matrix)
+    COMMON_SPECULATIVE_TYPE_DFLASH,        // DFlash block-diffusion speculative decoding
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
@@ -354,6 +358,33 @@ struct common_params_speculative {
 
     common_params_speculative_ngram_cache ngram_cache;
 
+    // DFlash-specific params (top-level for fork compat)
+    int32_t n_max        = 16; // maximum number of tokens to draft during speculative decoding
+    int32_t n_min        = 0;  // minimum number of draft tokens to use for speculative decoding
+    int32_t tree_budget  = 0;  // DDTree node budget (0 = flat DFlash, >0 = tree verification)
+    int32_t dflash_max_slots = 1; // max concurrent server slots that keep DFlash state
+    float   p_split = 0.1f;   // speculative decoding split probability
+    float   p_min   = 0.0f;   // minimum speculative decoding probability (0 = disabled)
+    float   sample_temp = 0.0f; // drafter sampling temperature (0 = greedy, >0 = Gumbel sampling)
+    int32_t draft_topk  = 1;   // top-K candidates per drafter position (1 = argmax only)
+
+    // DFlash draft model (separate from upstream's draft.model)
+    struct common_params_model mparams_dft;
+    llama_model * model_dft = nullptr;
+    llama_context_params cparams_dft;
+
+    // copyspec: copy from context
+    int32_t copyspec_gamma      = 6;    // window size for rolling hash match
+
+    // token recycling: adjacency matrix
+    int32_t recycle_k            = 8;    // top-k successors per token
+
+    // suffix tree speculative decoding
+    int32_t suffix_max_depth    = 64;   // maximum depth of suffix tree
+    float   suffix_spec_factor  = 2.0f; // max_spec = factor * match_len + offset
+    float   suffix_spec_offset  = 0.0f; // additive offset for max speculative tokens
+    float   suffix_min_prob     = 0.1f; // prune branches below this probability
+
     bool has_dft() const {
         return !draft.mparams.path.empty() || !draft.mparams.hf_repo.empty();
     }
@@ -467,6 +498,7 @@ struct common_params {
     enum llama_pooling_type      pooling_type      = LLAMA_POOLING_TYPE_UNSPECIFIED; // pooling type for embeddings
     enum llama_attention_type    attention_type    = LLAMA_ATTENTION_TYPE_UNSPECIFIED; // attention type for embeddings
     enum llama_flash_attn_type   flash_attn_type   = LLAMA_FLASH_ATTN_TYPE_AUTO; // whether to use Flash Attention
+    bool no_fused_gdn = false;
 
     struct common_params_sampling    sampling;
     struct common_params_speculative speculative;

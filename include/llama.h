@@ -381,12 +381,19 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool no_fused_gdn; // disable fused Gated Delta Net kernels (use decomposed ops)
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)
         struct llama_sampler_seq_config * samplers;
         size_t                            n_samplers;
+
+        // DFlash drafter: initial number of cross-attention slots.
+        // Sets the drafter graph width at reservation. Clamped to [1, LLAMA_DFLASH_MAX_SLOTS].
+        // Set this BEFORE llama_init_from_model — runtime widening past this value requires
+        // a larger compute buffer than was allocated at init.
+        int32_t dflash_n_slots;
     };
 
     struct llama_model_tensor_override {
@@ -610,6 +617,14 @@ extern "C" {
     // Returns the total number of parameters in the model
     LLAMA_API uint64_t llama_model_n_params(const struct llama_model * model);
 
+    // DFlash drafter model hyperparameters
+    LLAMA_API int32_t llama_model_dflash_block_size       (const struct llama_model * model);
+    LLAMA_API int32_t llama_model_dflash_mask_token_id    (const struct llama_model * model);
+    LLAMA_API int32_t llama_model_dflash_n_target_layers  (const struct llama_model * model);
+    LLAMA_API int32_t llama_model_dflash_n_target_features(const struct llama_model * model);
+    // fills layer_ids[0..n-1], returns n (capped by capacity)
+    LLAMA_API int32_t llama_model_dflash_target_layer_ids (const struct llama_model * model, int32_t * layer_ids, int32_t capacity);
+
     // Returns true if the model contains an encoder that requires llama_encode() call
     LLAMA_API bool llama_model_has_encoder(const struct llama_model * model);
 
@@ -767,6 +782,14 @@ extern "C" {
 
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
+
+    // Expand the recurrent state to new_n_seq_max cells (for deferred backup allocation).
+    // Returns true on success. No-op if the memory is already large enough or has no recurrent component.
+    LLAMA_API bool llama_memory_recurrent_expand(llama_memory_t mem, uint32_t new_n_seq_max);
+
+    // Shrink the recurrent state to new_n_seq_max cells (frees GPU memory for prefill).
+    // Returns true on success. No-op if the memory is already small enough or has no recurrent component.
+    LLAMA_API bool llama_memory_recurrent_shrink(llama_memory_t mem, uint32_t new_n_seq_max);
 
     //
     // State / sessions
@@ -998,6 +1021,15 @@ extern "C" {
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
 
+    // Get GPU-computed argmax/topk of logits for all output positions.
+    // Returns array of K*n token IDs (row-major: pos0_tok0..pos0_tokK-1, pos1_tok0...), or NULL.
+    LLAMA_API int32_t * llama_get_logits_argmax(struct llama_context * ctx);
+    LLAMA_API int32_t   llama_get_logits_argmax_n(struct llama_context * ctx);
+    // K value: how many candidates per position (1 = argmax, >1 = top-K)
+    LLAMA_API int32_t   llama_get_logits_argmax_k(struct llama_context * ctx);
+    // Log-probabilities of top-K tokens (available when dflash_sample_temp > 0).
+    LLAMA_API float *   llama_get_logits_argmax_probs(struct llama_context * ctx);
+
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
     // the embeddings for which llama_batch.logits[i] != 0 are stored contiguously
@@ -1019,6 +1051,131 @@ extern "C" {
     // when pooling_type == LLAMA_POOLING_TYPE_RANK, returns float[n_cls_out] with the rank(s) of the sequence
     // otherwise: float[n_embd] (1-dimensional)
     LLAMA_API float * llama_get_embeddings_seq(struct llama_context * ctx, llama_seq_id seq_id);
+
+    // DFlash: get captured layer hidden state by slot index
+    // Returns pointer to float[n_embd * n_tokens] or NULL if slot is invalid
+    LLAMA_API float * llama_get_layer_hidden(struct llama_context * ctx, int slot);
+    LLAMA_API int64_t llama_get_layer_hidden_n_tokens(struct llama_context * ctx, int slot);
+    LLAMA_API int64_t llama_get_layer_hidden_n_embd(struct llama_context * ctx, int slot);
+    LLAMA_API int32_t llama_get_n_layer_hiddens(struct llama_context * ctx);
+
+    // DFlash: configure which target layers to capture hidden states from during decode
+    // layer_ids: array of layer indices, n_layers: number of layers
+    // Pass n_layers=0 to disable capture
+    LLAMA_API void llama_set_dflash_capture(struct llama_context * ctx, const int32_t * layer_ids, int32_t n_layers);
+
+    // DFlash: set drafter sampling temperature (Gumbel-max trick)
+    // temp=0: greedy argmax (default), temp>0: sample from softmax(logits/temp)
+    LLAMA_API void llama_set_dflash_sample_temp(struct llama_context * ctx, float temp);
+
+    // DFlash: set top-K for drafter (1 = argmax, >1 = top-K candidates per position)
+    LLAMA_API void llama_set_dflash_topk(struct llama_context * ctx, int k);
+
+    // DFlash: set the number of concurrent slots the drafter graph is reserved for.
+    // Called on the drafter context (ctx_dft). Default 1. Max LLAMA_DFLASH_MAX_SLOTS.
+    // Increases drafter ctx_len (and attention cost) linearly — set to the max slots
+    // the server will actually batch (e.g. --dflash-max-slots). Invalidates graph
+    // cache and forces a reserve on next decode.
+    LLAMA_API void llama_set_dflash_n_slots(struct llama_context * ctx, int n);
+
+    // DFlash: enable/disable tape recording for DeltaNet rollback
+    // When enabled, the eval callback records per-token DeltaNet inputs (k, v, gate, beta)
+    // during verification decode for efficient state replay instead of full re-evaluation
+    LLAMA_API void llama_set_tape_recording(struct llama_context * ctx, bool enable);
+
+    // Toggle force_split_seq on the memory. When false, the batch allocator
+    // may produce multi-seq ubatches (split_equal), allowing concurrent verify tokens
+    // from multiple slots to be processed in a single GPU launch. Set to false before
+    // a verify-only decode, and true after (mixed prompt+TG batches need split_seq).
+    LLAMA_API void llama_set_force_split_seq(struct llama_context * ctx, bool force);
+
+    // max verify-batch size (16 draft + a few extra) — sized for DFlash block_size=16.
+    // MAX_SLOTS caps the batched drafter graph width (must be >= --dflash-max-slots).
+    // PER_SLOT_CTX matches common_speculative_state_dflash::ctx_window.
+    enum {
+        LLAMA_DFLASH_MAX_VERIFY_TOKENS = 25, // must be >= draft_max + 1
+        LLAMA_DFLASH_MAX_SLOTS         = 8,
+        LLAMA_DFLASH_PER_SLOT_CTX      = 512,
+    };
+
+    // DFlash: allocate per-slot GPU tape + hidden-capture buffers for multi-slot use.
+    // Call before the first llama_decode() (and before set_tape_recording(true)). For
+    // single-slot workloads this is optional — a 1-slot allocation is created lazily.
+    LLAMA_API void llama_dflash_allocate_slots(struct llama_context * ctx, int n_slots);
+
+    // DFlash: select which slot's GPU tape the next llama_decode() writes into.
+    // For multi-slot servers (llama-server -np > 1), each slot has its own tape so
+    // concurrent slots don't clobber each other. Must be called before each decode
+    // when multi-slot tape is in use. No-op for single-slot contexts.
+    LLAMA_API void llama_dflash_set_active_slot(struct llama_context * ctx, int slot_idx);
+
+    // DFlash: replay tape data to reconstruct DeltaNet state after partial acceptance
+    // Applies n_accepted tokens worth of state updates on CPU instead of full model re-eval
+    // Must be called after restoring from backup (seq_cp) and before the next decode
+    LLAMA_API void llama_tape_replay(struct llama_context * ctx, llama_seq_id seq_id, int n_accepted);
+
+    // DFlash: complete rollback for hybrid models after partial acceptance
+    // For hybrid (attention+recurrent) models, handles KV cache and recurrent state separately:
+    //   - KV cache: trims rejected draft positions (keeps accepted tokens' KV entries)
+    //   - Recurrent state: restores from backup + tape replay for accepted tokens
+    // This replaces the manual seq_rm/seq_cp + tape_replay sequence
+    LLAMA_API void llama_dflash_rollback(
+            struct llama_context * ctx,
+            llama_seq_id           seq_id,
+            llama_seq_id           seq_backup,
+            int                    n_past_before,
+            int                    n_accepted);
+
+    // DFlash: wait for async tape replay to complete (must be called before next verify)
+    LLAMA_API void llama_tape_replay_sync(struct llama_context * ctx);
+
+    // DFlash: prepare DeltaNet state for branch verification (Phase 2 multi-pass)
+    // Restores recurrent state from backup and tape-replays to given depth.
+    // Does NOT touch attention KV cache or destroy the backup.
+    LLAMA_API void llama_dflash_prepare_branch(
+            struct llama_context * ctx,
+            llama_seq_id           seq_id,
+            llama_seq_id           seq_backup,
+            int                    depth);
+
+    // DFlash: set cross-attention data (fused target hidden states for drafter)
+    // data: float[n_embd * n_tokens], n_embd: feature dimension, n_tokens: context length
+    LLAMA_API void llama_set_cross_data(struct llama_context * ctx, const float * data, int64_t n_embd, int64_t n_tokens);
+
+    // Multi-slot variant: stashes cross data keyed by seq_id so multiple slots can
+    // each set their own buffer before a batched drafter decode. seq_id < 0 routes
+    // to the single-slot path (same as llama_set_cross_data).
+    LLAMA_API void llama_set_cross_data_seq(struct llama_context * ctx, llama_seq_id seq_id, const float * data, int64_t n_embd, int64_t n_tokens);
+
+    // DFlash GPU cross-attention ring: keep ring buffer on GPU, interleave with CUDA kernel
+    LLAMA_API void * llama_dflash_cross_ring_gpu_init(struct llama_context * ctx, int n_layers, int n_embd, int ring_size);
+    LLAMA_API void   llama_dflash_cross_ring_gpu_free(void * handle);
+    LLAMA_API void   llama_dflash_cross_ring_gpu_write(void * handle, int layer, int ring_pos, const float * data, int n_tokens, int n_embd);
+    LLAMA_API void   llama_dflash_cross_ring_gpu_set_cross(struct llama_context * ctx, void * handle, llama_seq_id seq_id, int ring_write_pos, int ring_filled, int n_layers, int n_embd, int ctx_window);
+
+    // DDTree: set tree attention mask for verification decode
+    // visibility: bool[n_tree_tokens * n_tree_tokens] row-major, true = can attend
+    // n_tree_tokens: number of tokens in the tree batch (root + nodes)
+    LLAMA_API void llama_set_tree_mask(struct llama_context * ctx, const uint8_t * visibility, int n_tree_tokens);
+
+    // DDTree: clear tree attention mask after verification
+    LLAMA_API void llama_clear_tree_mask(struct llama_context * ctx);
+
+    // DDTree: set parent IDs for tree-mode SSM kernels (enables tree-parallel DeltaNet)
+    LLAMA_API void llama_set_tree_parent_ids(struct llama_context * ctx, const int32_t * parents, int n_tokens);
+
+    // DDTree: clear tree parent IDs after verification
+    LLAMA_API void llama_clear_tree_parent_ids(struct llama_context * ctx);
+
+    // DDTree: allocate persistent SSM intermediate buffers for tree verification
+    LLAMA_API void llama_allocate_tree_buffers(struct llama_context * ctx, int max_tree_tokens);
+
+    // DDTree: rollback SSM state to committed token using stored intermediates
+    LLAMA_API void llama_tree_rollback(struct llama_context * ctx, int commit_n, const int32_t * parents, int n_seq0);
+
+    // DFlash: share tok_embd and output tensors from src model to dst model
+    // Used to avoid duplicating embedding/lm_head weights between target and drafter
+    LLAMA_API void llama_model_share_tensors(struct llama_model * dst, const struct llama_model * src);
 
     //
     // backend sampling API [EXPERIMENTAL]
@@ -1466,6 +1623,10 @@ extern "C" {
 
     // Returns the seed used by the sampler if applicable, LLAMA_DEFAULT_SEED otherwise
     LLAMA_API uint32_t llama_sampler_get_seed(const struct llama_sampler * smpl);
+
+    // Returns true if a grammar sampler is actively constraining output
+    // For lazy grammars, returns false until the trigger has fired
+    LLAMA_API bool llama_sampler_grammar_is_constraining(const struct llama_sampler * smpl);
 
     /// @details Sample and accept a token from the idx-th output of the last evaluation
     //

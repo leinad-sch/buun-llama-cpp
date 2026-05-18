@@ -18,6 +18,7 @@ struct ggml_tensor;
 
 struct llama_cparams;
 struct llama_layer;
+struct llama_tree_mask;
 
 struct llama_memory_context_i;
 
@@ -64,11 +65,30 @@ struct llama_cross {
     //       ref: https://github.com/ggml-org/llama.cpp/pull/11213#discussion_r1969892524
     //ggml_tensor * t_embd = nullptr;
 
-    int64_t n_embd = 0;
-    int64_t n_enc  = 0;
+    int64_t n_embd    = 0;
+    int64_t n_enc     = 0;  // may be padded to bucket for graph stability
+    int64_t n_enc_real = 0; // actual data length (unpadded)
 
     // embeddings data copied to host memory (tmp)
+    // Single-slot / encoder-decoder path: graph builders read from here directly.
     std::vector<float> v_embd;
+
+    // GPU D2D path: device pointer to interleaved cross data (set by GPU ring interleave)
+    const void * v_embd_gpu = nullptr;
+    int64_t v_embd_gpu_n_enc_real = 0;
+    void (*fn_set_tensor_d2d)(void * d_dst, const void * d_src, size_t offset, size_t size) = nullptr;
+
+    // Per-seq cross buffers for DFlash multi-slot.
+    // When non-empty, graph builders should pack these into target_hidden per slot
+    // instead of reading v_embd. Empty ⇒ fall through to the legacy v_embd path.
+    struct seq_cross {
+        int64_t n_enc      = 0;  // padded length (graph stability)
+        int64_t n_enc_real = 0;  // actual data length
+        std::vector<float> v_embd;
+        const void * v_embd_gpu = nullptr;
+        int64_t v_embd_gpu_n_enc_real = 0;
+    };
+    std::map<llama_seq_id, seq_cross> v_embd_per_seq;
 
     // needed to construct the cross-attention mask in the decoder
     std::vector<std::set<llama_seq_id>> seq_ids_enc;
@@ -288,10 +308,12 @@ public:
     llm_graph_input_attn_kv(
             const llama_hparams & hparams,
             const llama_cparams & cparams,
-            const llama_kv_cache_context * mctx) :
+            const llama_kv_cache_context * mctx,
+            const llama_tree_mask * tree_mask = nullptr) :
         hparams(hparams),
         cparams(cparams),
-        mctx(mctx) {
+        mctx(mctx),
+        tree_mask(tree_mask) {
     }
     ~llm_graph_input_attn_kv() = default;
 
@@ -321,6 +343,7 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_context * mctx;
+    const llama_tree_mask * tree_mask;
 };
 
 // V-less input for the KV cache
@@ -545,6 +568,12 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_tree_mask        * tree_mask = nullptr;
+
+    // DDTree: tree-mode SSM buffers (parent_ids + persistent intermediates)
+    ggml_tensor * tree_parent_ids = nullptr;
+    const std::vector<ggml_tensor *> * tree_ssm_intermediates = nullptr;
+    int tree_n_recurrent_layers = 0;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -631,7 +660,8 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
-            cross == other.cross;
+            cross == other.cross &&
+            (tree_parent_ids != nullptr) == (other.tree_parent_ids != nullptr);
     }
 };
 
@@ -672,6 +702,7 @@ public:
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
     ggml_tensor * t_logits      = nullptr;
+    ggml_tensor * t_logits_argmax = nullptr; // [n_tokens] int32, GPU argmax of logits
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_pre_norm  = nullptr; // [n_embd, n_outputs] hidden state before final output norm
@@ -680,6 +711,9 @@ public:
     std::map<llama_seq_id, ggml_tensor*> t_candidates;
     std::map<llama_seq_id, ggml_tensor*> t_sampled;
     std::map<llama_seq_id, ggml_tensor*> t_sampled_probs;
+
+    // DFlash: captured per-layer hidden states (set by target model graph builder)
+    // DFlash hidden state capture moved to eval callback (dflash_eval_callback)
 
     std::vector<llm_graph_input_ptr> inputs;
 
@@ -761,6 +795,12 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_tree_mask        * tree_mask;
+
+    // DDTree: tree-mode SSM buffers
+    ggml_tensor * tree_parent_ids = nullptr;
+    const std::vector<ggml_tensor *> * tree_ssm_intermediates = nullptr;
+    int tree_n_recurrent_layers = 0;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

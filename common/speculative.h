@@ -73,3 +73,46 @@ struct common_speculative_deleter {
 };
 
 typedef std::unique_ptr<common_speculative, common_speculative_deleter> common_speculative_ptr;
+
+// fork: per-slot init (n_seq=1, shared drafter context)
+llama_context * common_speculative_create_ctx_dft(const common_params_speculative & params, int dflash_n_slots = 1);
+common_speculative * common_speculative_init(
+        common_params_speculative & params,
+        llama_context             * ctx_tgt,
+        llama_context             * ctx_dft_shared = nullptr);
+
+// fork: single-seq overloads
+void common_speculative_begin(common_speculative * spec, const llama_tokens & prompt);
+void common_speculative_accept(common_speculative * spec, uint16_t n_accepted);
+
+// fork: DFlash slot routing
+void common_speculative_set_seq_id(common_speculative * spec, llama_seq_id seq_id);
+
+// fork: single-seq draft (returns tokens)
+llama_tokens common_speculative_draft(
+        common_speculative              * spec,
+        const common_params_speculative & params,
+        const llama_tokens              & prompt_tgt,
+        llama_token                       id_last,
+        std::vector<float>              * draft_log_probs = nullptr);
+
+// fork: batched multi-slot DFlash drafting
+void common_speculative_draft_batch(
+        std::vector<common_speculative *> & specs,
+        llama_context                     * ctx_dft,
+        const common_params_speculative   & params,
+        const std::vector<llama_token>    & id_last_per_spec,
+        std::vector<llama_tokens>         & result_per_spec);
+
+// fork: logit/state management
+void   common_speculative_update_logits(common_speculative * spec, llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted);
+void   common_speculative_flush_prefill(common_speculative * spec);
+
+// fork: DFlash ring buffer state save/load
+size_t common_speculative_ring_state_size(const common_speculative * spec);
+void   common_speculative_ring_state_save(const common_speculative * spec, uint8_t * buf, size_t size);
+bool   common_speculative_ring_state_load(common_speculative * spec, const uint8_t * buf, size_t size);
+
+// fork: draft length params
+int32_t common_speculative_n_max(const common_speculative * spec, const common_params_speculative & params);
+int32_t common_speculative_n_min(const common_speculative * spec, const common_params_speculative & params);

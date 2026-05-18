@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-batch.h"
+#include "llama-context.h"
 #include "llama-cparams.h"
 
 #include "llama-kv-cache.h"
@@ -455,6 +456,27 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
 
     mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
 
+    // DDTree: overwrite the tree×tree block of the attention mask with the visibility matrix
+    // Sets BOTH allow (0) and block (-inf) to fully override seq_id-based masking
+    if (tree_mask && tree_mask->active) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask->buffer));
+
+        float   * mask_data = (float *)   self_kq_mask->data;
+        int64_t * k_idxs    = (int64_t *) self_k_idxs->data;
+
+        const int n = tree_mask->n_tree_tokens;
+        const int64_t n_kv = self_kq_mask->ne[0];
+
+        GGML_ASSERT((int) ubatch->n_tokens == n);
+
+        for (int i = 0; i < n; ++i) {
+            for (int j = 0; j < n; ++j) {
+                float val = tree_mask->visibility[i * n + j] ? 0.0f : -INFINITY;
+                mask_data[i * n_kv + k_idxs[j]] = val;
+            }
+        }
+    }
+
     if (self_k_rot) {
         mctx->set_input_k_rot(self_k_rot);
     }
@@ -842,6 +864,9 @@ void llm_graph_result::set_outputs() {
     if (t_logits != nullptr) {
         ggml_set_output(t_logits);
     }
+    if (t_logits_argmax != nullptr) {
+        ggml_set_output(t_logits_argmax);
+    }
     if (t_embd != nullptr) {
         ggml_set_output(t_embd);
     }
@@ -871,6 +896,7 @@ void llm_graph_result::set_outputs() {
             ggml_set_output(t);
         }
     }
+    // DFlash hidden state capture moved to eval callback (no graph outputs needed)
 }
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
@@ -954,6 +980,10 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    tree_mask        (params.tree_mask),
+    tree_parent_ids           (params.tree_parent_ids),
+    tree_ssm_intermediates    (params.tree_ssm_intermediates),
+    tree_n_recurrent_layers   (params.tree_n_recurrent_layers),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1958,6 +1988,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     k = ggml_permute(ctx0, k, 0, 2, 1, 3);
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
 
+    // TODO: TurboQuant pre-rotate-queries optimization (WIP — PPL 23.5 vs 6.19 target)
+    // The graph-side rotation approach works mechanically (ggml_mul_mat rotates correctly)
+    // but gives 4x worse PPL than dequant-side rotation for unknown reasons.
+    // Keeping dequant inverse rotation for now until this is resolved.
+    // See: docs/turbo-speed-investigation.md for full debugging history
+
     ggml_tensor * cur;
 
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
@@ -2067,6 +2103,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
     }
 
+    // TODO: TurboQuant V inverse rotation (WIP — part of pre-rotate-queries optimization)
+    // See comment above for status
+
     ggml_build_forward_expand(gf, cur);
 
     return cur;
@@ -2151,9 +2190,10 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
      const llama_ubatch & ubatch,
     const llama_hparams & hparams,
     const llama_cparams & cparams,
-    const llama_kv_cache_context * mctx_cur) {
+    const llama_kv_cache_context * mctx_cur,
+    const llama_tree_mask * tree_mask = nullptr) {
 
-    auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
+    auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur, tree_mask);
 
     {
         GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE && "Use llama_kv_cache_iswa for SWA");
@@ -2174,7 +2214,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
-    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
+    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur, tree_mask);
 
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
@@ -2227,11 +2267,42 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
+    // TurboQuant Q pre-rotation is handled inline in CUDA FA kernels:
+    // - Vec kernel: shared memory FWHT (fattn-vec.cuh)
+    // - Prefill MMA: separate Q rotation kernel (fattn.cu)
+
+    // Pad Q to match K's padded head_dim (turbo FWHT requires 128-aligned heads)
+    const int64_t orig_head_dim = q->ne[0];
+    const bool head_padded = (q->ne[0] < k->ne[0]);
+    if (head_padded) {
+        q = ggml_pad(ctx0, q, k->ne[0] - q->ne[0], 0, 0, 0);
+    }
+
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
-    if (inp->self_v_rot) {
+    // TurboQuant V un-rotation at graph level (CUDA graph compatible)
+    if (v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO3_TCQ || v->type == GGML_TYPE_TURBO2_TCQ) {
+        if (cur->ne[0] % 128 == 0) {
+            cur = ggml_cont(ctx0, cur);  // force copy to break potential aliasing
+            cur = ggml_turbo_wht(ctx0, cur, 1);  // 1 = inverse
+        }
+    } else if (inp->self_v_rot) {
         cur = ggml_mul_mat_aux(ctx0, cur, inp->self_v_rot);
+    }
+
+    // Crop output back to original head_dim after turbo head padding
+    // cur is 2D [padded_head * n_head_q, n_tokens] — unflatten, crop per-head, reflatten
+    if (head_padded) {
+        const int64_t padded_head = k->ne[0];
+        const int64_t n_head_q = cur->ne[0] / padded_head;
+        const int64_t n_tok = cur->ne[1];
+        cur = ggml_reshape_3d(ctx0, cur, padded_head, n_head_q, n_tok);
+        cur = ggml_view_3d(ctx0, cur,
+            orig_head_dim, n_head_q, n_tok,
+            cur->nb[1], cur->nb[2], 0);
+        cur = ggml_cont(ctx0, cur);
+        cur = ggml_reshape_2d(ctx0, cur, orig_head_dim * n_head_q, n_tok);
     }
 
     if (wo) {
@@ -2409,7 +2480,13 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
-    if (v_rot) {
+    // TurboQuant V un-rotation at graph level (CUDA graph compatible)
+    if (v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO3_TCQ || v->type == GGML_TYPE_TURBO2_TCQ) {
+        if (cur->ne[0] % 128 == 0) {
+            cur = ggml_cont(ctx0, cur);
+            cur = ggml_turbo_wht(ctx0, cur, 1);  // 1 = inverse
+        }
+    } else if (v_rot) {
         cur = ggml_mul_mat_aux(ctx0, cur, v_rot);
     }
 
@@ -2643,7 +2720,7 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
-    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
+    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn(), tree_mask);
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 

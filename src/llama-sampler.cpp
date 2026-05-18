@@ -3850,6 +3850,20 @@ uint32_t llama_sampler_get_seed(const struct llama_sampler * smpl) {
     return LLAMA_DEFAULT_SEED;
 }
 
+bool llama_sampler_grammar_is_constraining(const struct llama_sampler * smpl) {
+    if (!smpl || smpl->iface != &llama_sampler_grammar_i) {
+        return false;
+    }
+    const auto * ctx = (const llama_sampler_grammar *) smpl->ctx;
+    if (!ctx->grammar) {
+        return false;
+    }
+    if (ctx->grammar->lazy && ctx->grammar->awaiting_trigger) {
+        return false;
+    }
+    return true;
+}
+
 // perf
 
 struct llama_perf_sampler_data llama_perf_sampler(const struct llama_sampler * chain) {

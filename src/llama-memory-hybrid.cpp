@@ -71,7 +71,10 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
         while (true) {
             llama_ubatch ubatch;
 
-            if (embd_all) {
+            // DFlash target models need per-seq ubatches so the per-ubatch slot
+            // switch in llama_context::decode() can route hidden-state capture
+            // and tape writes to the correct slot.
+            if (embd_all || force_split_seq) {
                 // if all tokens are output, split by sequence
                 ubatch = balloc.split_seq(n_ubatch);
             } else {
@@ -132,12 +135,11 @@ void llama_memory_hybrid::clear(bool data) {
 }
 
 bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-    // Try removing from the recurrent cache first since it may fail. If it does
-    // fail, the cache will not have been mutated.
-    if (!mem_recr->seq_rm(seq_id, p0, p1)) {
-        return false;
-    }
-    return mem_attn->seq_rm(seq_id, p0, p1);
+    // Always attempt both removals. Attention cache must be cleaned up
+    // even if recurrent rollback fails (e.g. no checkpoint available).
+    bool ok_recr = mem_recr->seq_rm(seq_id, p0, p1);
+    bool ok_attn = mem_attn->seq_rm(seq_id, p0, p1);
+    return ok_recr && ok_attn;
 }
 
 void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
@@ -263,6 +265,14 @@ const llama_ubatch & llama_memory_hybrid_context::get_ubatch() const {
 
 const llama_kv_cache_context * llama_memory_hybrid_context::get_attn() const {
     return static_cast<const llama_kv_cache_context *>(ctx_attn.get());
+}
+
+ggml_tensor * llama_memory_hybrid_context::get_turbo_rot_forward() const {
+    return ctx_attn ? ctx_attn->get_turbo_rot_forward() : nullptr;
+}
+
+ggml_tensor * llama_memory_hybrid_context::get_turbo_rot_inverse() const {
+    return ctx_attn ? ctx_attn->get_turbo_rot_inverse() : nullptr;
 }
 
 const llama_memory_recurrent_context * llama_memory_hybrid_context::get_recr() const {

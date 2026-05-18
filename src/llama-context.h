@@ -22,6 +22,7 @@ class llama_io_write_i;
 // "memory" as in abstract memory for the context
 struct llama_memory_i;
 struct llama_memory_context_i;
+struct llama_memory_recurrent;
 
 // stores copy of the memory in device buffer. used for fast state save/load
 struct llama_memory_buffer {
@@ -37,6 +38,140 @@ struct llama_memory_buffer {
 };
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
+
+// DFlash: hidden state buffer for captured layer activations
+struct dflash_layer_hidden_buf {
+    std::vector<float> data;
+    int64_t n_embd = 0;
+    int64_t n_tokens = 0;
+};
+
+// DFlash: tape recording data for one recurrent layer
+struct dflash_tape_layer {
+    std::vector<float> k;          // [S_k * H_k * n_tokens] after l2_norm
+    std::vector<float> v;          // [S_v * H_v * n_tokens]
+    std::vector<float> gate;       // [H_v * n_tokens] pre-exp
+    std::vector<float> beta;       // [H_v * n_tokens] pre-sigmoid
+    std::vector<float> qkv_mixed;  // [conv_channels * n_tokens * n_seqs] for conv state rebuild
+    int64_t S_k = 0, H_k = 0, S_v = 0, H_v = 0;
+    int64_t conv_channels = 0;
+    int n_tokens = 0;
+    // per-seq metadata for multi-seq verify QKV scatter
+    int n_seqs = 1;
+    llama_seq_id seq_ids[LLAMA_DFLASH_MAX_SLOTS] = {};
+};
+
+// GPU-resident tape: persistent tensors that the graph writes into directly (no eval callback sync)
+struct dflash_tape_gpu_layer {
+    ggml_tensor * k    = nullptr;  // [S_k, H_k, max_tokens]
+    ggml_tensor * v    = nullptr;  // [S_v, H_v, max_tokens]
+    ggml_tensor * gate = nullptr;  // [1, H_v, max_tokens]
+    ggml_tensor * beta = nullptr;  // [1, H_v, max_tokens]
+};
+
+struct dflash_tape_gpu {
+    std::vector<dflash_tape_gpu_layer> layers;  // one per recurrent layer
+    std::vector<int32_t> layer_ids;             // model layer indices → tape index mapping
+    ggml_backend_buffer_t buf = nullptr;
+    ggml_context * ctx = nullptr;               // owns the tensor descriptors
+    int max_tokens = 0;                         // allocated capacity
+    int n_tokens = 0;                           // actual tokens recorded this pass
+
+    ~dflash_tape_gpu() {
+        if (buf) ggml_backend_buffer_free(buf);
+        if (ctx) ggml_free(ctx);
+    }
+};
+
+enum dflash_tape_type {
+    DFLASH_TAPE_K    = 0,
+    DFLASH_TAPE_V    = 1,
+    DFLASH_TAPE_GATE = 2,
+    DFLASH_TAPE_BETA = 3,
+    DFLASH_TAPE_QKV  = 4,
+};
+
+// DDTree: tree attention mask for verification
+struct llama_tree_mask {
+    bool active = false;
+    int n_tree_tokens = 0;         // number of tree tokens (root + nodes)
+    std::vector<uint8_t> visibility;  // [n² row-major] true = can attend
+};
+
+// DFlash: eval callback data for hidden state capture + tape recording
+struct dflash_capture_data {
+    // hidden state capture (for drafter conditioning)
+    std::vector<int32_t> layer_ids;           // layer indices to capture
+    std::vector<std::string> tensor_names;    // pre-formatted "l_out-{id}" names
+    std::unordered_map<std::string, size_t> hidden_name_idx; // name → index for O(1) lookup
+    // pointer to context's layer_hiddens (outer: per-slot, inner: per-captured-layer)
+    std::vector<std::vector<dflash_layer_hidden_buf>> * hiddens;
+
+    // tape recording (for DeltaNet state rollback)
+    bool tape_enabled = false;
+    std::vector<int32_t> recurrent_layer_ids;       // model layer indices that are DeltaNet
+    std::unordered_map<std::string, std::pair<int, int>> tape_name_map;  // name → (layer_idx, type)
+    std::vector<dflash_tape_layer> tape_layers;     // one per recurrent layer (CPU fallback)
+
+    // GPU-resident tape: graph writes directly to these tensors (no eval callback sync).
+    // One entry per slot for multi-slot DFlash (see --dflash-max-slots). For single-slot
+    // (default), `tapes` has size 1 and `active_tape_idx` is always 0 — behavior is
+    // byte-identical to the pre-multi-slot singleton.
+    std::vector<std::unique_ptr<dflash_tape_gpu>> tapes;
+    int active_tape_idx = 0;
+
+    // Active ubatch for the in-flight process_ubatch() call. The eval callback
+    // reads ubatch->n_seqs_unq / ubatch->seq_id to route hidden-state captures
+    // to layer_hiddens[seq] (per-token scatter under multi-seq ubatches).
+    // ggml's scheduler serializes callbacks within a graph compute, so this
+    // pointer is safe to read without synchronization.
+    const llama_ubatch * ubatch = nullptr;
+
+    // Reused scratch for the multi-seq scatter path (avoid per-ubatch alloc).
+    std::vector<float> scatter_buf;
+
+    dflash_tape_gpu * active_tape() const {
+        return (active_tape_idx >= 0 && active_tape_idx < (int) tapes.size())
+                   ? tapes[active_tape_idx].get()
+                   : nullptr;
+    }
+
+    std::vector<dflash_layer_hidden_buf> * slot_hiddens(int slot) const {
+        if (!hiddens || slot < 0 || slot >= (int) hiddens->size()) {
+            return nullptr;
+        }
+        return &(*hiddens)[slot];
+    }
+
+    std::vector<dflash_layer_hidden_buf> * active_slot_hiddens() const {
+        return slot_hiddens(active_tape_idx);
+    }
+
+    // persistent GPU buffer for tape replay (avoids per-call alloc/free)
+    ggml_backend_buffer_t replay_buf = nullptr;
+    size_t replay_buf_size = 0;
+
+    // S2: pre-allocated zeros buffer for Q input (avoids per-call alloc+zero)
+    std::vector<float> replay_zeros;
+
+    // async tape replay state (GDN launched, waiting for sync before conv rebuild)
+    bool replay_pending = false;
+    ggml_backend_t replay_gpu_backend = nullptr;
+    ggml_context * replay_graph_ctx = nullptr;
+    int replay_n_accepted = 0;
+    int32_t replay_cell_idx = -1;
+    llama_seq_id replay_seq_id = 0;
+    llama_memory_recurrent * replay_mem_recurrent = nullptr;
+
+    ~dflash_capture_data() {
+        if (replay_graph_ctx) {
+            ggml_free(replay_graph_ctx);
+        }
+        if (replay_buf) {
+            ggml_backend_buffer_free(replay_buf);
+        }
+    }
+};
 
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs

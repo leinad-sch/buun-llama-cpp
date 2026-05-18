@@ -429,7 +429,12 @@ extern "C" {
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
-        GGML_TYPE_COUNT   = 42,
+        GGML_TYPE_TURBO3_0 = 42, // TurboQuant 3-bit KV cache: 2-bit PolarQuant + 1-bit QJL
+        GGML_TYPE_TURBO4_0 = 43, // TurboQuant 4-bit KV cache: 3-bit PolarQuant + 1-bit QJL
+        GGML_TYPE_TURBO2_0 = 44, // TurboQuant 2-bit KV cache: 2-bit PolarQuant, no QJL
+        GGML_TYPE_TURBO3_TCQ = 45, // TurboQuant 3-bit KV cache: TCQ (Trellis-Coded Quantization)
+        GGML_TYPE_TURBO2_TCQ = 46, // TurboQuant 2-bit KV cache: TCQ (k=2, L=8, 256 states)
+        GGML_TYPE_COUNT   = 47,
     };
 
     // precision
@@ -567,6 +572,9 @@ extern "C" {
         GGML_OP_RWKV_WKV7,
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
+        GGML_OP_GATED_DELTA_NET_TREE,
+        GGML_OP_SSM_CONV_TREE,
+        GGML_OP_TURBO_WHT,
 
         GGML_OP_UNARY,
 
@@ -1050,6 +1058,26 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_argmax(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
+
+    // argmax with temperature scaling and Gumbel noise (sampling via Gumbel-max trick)
+    // when temp > 0 and seed != 0: samples from softmax(a/temp) distribution
+    // when temp == 0 or seed == 0: equivalent to regular argmax
+    GGML_API struct ggml_tensor * ggml_argmax_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            float                 temp,
+            uint64_t              seed);
+
+    // top-K with temperature scaling and Gumbel noise
+    // output: [2*K*nrows] I32 — first K*nrows = token IDs (sorted by score desc),
+    //         second K*nrows = log-probs as float bits
+    // K candidates per row, row-major: row0_tok0, row0_tok1, ..., row0_tokK-1, row1_tok0, ...
+    GGML_API struct ggml_tensor * ggml_topk_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   k,
+            float                 temp,
+            uint64_t              seed);
 
     // count number of equal elements in a and b
     GGML_API struct ggml_tensor * ggml_count_equal(
@@ -2554,6 +2582,34 @@ extern "C" {
             struct ggml_tensor  * g,
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state);
+
+    // Tree-mode gated delta net: processes tokens with tree structure via parent_ids
+    // persist_inter: [S_v, S_v, H, n_tokens, n_seqs] f16 buffer for intermediate states
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_tree(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * parent_ids,
+            struct ggml_tensor  * persist_inter);
+
+    // Tree-mode SSM conv: follows parent pointers for convolution window
+    GGML_API struct ggml_tensor * ggml_ssm_conv_tree(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * conv_input,
+            struct ggml_tensor  * conv_weight,
+            struct ggml_tensor  * parent_ids);
+
+    // TurboQuant Walsh-Hadamard Transform (O(d log d) rotation for KV cache compression)
+    // Applies WHT rotation to 128-element groups along ne[0]: sign1 → butterfly → sign2 → normalize
+    // direction: 0 = forward (signs1 → WHT → signs2), 1 = inverse (signs2 → WHT → signs1)
+    GGML_API struct ggml_tensor * ggml_turbo_wht(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   direction);
 
     // custom operators
 
