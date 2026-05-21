@@ -262,6 +262,8 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
                 continue;
             }
 
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, dp.n_past, -1);
+
             n_drafting++;
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
@@ -605,6 +607,11 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
             if (!dp.drafting) {
                 continue;
             }
+
+            // Truncate stale draft positions: process() only cleans sequences
+            // present in the verify batch, so a previous draft() may have
+            // advanced this sequence past dp.n_past.
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, dp.n_past, -1);
 
             n_drafting++;
             drafting[seq_id] = true;
