@@ -4924,8 +4924,8 @@ llama_context * llama_init_from_model(
             return nullptr;
         }
         if (ggml_is_quantized(params.type_k) || ggml_is_quantized(params.type_v)) {
-            LLAMA_LOG_ERROR("%s: simultaneous use of SPLIT_MODE_TENSOR and KV cache quantization not implemented\n", __func__);
-            return nullptr;
+            LLAMA_LOG_INFO("%s: SPLIT_MODE_TENSOR with quantized KV cache (K=%s, V=%s)\n",
+                __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
         }
     }
 
