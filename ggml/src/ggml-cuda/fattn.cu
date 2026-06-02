@@ -890,6 +890,25 @@ static __global__ void k_q8_0_dequant_f16_tkhe(
     dst[strm * (ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0 + j] = __float2half(val);
 }
 
+// bf16 K/V cast to f16 in the same TKHE layout as k_q8_0_dequant_f16_tkhe. Used when a bf16
+// side is paired with a turbo side: the f16-only MMA/VEC kernels need an f16 input, and bf16 is
+// already in the original (unrotated) domain so no rotation is applied. 1 thread per element.
+static __global__ void k_bf16_to_f16_tkhe(
+        const char * __restrict__ src, half * __restrict__ dst,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2,
+        const size_t nb1, const size_t nb2, const size_t nb3) {
+    const int64_t row  = blockIdx.x;
+    const int64_t head = blockIdx.y;
+    const int64_t strm = blockIdx.z;
+    const int j = threadIdx.x;
+    if (j >= ne0) return;
+
+    const nv_bfloat16 * src_row = (const nv_bfloat16 *)(src + strm * nb3 + row * nb1 + head * nb2);
+    const float val = __bfloat162float(src_row[j]);
+
+    dst[strm * (ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0 + j] = __float2half(val);
+}
+
 // Persistent Q rotation buffer per device (shared between prefill and decode paths)
 static float * q_rot_buf[GGML_CUDA_MAX_DEVICES] = {};
 static size_t  q_rot_buf_size[GGML_CUDA_MAX_DEVICES] = {};
@@ -943,6 +962,9 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
     // need no conversion (already f16). This is the prefill mirror of the decode dequant path.
     const bool q8_k = K->type == GGML_TYPE_Q8_0;
     const bool q8_v = V->type == GGML_TYPE_Q8_0;
+    // bf16 side paired with turbo: cast to f16 too (same reason as q8_0 above).
+    const bool bf16_k = K->type == GGML_TYPE_BF16;
+    const bool bf16_v = V->type == GGML_TYPE_BF16;
 
     int device;
     CUDA_CHECK(cudaGetDevice(&device));
@@ -950,8 +972,8 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
     half * k_fp16 = nullptr;
     half * v_fp16 = nullptr;
 
-    // Allocate and dequant K to fp16 (turbo2/3/4 or q8_0)
-    if (turbo_k || q8_k) {
+    // Allocate and dequant K to fp16 (turbo2/3/4, q8_0, or bf16)
+    if (turbo_k || q8_k || bf16_k) {
         // Size for full cache (kv_size from root) so we never realloc mid-session.
         const ggml_tensor * k_root = K;
         while (k_root->view_src) k_root = k_root->view_src;
@@ -1017,6 +1039,10 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
             // turbo4 K: inverse FWHT dequant → produces K in original domain (no Q rotation needed)
             k_turbo4_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
                 (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
+        } else if (K->type == GGML_TYPE_BF16) {
+            // bf16 K (mixed K/V): cast to f16 in original (unrotated) domain. Q stays unrotated.
+            k_bf16_to_f16_tkhe<<<grid_k, K->ne[0], 0, stream>>>(
+                (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
         } else {
             // q8_0 K (mixed K/V): plain dequant to f16 in original (unrotated) domain. Q stays
             // unrotated (turbo_k is false → the Q-rotation block below is skipped).
@@ -1025,8 +1051,8 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
         }
     }
 
-    // Allocate and dequant V to fp16 (turbo2/3/4 or q8_0)
-    if (turbo_v || q8_v) {
+    // Allocate and dequant V to fp16 (turbo2/3/4, q8_0, or bf16)
+    if (turbo_v || q8_v || bf16_v) {
         // Size for full cache (kv_size from root) so we never realloc mid-session.
         const ggml_tensor * v_root = V;
         while (v_root->view_src) v_root = v_root->view_src;
@@ -1090,6 +1116,11 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
                 (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], tcq_compute_alpha_v(V->type, V->ne[1]));
         } else if (V->type == GGML_TYPE_TURBO4_0) {
             k_turbo4_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
+                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
+        } else if (V->type == GGML_TYPE_BF16) {
+            // bf16 V (mixed K/V): cast to f16 in original domain. Not rotated, and the graph-level
+            // inverse WHT is gated on V being a turbo type (llama-graph.cpp), so none is applied.
+            k_bf16_to_f16_tkhe<<<grid_v, V->ne[0], 0, stream>>>(
                 (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
         } else {
             // q8_0 V (mixed K/V): plain dequant to f16 in original domain. q8_0 V is not rotated,
@@ -1720,8 +1751,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         // Mixed f16/q8_0 + turbo at D=512: dequant K (and turbo V) to f16 so FA dispatches as
         // F16/F16 D=512 (which exists). Without this, the native VEC templates needed are
         // either missing (F16↔turbo) or have buggy SASS on sm_120 PTX-JIT (Q8_0↔turbo4 etc).
-        const bool k_is_f16_q8_or_turbo = (K->type == GGML_TYPE_F16) || (K->type == GGML_TYPE_Q8_0) || turbo_k_only;
-        const bool v_is_f16_q8_or_turbo = (V->type == GGML_TYPE_F16) || (V->type == GGML_TYPE_Q8_0) || turbo_v_only;
+        const bool k_is_f16_q8_or_turbo = (K->type == GGML_TYPE_F16) || (K->type == GGML_TYPE_Q8_0) || (K->type == GGML_TYPE_BF16) || turbo_k_only;
+        const bool v_is_f16_q8_or_turbo = (V->type == GGML_TYPE_F16) || (V->type == GGML_TYPE_Q8_0) || (V->type == GGML_TYPE_BF16) || turbo_v_only;
         const bool both_dequantable_512 = k_is_f16_q8_or_turbo && v_is_f16_q8_or_turbo;
         const bool do_decode_dequant = !turbo_decode_native && turbo_kv && (Q->ne[0] <= 256 || (Q->ne[0] <= 512 && both_dequantable_512));
 
@@ -1739,8 +1770,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             // q8_0, the FA kernel gets a (Q8_0, F16) pair, which produces garbage at D<=256
             // (no correct mixed VEC combo). Dequant the q8_0 side to f16 too so the pair is
             // (F16, F16) — matching the symmetric turbo path that goes through the same f16 FA.
-            const bool k_needs_dequant = turbo_k_only || (K->type == GGML_TYPE_Q8_0 && (Q->ne[0] > 256 || turbo_v_only));
-            const bool v_needs_dequant = turbo_v_only || (V->type == GGML_TYPE_Q8_0 && (Q->ne[0] > 256 || turbo_k_only));
+            const bool k_needs_dequant = turbo_k_only || ((K->type == GGML_TYPE_Q8_0 || K->type == GGML_TYPE_BF16) && (Q->ne[0] > 256 || turbo_v_only));
+            const bool v_needs_dequant = turbo_v_only || ((V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_BF16) && (Q->ne[0] > 256 || turbo_k_only));
             if (k_needs_dequant) {
                 // Size the dequant buffer for the FULL cache (kv_size from the underlying root
                 // tensor), not just the current n_kv. This prevents per-token reallocations as
@@ -1802,6 +1833,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                     // Output goes into TKHE layout matching V_f16_dec → dispatches as F16/F16 D=512.
                     k_q8_0_dequant_f16_tkhe<<<grid_k, K->ne[0], 0, stream>>>(
                         (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
+                } else if (K->type == GGML_TYPE_BF16) {
+                    // bf16 K cast to f16 (mixed bf16-K + turbo-V) → dispatches as F16/F16.
+                    k_bf16_to_f16_tkhe<<<grid_k, K->ne[0], 0, stream>>>(
+                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
                 }
                 K_f16_dec = *K;
                 K_f16_dec.type = GGML_TYPE_F16;
@@ -1845,6 +1880,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 } else if (V->type == GGML_TYPE_Q8_0) {
                     // Q8_0 V dequant: only fires at D=512 when K is turbo (mirror of K=Q8_0 path).
                     k_q8_0_dequant_f16_tkhe<<<grid_v, V->ne[0], 0, stream>>>(
+                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
+                } else if (V->type == GGML_TYPE_BF16) {
+                    // bf16 V cast to f16 (mixed turbo-K + bf16-V) → dispatches as F16/F16.
+                    k_bf16_to_f16_tkhe<<<grid_v, V->ne[0], 0, stream>>>(
                         (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
                 }
                 V_f16_dec = *V;
