@@ -347,7 +347,9 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_n_rs();
 
-    if (s_copy) {
+    // s_copy may be unallocated (no buffer) when build_rs_in replaced every get_rows with a
+    // direct view — there is then no index tensor to fill.
+    if (s_copy && s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
         int32_t * data = (int32_t *) s_copy->data;
 
@@ -372,6 +374,13 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
+
+    // If this graph baked a direct state view (build_rs_in fast-path), it is only valid to reuse
+    // while the new ubatch is still a contiguous-identity gather; otherwise the frozen view would
+    // read the wrong (remapped) state rows. head/rs_z above don't catch a pure src0 reorder.
+    if (view_path) {
+        res &= mctx->states_are_contiguous_identity(params.ubatch.n_seqs);
+    }
 
     return res;
 }
@@ -694,7 +703,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -738,7 +747,7 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -808,7 +817,7 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -2860,6 +2869,25 @@ ggml_tensor * llm_graph_context::build_rs(
     return build_rs(s, inp->s_copy_main, inp->s_copy_extra, state_size, n_seqs,
                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
                     get_state_rows);
+}
+
+ggml_tensor * llm_graph_context::build_rs_in(
+        llm_graph_input_rs * inp,
+        ggml_tensor * s,
+            int32_t   state_size,
+            int32_t   n_seqs) const {
+    const auto * kv_state = inp->mctx;
+
+    if (kv_state->states_are_contiguous_identity((uint32_t) n_seqs)) {
+        // The get_rows would be a contiguous identity gather of rows [head, head + n_seqs):
+        // return a view of those rows directly and skip the copy + kernel launch.
+        inp->view_path = true;
+        ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
+        return ggml_view_2d(ctx0, states, state_size, n_seqs, states->nb[1],
+                            (size_t) kv_state->get_head() * states->nb[1]);
+    }
+
+    return build_rs(inp, s, state_size, n_seqs);
 }
 
 ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(

@@ -182,6 +182,11 @@ public:
 
     int32_t s_copy(int i) const;
 
+    // True when the state input for the first n_seqs cells is a contiguous identity gather
+    // (src0 == head + i for all i, no extra states), so build_rs can return a plain view of
+    // the state slot instead of materializing a get_rows copy. Pure: no side effects.
+    bool states_are_contiguous_identity(uint32_t n_seqs) const;
+
 private:
     const llama_memory_status status;
 

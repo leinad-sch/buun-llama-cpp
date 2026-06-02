@@ -283,6 +283,11 @@ public:
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+
+    // set when build_rs_in baked a direct ggml_view_2d of the state slot (the contiguous-identity
+    // fast-path) instead of a get_rows gather. On reuse the predicate must still hold, otherwise the
+    // frozen view would alias the wrong rows for a remapped ubatch.
+    bool view_path = false;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {
@@ -1131,6 +1136,15 @@ struct llm_graph_context {
                 int32_t   state_size,
                 int32_t   n_seqs,
             const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
+
+    // Like build_rs, but returns a plain view of the state slot when the gather is a
+    // contiguous identity (steady-state recurrent decode), skipping the get_rows copy.
+    // Falls back to build_rs whenever a real copy/zero/reorder is required.
+    ggml_tensor * build_rs_in(
+            llm_graph_input_rs * inp,
+            ggml_tensor * s,
+                int32_t   state_size,
+                int32_t   n_seqs) const;
 
     ggml_tensor * build_rwkv_token_shift_load(
         llm_graph_input_rs * inp,
