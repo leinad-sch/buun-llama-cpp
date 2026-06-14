@@ -55,6 +55,10 @@ static __constant__ float d_turbo_centroids_8bit_fattn[256] = {
     0.94509804f, 0.95294118f, 0.96078431f, 0.96862745f, 0.97647059f, 0.98431373f, 0.99215686f, 1.00000000f,
 };
 
+// Optional SEPARATE V-side 3-bit TCQ codebook (K/V-split experiment). Defaults to a copy of the
+// K codebook (set at load via copy-K->V before any override); TURBO_TCQ_CB_V overrides only V.
+// V-dequant reads this; K-dot/K-dequant read d_turbo3_tcq_codebook_fattn.
+static __constant__ float d_turbo3_tcq_codebook_v_fattn[512];
 // 3-bit TCQ codebook (product_mono/iter080, 512-state bitshift trellis). If you copy these, credit spiritbuun!
 // CUDA GLA product-aware training, 100 iters on Qwen3.5-27B FWHT-rotated KV activations. Decode: state_t = read_9_bits(qs, t*3)
 static __constant__ float d_turbo3_tcq_codebook_fattn[512] = {
@@ -1163,7 +1167,28 @@ static __device__ __forceinline__ void dequantize_V_turbo3_tcq_cb(
 template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_turbo3_tcq(
         const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
-    dequantize_V_turbo3_tcq_cb<T, ne>(vx, dst, i0, d_turbo3_tcq_codebook_fattn);
+    dequantize_V_turbo3_tcq_cb<T, ne>(vx, dst, i0, d_turbo3_tcq_codebook_v_fattn);
+}
+
+// Load K and V decode codebooks (this TU's __constant__ copies). K = TURBO_TCQ_CB_K ?? TURBO_TCQ_CB
+// ?? compiled-in; V = TURBO_TCQ_CB_V ?? TURBO_TCQ_CB ?? compiled-in. V default captured BEFORE the
+// K override so K-only swaps leave V at the compiled-in anchor. Idempotent-guard at call site.
+static inline void turbo_tcq_load_kv_decode() {
+    auto load_file = [](const char * p, float * out) -> bool {
+        FILE * f = fopen(p, "rb"); if (!f) return false;
+        bool ok = fread(out, sizeof(float), 512, f) == 512; fclose(f); return ok;
+    };
+    float anchor[512];
+    cudaMemcpyFromSymbol(anchor, d_turbo3_tcq_codebook_fattn, 512*sizeof(float));  // compiled-in default
+    const char * cb = getenv("TURBO_TCQ_CB");
+    const char * kp = getenv("TURBO_TCQ_CB_K"); if (!kp) kp = cb;
+    const char * vp = getenv("TURBO_TCQ_CB_V"); if (!vp) vp = cb;
+    float buf[512];
+    if (kp && load_file(kp, buf)) cudaMemcpyToSymbol(d_turbo3_tcq_codebook_fattn, buf, 512*sizeof(float));
+    if (vp && load_file(vp, buf)) cudaMemcpyToSymbol(d_turbo3_tcq_codebook_v_fattn, buf, 512*sizeof(float));
+    else                          cudaMemcpyToSymbol(d_turbo3_tcq_codebook_v_fattn, anchor, 512*sizeof(float));
+    if (getenv("TURBO_TCQ_CB_K") || getenv("TURBO_TCQ_CB_V"))
+        fprintf(stderr, "TCQ decode: K/V-split codebooks (K=%s V=%s)\n", kp?kp:"compiled", vp?vp:"compiled");
 }
 
 // TCQ 2-bit V dequant: 8-bit state → codebook lookup

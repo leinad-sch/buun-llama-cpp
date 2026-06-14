@@ -22,6 +22,29 @@ static __device__ int   d_innerq_count;                  // calibration token co
 static __device__ int   d_innerq_calibrate;              // 1 = accumulate stats, 0 = apply scales
 static __device__ int   d_innerq_is_k;                   // 1 = current set_rows is K cache, 0 = V cache
 
+// === Track B probe: post-FWHT per-bin statistics (KVarN channel-axis gate, #135) ===
+// During InnerQ calibration (identity scale), accumulate K-only post-rotation bin stats to test
+// whether our FWHT leaves material per-bin std imbalance / DC offset (= KVarN's per-channel lever).
+static __device__ float d_postfwht_bin_sum[128];         // sum of post-FWHT bin value (K only) → mean/DC
+static __device__ float d_postfwht_bin_sq[128];          // sum of post-FWHT bin value^2 (K only) → std
+static __device__ int   d_postfwht_count;                // K group count for the probe
+
+// === PFHEAD probe: RAW per-(layer,channel) K/V mean/std (per-head mean trick gate) ===
+// #135 pooled bins across heads+layers, which cancels per-head DC offsets (the TorQuant-cert
+// pooled-centering trap). This probe keys channel stats by (kv, layer, channel) so per-head
+// means survive, and accumulates PRE-norm PRE-rotation raw values: subtracting a per-head mean
+// at encode is softmax-neutral for K only when done in the raw domain (post-norm the missing
+// term picks up each token's group norm and stops being a uniform logit shift).
+// Enabled by TURBO_PFHEAD_DUMP=<path> during InnerQ calibration (TURBO_INNERQ=1, -ctk/-ctv turbo3).
+#define PFHEAD_MAX_L 128
+#define PFHEAD_MAX_C 2048
+static __device__ float * d_pfhead_sum = nullptr;        // [2][PFHEAD_MAX_L][PFHEAD_MAX_C] kv-major
+static __device__ float * d_pfhead_sq  = nullptr;
+static __device__ int   * d_pfhead_cnt = nullptr;        // [2][PFHEAD_MAX_L] row counts
+// NOTE: the layer index is passed as a KERNEL ARGUMENT (pf_layer), never a device symbol —
+// a per-launch symbol write races with queued kernels on the non-blocking compute stream
+// and misattributes samples across layers (discovered 2026-06-12: l63 absorbed 8x rows).
+
 // Forward declaration: fattn compilation unit has its own copy of inverse scales
 extern void turbo_innerq_update_fattn_scales(const float * scale_inv);
 extern void turbo_innerq_init_fattn();
@@ -40,10 +63,19 @@ static __device__ int       d_tcq_dump_max      = 0;       // max groups to dump
 static __device__ float * d_extract_buf_ptr = nullptr;
 static __device__ int   * d_extract_pos_ptr = nullptr;
 static __device__ int     d_extract_max_val = 0;
+// Optional per-record tag (layer*1000 + kvsel*100 + group), -1 = untagged source.
+// Parallel file /tmp/turbo_postrot_tags.bin, one int32 per 128-float record.
+static __device__ int   * d_extract_tag_ptr = nullptr;
+// TURBO_EXTRACT_STRIDE=N keeps every Nth record so the corpus spans more text
+// (default 1 = old behavior: buffer fills within the first prefill chunk).
+static __device__ int   * d_extract_seen_ptr = nullptr;
+static __device__ int     d_extract_stride_val = 1;
 
 // Host-side management
 static float * h_extract_gpu_buf = nullptr;
+static int   * h_extract_gpu_tags = nullptr;
 static int   * h_extract_gpu_pos = nullptr;
+static int   * h_extract_gpu_seen = nullptr;
 static int     h_extract_max = 0;
 static int     h_extract_state = 0;  // 0=uninit, 1=collecting, 2=done
 static std::once_flag h_extract_init_flag;
@@ -55,13 +87,22 @@ static void turbo_extract_init(int max_samples) {
 	int device_count;
 	cudaGetDeviceCount(&device_count);
 	cudaMalloc(&h_extract_gpu_buf, (size_t)max_samples * sizeof(float));
+	cudaMalloc(&h_extract_gpu_tags, (size_t)(max_samples / 128) * sizeof(int));
 	cudaMalloc(&h_extract_gpu_pos, sizeof(int));
+	cudaMalloc(&h_extract_gpu_seen, sizeof(int));
 	int zero = 0;
 	cudaMemcpy(h_extract_gpu_pos, &zero, sizeof(int), cudaMemcpyHostToDevice);
+	cudaMemcpy(h_extract_gpu_seen, &zero, sizeof(int), cudaMemcpyHostToDevice);
+	const char * stride_env = getenv("TURBO_EXTRACT_STRIDE");
+	int stride = stride_env ? atoi(stride_env) : 1;
+	if (stride < 1) stride = 1;
 	for (int id = 0; id < device_count; id++) {
 		cudaSetDevice(id);
 		cudaMemcpyToSymbol(d_extract_buf_ptr, &h_extract_gpu_buf, sizeof(float *));
+		cudaMemcpyToSymbol(d_extract_tag_ptr, &h_extract_gpu_tags, sizeof(int *));
 		cudaMemcpyToSymbol(d_extract_pos_ptr, &h_extract_gpu_pos, sizeof(int *));
+		cudaMemcpyToSymbol(d_extract_seen_ptr, &h_extract_gpu_seen, sizeof(int *));
+		cudaMemcpyToSymbol(d_extract_stride_val, &stride, sizeof(int));
 		cudaMemcpyToSymbol(d_extract_max_val, &max_samples, sizeof(int));
 		if (id != cur_device) {
 			cudaDeviceEnablePeerAccess(cur_device, 0);
@@ -91,6 +132,18 @@ static void turbo_extract_check_done() {
 				pos, path, (float)pos * sizeof(float) / (1024*1024));
 	}
 	free(host_buf);
+	{
+		const int n_rec = pos / 128;
+		int * tag_buf = (int *)malloc((size_t)n_rec * sizeof(int));
+		cudaMemcpy(tag_buf, h_extract_gpu_tags, (size_t)n_rec * sizeof(int), cudaMemcpyDeviceToHost);
+		FILE * tfp = fopen("/tmp/turbo_postrot_tags.bin", "wb");
+		if (tfp) {
+			fwrite(tag_buf, sizeof(int), n_rec, tfp);
+			fclose(tfp);
+			fprintf(stderr, "TURBO_EXTRACT: wrote %d tags to /tmp/turbo_postrot_tags.bin\n", n_rec);
+		}
+		free(tag_buf);
+	}
 	// Disable extraction (set device pointers to null) on all devices
 	float * null_ptr = nullptr;
 	int   * null_iptr = nullptr;
@@ -102,23 +155,31 @@ static void turbo_extract_check_done() {
 	for (int id = 0; id < dev_count; id++) {
 		cudaSetDevice(id);
 		cudaMemcpyToSymbol(d_extract_buf_ptr, &null_ptr, sizeof(float *));
+		cudaMemcpyToSymbol(d_extract_tag_ptr, &null_iptr, sizeof(int *));
 		cudaMemcpyToSymbol(d_extract_pos_ptr, &null_iptr, sizeof(int *));
+		cudaMemcpyToSymbol(d_extract_seen_ptr, &null_iptr, sizeof(int *));
 		cudaMemcpyToSymbol(d_extract_max_val, &zero_max, sizeof(int));
 	}
 	cudaSetDevice(cur_dev);
 	cudaFree(h_extract_gpu_buf); h_extract_gpu_buf = nullptr;
+	cudaFree(h_extract_gpu_tags); h_extract_gpu_tags = nullptr;
 	cudaFree(h_extract_gpu_pos); h_extract_gpu_pos = nullptr;
+	cudaFree(h_extract_gpu_seen); h_extract_gpu_seen = nullptr;
 	h_extract_state = 2;
 	// Also finalize Q² calibration if running
 	turbo_q_calibrate_finalize();
 }
 
 // Device-side: append 128 post-rotation values to extraction buffer
-static __device__ void turbo_extract_append(const float * x) {
+static __device__ void turbo_extract_append(const float * x, int tag = -1) {
 	if (!d_extract_buf_ptr || !d_extract_pos_ptr) return;
+	if (d_extract_stride_val > 1 && d_extract_seen_ptr) {
+		if (atomicAdd(d_extract_seen_ptr, 1) % d_extract_stride_val != 0) return;
+	}
 	int base = atomicAdd(d_extract_pos_ptr, 128);
 	if (base + 128 <= d_extract_max_val) {
 		for (int j = 0; j < 128; j++) d_extract_buf_ptr[base + j] = x[j];
+		if (d_extract_tag_ptr) d_extract_tag_ptr[base / 128] = tag;
 	}
 }
 
@@ -141,6 +202,9 @@ static void turbo_innerq_init() {
         cudaMemcpyToSymbol(d_innerq_count, &zero, sizeof(zero));
         cudaMemcpyToSymbol(d_innerq_calibrate, &zero, sizeof(zero));
         cudaMemcpyToSymbol(d_innerq_is_k, &zero, sizeof(zero));
+        cudaMemcpyToSymbol(d_postfwht_bin_sum, zeros, sizeof(zeros));
+        cudaMemcpyToSymbol(d_postfwht_bin_sq, zeros, sizeof(zeros));
+        cudaMemcpyToSymbol(d_postfwht_count, &zero, sizeof(zero));
     }
     cudaSetDevice(cur_device);
     turbo_innerq_init_fattn();
@@ -150,6 +214,129 @@ static void turbo_innerq_init() {
 // Host-side: set K/V flag before kernel launch (called from set-rows.cu)
 static void turbo_innerq_set_is_k(int is_k) {
     cudaMemcpyToSymbol(d_innerq_is_k, &is_k, sizeof(int));
+}
+
+// PFHEAD probe host state (current device only — probe runs are single-GPU)
+static float * h_pfhead_sum_ptr = nullptr;
+static float * h_pfhead_sq_ptr  = nullptr;
+static int   * h_pfhead_cnt_ptr = nullptr;
+
+// Host-side: allocate + arm the PFHEAD probe if TURBO_PFHEAD_DUMP is set
+static void turbo_pfhead_start() {
+    const char * path = getenv("TURBO_PFHEAD_DUMP");
+    if (!path || !path[0] || h_pfhead_sum_ptr) return;
+    const size_t n = (size_t) 2 * PFHEAD_MAX_L * PFHEAD_MAX_C;
+    cudaMalloc(&h_pfhead_sum_ptr, n * sizeof(float));
+    cudaMalloc(&h_pfhead_sq_ptr,  n * sizeof(float));
+    cudaMalloc(&h_pfhead_cnt_ptr, 2 * PFHEAD_MAX_L * sizeof(int));
+    cudaMemset(h_pfhead_sum_ptr, 0, n * sizeof(float));
+    cudaMemset(h_pfhead_sq_ptr,  0, n * sizeof(float));
+    cudaMemset(h_pfhead_cnt_ptr, 0, 2 * PFHEAD_MAX_L * sizeof(int));
+    cudaMemcpyToSymbol(d_pfhead_sum, &h_pfhead_sum_ptr, sizeof(h_pfhead_sum_ptr));
+    cudaMemcpyToSymbol(d_pfhead_sq,  &h_pfhead_sq_ptr,  sizeof(h_pfhead_sq_ptr));
+    cudaMemcpyToSymbol(d_pfhead_cnt, &h_pfhead_cnt_ptr, sizeof(h_pfhead_cnt_ptr));
+    fprintf(stderr, "PFHEAD probe: armed, raw per-(layer,channel) K/V stats -> %s\n", path);
+}
+
+// === K-mean subtraction (per-head mean trick, K-only) ===
+// TURBO_KMEAN_SUB=<PFH1 dump> loads per-(layer,channel) raw K means (sum/cnt, kv=0 slab) and
+// subtracts them from K at encode, PRE-norm PRE-rotation. No decode change needed: the missing
+// q·mu term is a per-head constant across positions, so softmax is shift-invariant to it.
+// Channels from layers with cnt<100 get mu=0 (no-op). V is NOT subtracted (V means survive the
+// weighted sum and would need a decode add-back).
+static float * h_kmean_dev[16] = {};
+static bool    h_kmean_checked[16] = {};
+static float * h_vmean_dev[16] = {};
+static bool    h_vmean_checked[16] = {};
+
+// Shared PFH1 mean-table loader. kvsel: 0 = K slab (TURBO_KMEAN_SUB), 1 = V slab
+// (TURBO_VMEAN_SUB; encode half of the V tap — the graph-level add restores mu_V at decode).
+static float * turbo_meansub_load(int device, int kvsel, const char * env_name) {
+    const char * path = getenv(env_name);
+    if (!path || !path[0]) return nullptr;
+    FILE * f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "%s: cannot open %s\n", env_name, path); return nullptr; }
+    int32_t hdr[4];
+    const size_t n = (size_t) 2 * PFHEAD_MAX_L * PFHEAD_MAX_C;
+    if (fread(hdr, sizeof(int32_t), 4, f) != 4 || hdr[0] != 0x50464831 ||
+        hdr[1] != 2 || hdr[2] != PFHEAD_MAX_L || hdr[3] != PFHEAD_MAX_C) {
+        fprintf(stderr, "%s: bad header in %s\n", env_name, path); fclose(f); return nullptr;
+    }
+    const size_t nk = (size_t) PFHEAD_MAX_L * PFHEAD_MAX_C;
+    float * sums = (float *) malloc(nk * sizeof(float));
+    int   * cnts = (int *)   malloc(2 * PFHEAD_MAX_L * sizeof(int));
+    bool ok = fseek(f, (long) (16 + (size_t) kvsel * nk * sizeof(float)), SEEK_SET) == 0 &&
+              fread(sums, sizeof(float), nk, f) == nk &&
+              fseek(f, (long) (16 + 2 * n * sizeof(float)), SEEK_SET) == 0 &&
+              fread(cnts, sizeof(int), 2 * PFHEAD_MAX_L, f) == (size_t) 2 * PFHEAD_MAX_L;
+    fclose(f);
+    if (!ok) { fprintf(stderr, "%s: short read in %s\n", env_name, path); free(sums); free(cnts); return nullptr; }
+    float * mu = (float *) calloc(nk, sizeof(float));
+    int layers_live = 0;
+    for (int l = 0; l < PFHEAD_MAX_L; l++) {
+        const int c = cnts[kvsel * PFHEAD_MAX_L + l];
+        if (c < 100) continue;
+        layers_live++;
+        for (int j = 0; j < PFHEAD_MAX_C; j++) {
+            mu[(size_t) l * PFHEAD_MAX_C + j] = sums[(size_t) l * PFHEAD_MAX_C + j] / c;
+        }
+    }
+    free(sums); free(cnts);
+    float * dev = nullptr;
+    cudaMalloc(&dev, nk * sizeof(float));
+    cudaMemcpy(dev, mu, nk * sizeof(float), cudaMemcpyHostToDevice);
+    free(mu);
+    fprintf(stderr, "%s (device %d): %s-mean table loaded from %s (%d live layers)\n",
+            env_name, device, kvsel == 0 ? "K" : "V", path, layers_live);
+    return dev;
+}
+
+static float * turbo_kmean_table(int device) {
+    if (device < 0 || device >= 16) return nullptr;
+    if (h_kmean_checked[device]) return h_kmean_dev[device];
+    h_kmean_checked[device] = true;
+    h_kmean_dev[device] = turbo_meansub_load(device, 0, "TURBO_KMEAN_SUB");
+    return h_kmean_dev[device];
+}
+
+static float * turbo_vmean_table_enc(int device) {
+    if (device < 0 || device >= 16) return nullptr;
+    if (h_vmean_checked[device]) return h_vmean_dev[device];
+    h_vmean_checked[device] = true;
+    h_vmean_dev[device] = turbo_meansub_load(device, 1, "TURBO_VMEAN_SUB");
+    return h_vmean_dev[device];
+}
+
+// Host-side: copy back + write the PFHEAD dump (PFH1: hdr, sums, sqs, counts)
+static void turbo_pfhead_dump() {
+    if (!h_pfhead_sum_ptr) return;
+    cudaDeviceSynchronize();   // drain in-flight set_rows kernels before reading accumulators
+    const char * path = getenv("TURBO_PFHEAD_DUMP");
+    const size_t n = (size_t) 2 * PFHEAD_MAX_L * PFHEAD_MAX_C;
+    float * sum = (float *) malloc(n * sizeof(float));
+    float * sq  = (float *) malloc(n * sizeof(float));
+    int   * cnt = (int *)   malloc(2 * PFHEAD_MAX_L * sizeof(int));
+    cudaMemcpy(sum, h_pfhead_sum_ptr, n * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(sq,  h_pfhead_sq_ptr,  n * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(cnt, h_pfhead_cnt_ptr, 2 * PFHEAD_MAX_L * sizeof(int), cudaMemcpyDeviceToHost);
+    FILE * f = fopen(path, "wb");
+    if (f) {
+        const int32_t hdr[4] = { 0x50464831 /*PFH1*/, 2, PFHEAD_MAX_L, PFHEAD_MAX_C };
+        fwrite(hdr, sizeof(int32_t), 4, f);
+        fwrite(sum, sizeof(float), n, f);
+        fwrite(sq,  sizeof(float), n, f);
+        fwrite(cnt, sizeof(int), 2 * PFHEAD_MAX_L, f);
+        fclose(f);
+        int layers_seen = 0;
+        long total_rows = 0;
+        for (int l = 0; l < PFHEAD_MAX_L; l++) {
+            if (cnt[l] > 0) { layers_seen++; total_rows += cnt[l]; }
+        }
+        fprintf(stderr, "PFHEAD probe: wrote %s (%d K layers seen, %ld K rows)\n", path, layers_seen, total_rows);
+    } else {
+        fprintf(stderr, "PFHEAD probe: FAILED to open %s\n", path);
+    }
+    free(sum); free(sq); free(cnt);
 }
 
 // Host-side: enable calibration mode (all devices)
@@ -165,9 +352,13 @@ static void turbo_innerq_start_calibration() {
         cudaMemcpyToSymbol(d_innerq_channel_sq, zeros, sizeof(zeros));
         cudaMemcpyToSymbol(d_innerq_channel_max, zeros, sizeof(zeros));
         cudaMemcpyToSymbol(d_innerq_count, &zero, sizeof(zero));
+        cudaMemcpyToSymbol(d_postfwht_bin_sum, zeros, sizeof(zeros));
+        cudaMemcpyToSymbol(d_postfwht_bin_sq, zeros, sizeof(zeros));
+        cudaMemcpyToSymbol(d_postfwht_count, &zero, sizeof(zero));
         cudaMemcpyToSymbol(d_innerq_calibrate, &one, sizeof(one));
     }
     cudaSetDevice(cur_device);
+    turbo_pfhead_start();
 }
 
 // Host-side: finalize calibration — compute scales from accumulated stats
@@ -189,6 +380,41 @@ static void turbo_innerq_finalize_calibration() {
     cudaMemcpyFromSymbol(sq, d_innerq_channel_sq, sizeof(sq));
     cudaMemcpyFromSymbol(ch_max, d_innerq_channel_max, sizeof(ch_max));
     cudaMemcpyFromSymbol(&count, d_innerq_count, sizeof(count));
+
+    // Track B probe (#135): report post-FWHT per-bin std imbalance + DC offset (K-only).
+    // Flat std (~<1.3x) + zero-mean => KVarN's per-channel machinery (Sinkhorn + affine zp) is null here.
+    {
+        float pf_sum[128], pf_sq[128];
+        int pf_count = 0;
+        cudaMemcpyFromSymbol(pf_sum, d_postfwht_bin_sum, sizeof(pf_sum));
+        cudaMemcpyFromSymbol(pf_sq, d_postfwht_bin_sq, sizeof(pf_sq));
+        cudaMemcpyFromSymbol(&pf_count, d_postfwht_count, sizeof(pf_count));
+        if (pf_count > 0) {
+            float std_min = 1e30f, std_max = 0.0f, std_sum = 0.0f;
+            float max_abs_mean = 0.0f, bin0_mean = 0.0f, bin0_std = 0.0f;
+            int imax = -1;
+            for (int j = 0; j < 128; j++) {
+                float mean = pf_sum[j] / pf_count;
+                float ex2  = pf_sq[j] / pf_count;
+                float var  = ex2 - mean * mean;
+                float sd   = var > 0.0f ? sqrtf(var) : 0.0f;
+                std_sum += sd;
+                if (sd < std_min) std_min = sd;
+                if (sd > std_max) { std_max = sd; imax = j; }
+                if (fabsf(mean) > max_abs_mean) max_abs_mean = fabsf(mean);
+                if (j == 0) { bin0_mean = mean; bin0_std = sd; }
+            }
+            float mean_std = std_sum / 128.0f;
+            float std_ratio = std_min > 1e-12f ? std_max / std_min : 0.0f;
+            fprintf(stderr,
+                "PostFWHT probe (#135, K-only, %d groups): per-bin std min=%.5f max=%.5f mean=%.5f "
+                "RATIO=%.3f (max bin=%d) | max|mean|=%.5f (vs mean_std %.5f) | bin0 mean=%.5f std=%.5f\n",
+                pf_count, std_min, std_max, mean_std, std_ratio, imax,
+                max_abs_mean, mean_std, bin0_mean, bin0_std);
+        }
+    }
+
+    turbo_pfhead_dump();
 
     if (count == 0) return;
 
@@ -258,8 +484,12 @@ static void turbo_innerq_finalize_calibration() {
     fprintf(stderr, "InnerQ calibration: %d tokens, mode=%d, strength=%.2f, max scale ratio: %.3f (clamped to %.1f)\n",
             count, mode, strength, max_ratio, max_clamp);
 
-    // Auto-detect: if channels are already well-balanced, InnerQ won't help — skip
-    if (max_ratio < 1.2f) {
+    // Auto-detect: if channels are already well-balanced, InnerQ won't help — skip.
+    // TURBO_INNERQ_FORCE=1 bypasses this PPL-era heuristic so low-strength scales
+    // (e.g. strength 0.2 → ratio<1.2) can be measured on KLD/hazard/trajectory.
+    static const char * force_env = getenv("TURBO_INNERQ_FORCE");
+    bool force = force_env && atoi(force_env) > 0;
+    if (max_ratio < 1.2f && !force) {
         fprintf(stderr, "InnerQ: max ratio %.3f < 1.2 — channels already balanced, disabling (would hurt quality)\n", max_ratio);
         float ones[128];
         for (int i = 0; i < 128; i++) ones[i] = 1.0f;
@@ -448,7 +678,7 @@ static __global__ void k_set_rows_turbo3(
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
         const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t s10, const int64_t s11, const int64_t s12,
-        const int innerq_is_k,
+        const int innerq_is_k, const float * __restrict__ kmean_mu, const int pf_layer,
         const int64_t s1,  const int64_t s2,  const int64_t s3,
         const uint3 ne00_fd, const uint3 ne01_fd, const uint3 ne02_fd,
         const uint3 ne11_fd, const uint3 ne12_fd) {
@@ -483,6 +713,20 @@ static __global__ void k_set_rows_turbo3(
             } while (atomicCAS(addr, assumed, old_val) != assumed);
         }
         atomicAdd(&d_innerq_count, 1);
+        // PFHEAD probe: raw (pre-norm, pre-rotation) per-(kv,layer,channel) stats
+        if (d_pfhead_sum != nullptr && pf_layer >= 0 && pf_layer < PFHEAD_MAX_L && i00 + 128 <= PFHEAD_MAX_C) {
+            const int kvsel = innerq_is_k ? 0 : 1;
+            const size_t base = ((size_t) kvsel * PFHEAD_MAX_L + pf_layer) * PFHEAD_MAX_C + i00;
+            for (int j = 0; j < 128; j++) {
+                atomicAdd(&d_pfhead_sum[base + j], x[j]);
+                atomicAdd(&d_pfhead_sq[base + j],  x[j] * x[j]);
+            }
+            if (i00 == 0) atomicAdd(&d_pfhead_cnt[kvsel * PFHEAD_MAX_L + pf_layer], 1);
+        }
+    }
+    // K-mean subtract (raw domain; probe above intentionally sees PRE-subtract values)
+    if (kmean_mu != nullptr) {
+        for (int j = 0; j < 128; j++) x[j] -= kmean_mu[i00 + j];
     }
     for (int j = 0; j < 128; j++) x[j] *= d_innerq_channel_scale[j];
     norm_sq = 0.0f;
@@ -491,8 +735,17 @@ static __global__ void k_set_rows_turbo3(
     float inv_norm = grp_norm > 1e-10f ? 1.0f / grp_norm : 0.0f;
     for (int j = 0; j < 128; j++) x[j] *= inv_norm;
     turbo_rotate_forward_cuda(x, d_turbo_wht_signs1, d_turbo_wht_signs2);
-    // Post-rotation extraction (if enabled)
-    turbo_extract_append(x);
+    // Track B probe (#135): K-only post-FWHT per-bin stats during InnerQ calibration (identity scale).
+    if (d_innerq_calibrate && innerq_is_k) {
+        for (int j = 0; j < 128; j++) {
+            atomicAdd(&d_postfwht_bin_sum[j], x[j]);
+            atomicAdd(&d_postfwht_bin_sq[j], x[j] * x[j]);
+        }
+        atomicAdd(&d_postfwht_count, 1);
+    }
+    // Post-rotation extraction (if enabled); tag = layer*1000 + kvsel*100 + group
+    turbo_extract_append(x, pf_layer >= 0
+        ? pf_layer * 1000 + (innerq_is_k ? 0 : 100) + (int)(i00 / 128) : -1);
     // Quantize and accumulate reconstruction norm for correction
     float recon_norm_sq = 0.0f;
     for (int b = 0; b < blocks_per_group; b++) {
@@ -530,6 +783,45 @@ void dequantize_turbo3_0(const void * vx, const int64_t ib, const int iqs, float
       const uint8_t low2 = (x[ib].qs[j/4] >> ((j%4)*2)) & 0x3;
       const uint8_t hi1  = (x[ib].signs[j/8] >> (j%8)) & 0x1;
       v.y = d_turbo_centroids_3bit[low2 | (hi1 << 2)] * norm; }
+}
+
+// === TURBO3: per-128-group quantize (for the ragged roundtrip harness) ===
+// Mirrors k_set_rows_turbo3's math on a single 128-coord group (= QK_TURBO3_GROUP =
+// head_dim = 4 sub-blocks of QK_TURBO3). No innerq atomics (read-only channel scale,
+// identity by default) so it never mutates calibration globals.
+static __device__ __forceinline__
+void quantize_f32_turbo3_0_block(const float * src, block_turbo3_0 * dst) {
+    // NOTE: no InnerQ channel-scale here. d_innerq_channel_scale is only initialized
+    // (to 1.0) by turbo_innerq_init(), which runs only when a turbo KV type is active.
+    // The ragged injector runs with -ctk f16, so that global stays zero-initialized;
+    // multiplying by it would zero the reconstruction. InnerQ is never calibrated in
+    // these sweeps, so identity (no scale) is the faithful turbo3 behavior here.
+    float x[128];
+    for (int j = 0; j < 128; j++) x[j] = src[j];
+    float norm_sq = 0.0f;
+    for (int j = 0; j < 128; j++) norm_sq += x[j] * x[j];
+    const float grp_norm = sqrtf(norm_sq);
+    const float inv_norm = grp_norm > 1e-10f ? 1.0f / grp_norm : 0.0f;
+    for (int j = 0; j < 128; j++) x[j] *= inv_norm;
+    turbo_rotate_forward_cuda(x, d_turbo_wht_signs1, d_turbo_wht_signs2);
+    const int blocks_per_group = QK_TURBO3_GROUP / QK_TURBO3;
+    float recon_norm_sq = 0.0f;
+    for (int b = 0; b < blocks_per_group; b++) {
+        block_turbo3_0 & blk = dst[b];
+        const int off = b * QK_TURBO3;
+        for (int j = 0; j < QK_TURBO3 / 4; j++) blk.qs[j] = 0;
+        for (int j = 0; j < QK_TURBO3 / 8; j++) blk.signs[j] = 0;
+        for (int j = 0; j < QK_TURBO3; j++) {
+            uint8_t idx = turbo_find_nearest_3bit(x[off + j]);
+            blk.qs[j / 4] |= (idx & 0x3) << ((j % 4) * 2);
+            if (idx & 0x4) blk.signs[j / 8] |= (1 << (j % 8));
+            const float c = d_turbo_centroids_3bit[idx];
+            recon_norm_sq += c * c;
+        }
+    }
+    const float recon_norm = sqrtf(recon_norm_sq);
+    const float corrected_norm = (recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm;
+    for (int b = 0; b < blocks_per_group; b++) dst[b].norm = __float2half(corrected_norm);
 }
 
 // Temperature scaling for turbo4. KLD-optimal: α=1.0 (any scaling hurts KLD).
@@ -620,6 +912,106 @@ void dequantize_turbo8_0(const void * vx, const int64_t ib, const int iqs, float
     v.y = d_turbo_centroids_8bit[x[ib].qs[iqs + 64]] * norm;
 }
 
+// === RAGGED reconstruct-to-fp16 quality harness (EXP-16) ===
+// A static (position, layer, K/V) -> precision-tier schedule, applied at KV write.
+// Degraded rows are round-tripped quant->dequant and stored as f16; protected rows
+// stay exact f16. No ragged storage / no mixed-dtype fattn — this measures the
+// QUALITY (KLD) cost of per-row precision only. tier codes: 16=f16 (lossless),
+// 8=turbo8, 4=turbo4, 3=turbo3 (group-norm over the 128-coord head_dim group).
+// kv: 0=any, 1=K-only, 2=V-only. Last matching band wins.
+struct ragged_band { int pos_lo, pos_hi, lay_lo, lay_hi, cb_lo, cb_hi, kv, tier; };
+static __constant__ ragged_band d_ragged_bands[128];
+static __constant__ int d_ragged_nbands = 0;
+static __constant__ int d_ragged_default_tier = 16;
+
+// Content/token axis (EXP-15d): optional per-(window,position) tier mask in global
+// memory. d_ragged_window = current KLD chunk index (set per-chunk from perplexity).
+// A non-zero mask byte seeds the tier (overriding default); positional bands below
+// still override it (last-match-wins) so wall bands protect sink/recent on top.
+static __device__ const unsigned char * d_ragged_cmask = nullptr;
+static __constant__ int d_ragged_cmask_nctx = 0;
+static __constant__ int d_ragged_window      = 0;
+
+static __device__ __forceinline__
+int ragged_lookup_tier(int64_t pos, int layer, int is_k, int cb) {
+    int tier = d_ragged_default_tier;
+    if (d_ragged_cmask != nullptr && d_ragged_cmask_nctx > 0 && pos < d_ragged_cmask_nctx) {
+        const unsigned char ct = d_ragged_cmask[(int64_t) d_ragged_window * d_ragged_cmask_nctx + pos];
+        if (ct) tier = ct;
+    }
+    for (int i = 0; i < d_ragged_nbands; i++) {
+        const ragged_band b = d_ragged_bands[i];
+        if (pos < b.pos_lo || pos >= b.pos_hi) continue;
+        if (layer < b.lay_lo || layer > b.lay_hi) continue;
+        if (cb < b.cb_lo || cb >= b.cb_hi) continue;
+        if (b.kv == 1 && !is_k) continue;
+        if (b.kv == 2 &&  is_k) continue;
+        tier = b.tier;
+    }
+    return tier;
+}
+
+// Quantize one 128-coord block to `tier`, then dequantize back to ORIGINAL space
+// (inverse FWHT = forward rotation with the sign arrays swapped, since the
+// normalized FWHT is an involution). Storing the original-space reconstruction as
+// f16 makes a standard f16 Q.K reproduce the real rotated-space turbo score:
+// Q . R^-1(norm*c) == (HQ) . (norm*c).
+static __device__ __forceinline__
+void turbo_roundtrip_block_to_orig(const float * src, float * out, int tier) {
+    float xr[128];
+    float2 v;
+    if (tier == 8) {
+        block_turbo8_0 blk;
+        quantize_f32_turbo8_0_block(src, &blk);
+        for (int iqs = 0; iqs < 64; iqs++) {
+            dequantize_turbo8_0(&blk, 0, iqs, v);
+            xr[iqs] = v.x; xr[iqs + 64] = v.y;
+        }
+    } else if (tier == 4) {
+        block_turbo4_0 blk;
+        quantize_f32_turbo4_0_block(src, &blk);
+        for (int iqs = 0; iqs < 64; iqs++) {
+            dequantize_turbo4_0(&blk, 0, iqs, v);
+            xr[iqs] = v.x; xr[iqs + 64] = v.y;
+        }
+    } else if (tier == 2) { // 2-bit, shared 128-group norm (mirror of the turbo2 set_rows kernel,
+                            // inlined here because turbo_find_nearest_2bit is defined further down).
+        float x2[128];
+        float nsq = 0.0f;
+        for (int j = 0; j < 128; j++) { x2[j] = src[j]; nsq += x2[j] * x2[j]; }
+        const float gnorm = sqrtf(nsq);
+        const float invn = gnorm > 1e-10f ? 1.0f / gnorm : 0.0f;
+        for (int j = 0; j < 128; j++) x2[j] *= invn;
+        turbo_rotate_forward_cuda(x2, d_turbo_wht_signs1, d_turbo_wht_signs2);
+        uint8_t idxs[128];
+        float rnsq = 0.0f;
+        for (int j = 0; j < 128; j++) {
+            const float val = x2[j];
+            const uint8_t idx = (val < d_turbo_mid_2bit[0]) ? 0 :
+                                (val < d_turbo_mid_2bit[1]) ? 1 :
+                                (val < d_turbo_mid_2bit[2]) ? 2 : 3;
+            idxs[j] = idx;
+            const float c = d_turbo_centroids_2bit[idx];
+            rnsq += c * c;
+        }
+        const float rnorm = sqrtf(rnsq);
+        const float cnorm = (rnorm > 1e-10f) ? gnorm / rnorm : gnorm;
+        for (int j = 0; j < 128; j++) xr[j] = d_turbo_centroids_2bit[idxs[j]] * cnorm;
+    } else { // tier == 3 (4 sub-blocks of QK_TURBO3, shared group norm)
+        block_turbo3_0 blk[QK_TURBO3_GROUP / QK_TURBO3];
+        quantize_f32_turbo3_0_block(src, blk);
+        for (int ib = 0; ib < QK_TURBO3_GROUP / QK_TURBO3; ib++) {
+            for (int iqs = 0; iqs < QK_TURBO3 / 2; iqs++) {
+                dequantize_turbo3_0(blk, ib, iqs, v);
+                xr[ib * QK_TURBO3 + iqs]                 = v.x;
+                xr[ib * QK_TURBO3 + iqs + QK_TURBO3 / 2] = v.y;
+            }
+        }
+    }
+    turbo_rotate_forward_cuda(xr, d_turbo_wht_signs2, d_turbo_wht_signs1);
+    for (int j = 0; j < 128; j++) out[j] = xr[j];
+}
+
 // === TURBO2: find nearest 2-bit centroid ===
 static __device__ __forceinline__
 uint8_t turbo_find_nearest_2bit(float val) {
@@ -638,6 +1030,7 @@ static __global__ void k_set_rows_turbo2(
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
         const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t s10, const int64_t s11, const int64_t s12,
+        const float * __restrict__ kmean_mu,
         const int64_t s1,  const int64_t s2,  const int64_t s3,
         const uint3 ne00_fd, const uint3 ne01_fd, const uint3 ne02_fd,
         const uint3 ne11_fd, const uint3 ne12_fd) {
@@ -657,6 +1050,11 @@ static __global__ void k_set_rows_turbo2(
     const int blocks_per_group = QK_TURBO2_GROUP / QK_TURBO2;
     float x[128]; float norm_sq = 0.0f;
     for (int j = 0; j < 128; j++) { x[j] = grp_src[j]; norm_sq += x[j] * x[j]; }
+    // K-mean subtract (raw domain): re-derive the norm from the centered vector
+    if (kmean_mu != nullptr) {
+        norm_sq = 0.0f;
+        for (int j = 0; j < 128; j++) { x[j] -= kmean_mu[i00 + j]; norm_sq += x[j] * x[j]; }
+    }
     float grp_norm = sqrtf(norm_sq);
     float inv_norm = grp_norm > 1e-10f ? 1.0f / grp_norm : 0.0f;
     for (int j = 0; j < 128; j++) x[j] *= inv_norm;
@@ -694,6 +1092,10 @@ void dequantize_turbo2_0(const void * vx, const int64_t ib, const int iqs, float
       v.y = d_turbo_centroids_2bit[idx] * norm; }
 }
 
+// Optional SEPARATE V-side encode codebook (K/V-split experiment). Defaults to a copy of the K
+// codebook at load (before any override); TURBO_TCQ_CB_V overrides only V. K-encode reads
+// d_turbo3_tcq_codebook, V-encode reads this, selected by innerq_is_k in k_set_rows_turbo3_tcq.
+static __constant__ float d_turbo3_tcq_codebook_v[512];
 // 3-bit TCQ codebook (product_mono/iter080, 512-state bitshift trellis). If you copy these, credit spiritbuun!
 // CUDA GLA product-aware training, 100 iters on Qwen3.5-27B FWHT-rotated KV activations. Decode: state_t = read_9_bits(qs, t*3)
 static __constant__ float d_turbo3_tcq_codebook[512] = {
@@ -769,6 +1171,27 @@ static __constant__ float d_turbo3_tcq_codebook[512] = {
 static __constant__ float d_tcq_norm_alpha = 1.0f;
 static __constant__ float d_tcq_norm_alpha_v = 1.04f;
 
+// Load K and V ENCODE codebooks (this TU's __constant__ copies). Mirrors the decode helper:
+// K = TURBO_TCQ_CB_K ?? TURBO_TCQ_CB ?? compiled-in; V = TURBO_TCQ_CB_V ?? TURBO_TCQ_CB ??
+// compiled-in. V default captured BEFORE the K override so K-only swaps leave V at the anchor.
+static inline void turbo_tcq_load_kv_encode() {
+    auto load_file = [](const char * p, float * out) -> bool {
+        FILE * f = fopen(p, "rb"); if (!f) return false;
+        bool ok = fread(out, sizeof(float), 512, f) == 512; fclose(f); return ok;
+    };
+    float anchor[512];
+    cudaMemcpyFromSymbol(anchor, d_turbo3_tcq_codebook, 512*sizeof(float));
+    const char * cb = getenv("TURBO_TCQ_CB");
+    const char * kp = getenv("TURBO_TCQ_CB_K"); if (!kp) kp = cb;
+    const char * vp = getenv("TURBO_TCQ_CB_V"); if (!vp) vp = cb;
+    float buf[512];
+    if (kp && load_file(kp, buf)) cudaMemcpyToSymbol(d_turbo3_tcq_codebook,   buf,    512*sizeof(float));
+    if (vp && load_file(vp, buf)) cudaMemcpyToSymbol(d_turbo3_tcq_codebook_v, buf,    512*sizeof(float));
+    else                          cudaMemcpyToSymbol(d_turbo3_tcq_codebook_v, anchor, 512*sizeof(float));
+    if (getenv("TURBO_TCQ_CB_K") || getenv("TURBO_TCQ_CB_V"))
+        fprintf(stderr, "TCQ encode: K/V-split codebooks (K=%s V=%s)\n", kp?kp:"compiled", vp?vp:"compiled");
+}
+
 // TCQ SET_ROWS encode: Viterbi optimal path with right-shift trellis
 // 512 threads per block (one per trellis state), one block per 128-element group
 // Double-buffered cost arrays + global memory backtrace (128 syncs/group, was 384)
@@ -782,7 +1205,7 @@ static __global__ void __launch_bounds__(512, 1) k_set_rows_turbo3_tcq(
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
         const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t s10, const int64_t s11, const int64_t s12,
-        const int innerq_is_k,
+        const int innerq_is_k, const float * __restrict__ kvmean_mu,
         const int64_t s1,  const int64_t s2,  const int64_t s3,
         const uint3 ne00_fd, const uint3 ne01_fd, const uint3 ne02_fd,
         const uint3 ne11_fd, const uint3 ne12_fd) {
@@ -836,6 +1259,8 @@ static __global__ void __launch_bounds__(512, 1) k_set_rows_turbo3_tcq(
         } while (atomicCAS(addr, assumed, old_val) != assumed);
         if (sid == 0) atomicAdd(&d_innerq_count, 1);
     }
+    // Affine tap: raw-domain mean subtract (mu pre-offset to this layer on host)
+    if (kvmean_mu != nullptr && sid < 128) x[sid] -= kvmean_mu[i00 + sid];
     // No sync needed: calibration writes d_innerq_channel_sq/max, scaling reads d_innerq_channel_scale
     if (sid < 128) x[sid] *= d_innerq_channel_scale[sid];
     __syncthreads();
@@ -930,7 +1355,7 @@ static __global__ void __launch_bounds__(512, 1) k_set_rows_turbo3_tcq(
         __syncthreads();
 
         const int pred_idx = sid & 0x3F;
-        float dist = xt - d_turbo3_tcq_codebook[sid];
+        float dist = xt - (innerq_is_k ? d_turbo3_tcq_codebook : d_turbo3_tcq_codebook_v)[sid];
         dist = dist * dist;
 
         cost_wr[sid] = pred_min_cost[pred_idx] + dist;
@@ -1006,7 +1431,7 @@ static __global__ void __launch_bounds__(512, 1) k_set_rows_turbo3_tcq(
                       | (((int)outputs[sid - 1] & 0x7) << 3)
                       | (((int)outputs[sid]     & 0x7) << 6);
         }
-        float c = d_turbo3_tcq_codebook[cur_state];
+        float c = (innerq_is_k ? d_turbo3_tcq_codebook : d_turbo3_tcq_codebook_v)[cur_state];
         my_recon_sq = c * c;
     }
     cost[sid] = my_recon_sq;

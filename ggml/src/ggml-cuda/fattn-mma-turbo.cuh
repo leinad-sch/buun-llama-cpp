@@ -82,15 +82,7 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
         static bool cb3_loaded = false;
         if (!cb3_loaded) {
             cb3_loaded = true;
-            const char * cb_path = getenv("TURBO_TCQ_CB");
-            if (cb_path) {
-                float cb[512];
-                FILE * f = fopen(cb_path, "rb");
-                if (f && fread(cb, sizeof(float), 512, f) == 512) {
-                    fclose(f);
-                    CUDA_CHECK(cudaMemcpyToSymbol(d_turbo3_tcq_codebook_fattn, cb, 512 * sizeof(float)));
-                } else { if (f) fclose(f); }
-            }
+            turbo_tcq_load_kv_decode();
         }
     }
     if constexpr (type_K == GGML_TYPE_TURBO2_TCQ || type_V == GGML_TYPE_TURBO2_TCQ) {

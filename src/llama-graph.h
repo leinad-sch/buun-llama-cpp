@@ -359,6 +359,11 @@ public:
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
 
+    // TurboQuant V-mean tap: per-layer GQA-expanded mu_V table [pdim, n_layer], added back
+    // once after the inverse WHT (attention weights sum to 1, so the mean re-enters as a
+    // constant vector). Loaded from TURBO_VMEAN_SUB; nullptr when the tap is off.
+    ggml_tensor * self_vmean = nullptr;
+
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
     //       llm_graph_params from a previous batch, causing stack-use-after-return
@@ -479,6 +484,9 @@ public:
 
     ggml_tensor * self_k_rot_swa = nullptr;
     ggml_tensor * self_v_rot_swa = nullptr;
+
+    // TurboQuant V-mean tap (see llm_graph_input_attn_kv::self_vmean)
+    ggml_tensor * self_vmean = nullptr;
 
     const llama_hparams hparams;
     const llama_cparams cparams;
