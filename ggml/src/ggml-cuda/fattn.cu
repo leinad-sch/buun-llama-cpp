@@ -1518,35 +1518,6 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
     cudaStream_t stream = ctx.stream();
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
-    const ggml_tensor * K_promoted = dst->src[5];
-    const ggml_tensor * K_row_bands = dst->src[6];
-    const ggml_tensor * V_promoted = dst->src[7];
-    const ggml_tensor * V_row_bands = dst->src[8];
-    const bool vbr_stage2a_k = K_promoted != nullptr || K_row_bands != nullptr;
-    const bool vbr_stage2a_v = V_promoted != nullptr || V_row_bands != nullptr;
-    if (vbr_stage2a_k) {
-        GGML_ASSERT(K_promoted != nullptr);
-        GGML_ASSERT(K_row_bands != nullptr);
-        GGML_ASSERT(vbr_stage2a_promoted_k_type_supported(K_promoted->type));
-        GGML_ASSERT(K_promoted->ne[0] == K->ne[0]);
-        GGML_ASSERT(K_promoted->ne[2] == K->ne[2]);
-        GGML_ASSERT(K_promoted->ne[3] == K->ne[3]);
-        GGML_ASSERT(K_promoted->ne[1] > 0);
-        GGML_ASSERT(K_row_bands->type == GGML_TYPE_I32);
-        GGML_ASSERT(K_row_bands->ne[0] == 2 || K_row_bands->ne[0] >= 4);
-    }
-    if (vbr_stage2a_v) {
-        GGML_ASSERT(V_promoted != nullptr);
-        GGML_ASSERT(V_row_bands != nullptr);
-        GGML_ASSERT(vbr_stage2a_promoted_k_type_supported(V_promoted->type));
-        GGML_ASSERT(V_promoted->ne[0] == V->ne[0]);
-        GGML_ASSERT(V_promoted->ne[2] == V->ne[2]);
-        GGML_ASSERT(V_promoted->ne[3] == V->ne[3]);
-        GGML_ASSERT(V_promoted->ne[1] > 0);
-        GGML_ASSERT(V_row_bands->type == GGML_TYPE_I32);
-        GGML_ASSERT(V_row_bands->ne[0] == 2 || V_row_bands->ne[0] >= 4);
-    }
-
     const bool turbo_k = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO8_0 || K->type == GGML_TYPE_TURBO3_TCQ || K->type == GGML_TYPE_TURBO2_TCQ || K->type == GGML_TYPE_TURBO1 || K->type == GGML_TYPE_TURBO1_NSN || K->type == GGML_TYPE_TURBO1_CQ || K->type == GGML_TYPE_TURBO1_TCQ;
     const bool turbo_v = V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO8_0 || V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ || V->type == GGML_TYPE_TURBO1 || V->type == GGML_TYPE_TURBO1_NSN || V->type == GGML_TYPE_TURBO1_CQ || V->type == GGML_TYPE_TURBO1_TCQ;
     // Mixed (asymmetric) K/V: a q8_0 side must be dequanted to f16 here too, otherwise the raw
@@ -1645,118 +1616,6 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
         }
     }
 
-    if (vbr_stage2a_k) {
-        GGML_ASSERT(k_fp16 != nullptr);
-
-        const size_t bands_bytes = (size_t) K_row_bands->ne[0] * K_row_bands->ne[1] * sizeof(int32_t);
-        if (bands_bytes > vbr_stage2a_k_row_bands_buf_size[device]) {
-            if (vbr_stage2a_k_row_bands_buf[device]) CUDA_CHECK(cudaFree(vbr_stage2a_k_row_bands_buf[device]));
-            CUDA_CHECK(cudaMalloc(&vbr_stage2a_k_row_bands_buf[device], bands_bytes));
-            vbr_stage2a_k_row_bands_buf_size[device] = bands_bytes;
-        }
-        const ggml_tensor * K_row_bands_root = K_row_bands;
-        while (K_row_bands_root->view_src) {
-            K_row_bands_root = K_row_bands_root->view_src;
-        }
-        const cudaMemcpyKind band_copy_kind =
-            (K_row_bands_root->buffer == nullptr || ggml_backend_buffer_is_host(K_row_bands_root->buffer)) ?
-                cudaMemcpyHostToDevice : cudaMemcpyDeviceToDevice;
-        const char * band_data = (const char *) K_row_bands->data;
-        CUDA_CHECK(cudaMemcpyAsync(vbr_stage2a_k_row_bands_buf[device], band_data, bands_bytes, band_copy_kind, stream));
-
-        static int vbr_stage2a_debug_count = 0;
-        static int vbr_stage2a_debug_enabled = -1;
-        if (vbr_stage2a_debug_enabled < 0) {
-            const char * e = getenv("TURBO_VBR_STAGE2A_DEBUG");
-            vbr_stage2a_debug_enabled = e && e[0] && strcmp(e, "0") != 0;
-        }
-        static int64_t vbr_stage2a_debug_last_ne1 = -1;
-        if (vbr_stage2a_debug_enabled && (vbr_stage2a_debug_count < 8 || K->ne[1] != vbr_stage2a_debug_last_ne1)) {
-            vbr_stage2a_debug_count++;
-            vbr_stage2a_debug_last_ne1 = K->ne[1];
-            cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
-            CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
-            fprintf(stderr,
-                    "STAGE2A_CUDA K_type=%s KP_type=%s bands=%lld stride=%lld capture=%d K_ne=[%lld,%lld,%lld,%lld] KP_ne=[%lld,%lld,%lld,%lld] K_view=%zu KP_view=%zu K_nb=[%zu,%zu,%zu,%zu] KP_nb=[%zu,%zu,%zu,%zu]\n",
-                    ggml_type_name(K->type),
-                    ggml_type_name(K_promoted->type),
-                    (long long) K_row_bands->ne[1],
-                    (long long) K_row_bands->ne[0],
-                    (int) capture_status,
-                    (long long) K->ne[0], (long long) K->ne[1], (long long) K->ne[2], (long long) K->ne[3],
-                    (long long) K_promoted->ne[0], (long long) K_promoted->ne[1], (long long) K_promoted->ne[2], (long long) K_promoted->ne[3],
-                    K->view_offs, K_promoted->view_offs,
-                    K->nb[0], K->nb[1], K->nb[2], K->nb[3],
-                    K_promoted->nb[0], K_promoted->nb[1], K_promoted->nb[2], K_promoted->nb[3]);
-        }
-
-        dim3 grid_copy(K->ne[1], K->ne[2], K->ne[3]);
-        if (K_promoted->type == GGML_TYPE_BF16) {
-            k_vbr_stage2a_copy_promoted_rows_bf16<<<grid_copy, K->ne[0], 0, stream>>>(
-                k_fp16, (const char *) K_promoted->data, vbr_stage2a_k_row_bands_buf[device], K_row_bands->ne[1],
-                K_row_bands->ne[0], K->ne[0], K->ne[1], K_promoted->ne[1], K->ne[2],
-                K_promoted->nb[1], K_promoted->nb[2], K_promoted->nb[3]);
-        } else if (K_promoted->type == GGML_TYPE_F16) {
-            k_vbr_stage2a_copy_promoted_rows_native_f16<<<grid_copy, K->ne[0], 0, stream>>>(
-                k_fp16, (const char *) K_promoted->data, vbr_stage2a_k_row_bands_buf[device], K_row_bands->ne[1],
-                K_row_bands->ne[0], K->ne[0], K->ne[1], K_promoted->ne[1], K->ne[2],
-                K_promoted->nb[1], K_promoted->nb[2], K_promoted->nb[3]);
-        } else {
-            const ggml_tensor * kp_root = K_promoted;
-            while (kp_root->view_src) kp_root = kp_root->view_src;
-            const size_t kp_size = (size_t) ggml_nelements(kp_root) * sizeof(half);
-            if (kp_size > kv_dequant_k_promoted_buf_size[device]) {
-                if (kv_dequant_k_promoted_buf[device]) CUDA_CHECK(cudaFree(kv_dequant_k_promoted_buf[device]));
-                CUDA_CHECK(cudaMalloc(&kv_dequant_k_promoted_buf[device], kp_size));
-                kv_dequant_k_promoted_buf_size[device] = kp_size;
-            }
-            half * kp_fp16 = kv_dequant_k_promoted_buf[device];
-
-            dim3 grid_kp(K_promoted->ne[1], K_promoted->ne[2], K_promoted->ne[3]);
-            if (K_promoted->type == GGML_TYPE_TURBO3_TCQ) {
-                static bool tcq_fattn_kp_cb_loaded[GGML_CUDA_MAX_DEVICES] = {};
-                static int tcq_hot_kp = -1; if (tcq_hot_kp < 0) tcq_hot_kp = getenv("TURBO_TCQ_HOTSWAP") ? 1 : 0;
-                if (!tcq_fattn_kp_cb_loaded[device] || tcq_hot_kp) {
-                    tcq_fattn_kp_cb_loaded[device] = true;
-                    turbo_tcq_load_kv_decode();
-                }
-                k_turbo3_tcq_dequant_f16_inv_fwht<<<grid_kp, 128, 0, stream>>>(
-                    (const char *)K_promoted->data, kp_fp16, K_promoted->ne[0], K_promoted->ne[1], K_promoted->ne[2],
-                    K_promoted->nb[1], K_promoted->nb[2], K_promoted->nb[3], d_tcq_decode_alpha_k);
-            } else if (K_promoted->type == GGML_TYPE_TURBO2_TCQ) {
-                static bool tcq2_fattn_kp_cb_loaded[GGML_CUDA_MAX_DEVICES] = {};
-                static int tcq2_hot_kp = -1; if (tcq2_hot_kp < 0) tcq2_hot_kp = getenv("TURBO_TCQ_HOTSWAP") ? 1 : 0;
-                if (!tcq2_fattn_kp_cb_loaded[device] || tcq2_hot_kp) {
-                    tcq2_fattn_kp_cb_loaded[device] = true;
-                    turbo2_tcq_load_kv_decode();
-                }
-                k_turbo2_tcq_dequant_f16_inv_fwht<<<grid_kp, 128, 0, stream>>>(
-                    (const char *)K_promoted->data, kp_fp16, K_promoted->ne[0], K_promoted->ne[1], K_promoted->ne[2],
-                    K_promoted->nb[1], K_promoted->nb[2], K_promoted->nb[3], d_tcq_decode_alpha_k);
-            } else if (K_promoted->type == GGML_TYPE_TURBO1_TCQ) {
-                k_turbo1_tcq_dequant_f16<<<grid_kp, 128, 0, stream>>>(
-                    (const char *)K_promoted->data, kp_fp16, K_promoted->ne[0], K_promoted->ne[1], K_promoted->ne[2],
-                    K_promoted->nb[1], K_promoted->nb[2], K_promoted->nb[3], d_tcq_decode_alpha_k, 0);
-            } else if (K_promoted->type == GGML_TYPE_TURBO4_0) {
-                k_turbo4_dequant_f16_inv_fwht<<<grid_kp, 128, 0, stream>>>(
-                    (const char *)K_promoted->data, kp_fp16, K_promoted->ne[0], K_promoted->ne[1], K_promoted->ne[2],
-                    K_promoted->nb[1], K_promoted->nb[2], K_promoted->nb[3]);
-            } else if (K_promoted->type == GGML_TYPE_TURBO8_0) {
-                k_turbo8_dequant_f16_inv_fwht<<<grid_kp, 128, 0, stream>>>(
-                    (const char *)K_promoted->data, kp_fp16, K_promoted->ne[0], K_promoted->ne[1], K_promoted->ne[2],
-                    K_promoted->nb[1], K_promoted->nb[2], K_promoted->nb[3]);
-            } else if (K_promoted->type == GGML_TYPE_Q8_0) {
-                k_q8_0_dequant_f16_tkhe<<<grid_kp, K_promoted->ne[0], 0, stream>>>(
-                    (const char *)K_promoted->data, kp_fp16, K_promoted->ne[0], K_promoted->ne[1], K_promoted->ne[2],
-                    K_promoted->nb[1], K_promoted->nb[2], K_promoted->nb[3]);
-            }
-
-            k_vbr_stage2a_copy_promoted_rows_f16<<<grid_copy, K->ne[0], 0, stream>>>(
-                k_fp16, kp_fp16, vbr_stage2a_k_row_bands_buf[device], K_row_bands->ne[1],
-                K_row_bands->ne[0], K->ne[0], K->ne[1], K_promoted->ne[1], K->ne[2]);
-        }
-    }
-
     // Allocate and dequant V to fp16 (turbo2/3/4, q8_0, or bf16)
     if (turbo_v || q8_v || bf16_v) {
         // Size for full cache (kv_size from root) so we never realloc mid-session.
@@ -1834,117 +1693,6 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
             // so no spurious un-rotation is applied here.
             k_q8_0_dequant_f16_tkhe<<<grid_v, V->ne[0], 0, stream>>>(
                 (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
-        }
-    }
-
-    if (vbr_stage2a_v) {
-        GGML_ASSERT(v_fp16 != nullptr);
-
-        const size_t bands_bytes = (size_t) V_row_bands->ne[0] * V_row_bands->ne[1] * sizeof(int32_t);
-        if (bands_bytes > vbr_stage2a_v_row_bands_buf_size[device]) {
-            if (vbr_stage2a_v_row_bands_buf[device]) CUDA_CHECK(cudaFree(vbr_stage2a_v_row_bands_buf[device]));
-            CUDA_CHECK(cudaMalloc(&vbr_stage2a_v_row_bands_buf[device], bands_bytes));
-            vbr_stage2a_v_row_bands_buf_size[device] = bands_bytes;
-        }
-        const ggml_tensor * V_row_bands_root = V_row_bands;
-        while (V_row_bands_root->view_src) {
-            V_row_bands_root = V_row_bands_root->view_src;
-        }
-        const cudaMemcpyKind band_copy_kind =
-            (V_row_bands_root->buffer == nullptr || ggml_backend_buffer_is_host(V_row_bands_root->buffer)) ?
-                cudaMemcpyHostToDevice : cudaMemcpyDeviceToDevice;
-        const char * band_data = (const char *) V_row_bands->data;
-        CUDA_CHECK(cudaMemcpyAsync(vbr_stage2a_v_row_bands_buf[device], band_data, bands_bytes, band_copy_kind, stream));
-
-        dim3 grid_copy(V->ne[1], V->ne[2], V->ne[3]);
-        const bool v_base_rotated = vbr_stage2a_v_type_uses_rotated_domain(V->type);
-        const bool v_promoted_rotated = vbr_stage2a_v_type_uses_rotated_domain(V_promoted->type);
-        const bool v_promoted_needs_rot_to_orig = !v_base_rotated && v_promoted_rotated;
-        const bool v_promoted_needs_orig_to_rot = v_base_rotated && !v_promoted_rotated;
-
-        if (V_promoted->type == GGML_TYPE_BF16 && !v_promoted_needs_rot_to_orig && !v_promoted_needs_orig_to_rot) {
-            k_vbr_stage2a_copy_promoted_rows_bf16<<<grid_copy, V->ne[0], 0, stream>>>(
-                v_fp16, (const char *) V_promoted->data, vbr_stage2a_v_row_bands_buf[device], V_row_bands->ne[1],
-                V_row_bands->ne[0], V->ne[0], V->ne[1], V_promoted->ne[1], V->ne[2],
-                V_promoted->nb[1], V_promoted->nb[2], V_promoted->nb[3]);
-        } else if (V_promoted->type == GGML_TYPE_F16 && !v_promoted_needs_rot_to_orig && !v_promoted_needs_orig_to_rot) {
-            k_vbr_stage2a_copy_promoted_rows_native_f16<<<grid_copy, V->ne[0], 0, stream>>>(
-                v_fp16, (const char *) V_promoted->data, vbr_stage2a_v_row_bands_buf[device], V_row_bands->ne[1],
-                V_row_bands->ne[0], V->ne[0], V->ne[1], V_promoted->ne[1], V->ne[2],
-                V_promoted->nb[1], V_promoted->nb[2], V_promoted->nb[3]);
-        } else {
-            const ggml_tensor * vp_root = V_promoted;
-            while (vp_root->view_src) vp_root = vp_root->view_src;
-            const size_t vp_size = (size_t) ggml_nelements(vp_root) * sizeof(half);
-            if (vp_size > kv_dequant_v_promoted_buf_size[device]) {
-                if (kv_dequant_v_promoted_buf[device]) CUDA_CHECK(cudaFree(kv_dequant_v_promoted_buf[device]));
-                CUDA_CHECK(cudaMalloc(&kv_dequant_v_promoted_buf[device], vp_size));
-                kv_dequant_v_promoted_buf_size[device] = vp_size;
-            }
-            half * vp_fp16 = kv_dequant_v_promoted_buf[device];
-
-            dim3 grid_vp(V_promoted->ne[1], V_promoted->ne[2], V_promoted->ne[3]);
-            if (V_promoted->type == GGML_TYPE_TURBO3_TCQ) {
-                static bool tcq_fattn_vp_cb_loaded[GGML_CUDA_MAX_DEVICES] = {};
-                static int tcq_hot_vp = -1; if (tcq_hot_vp < 0) tcq_hot_vp = getenv("TURBO_TCQ_HOTSWAP") ? 1 : 0;
-                if (!tcq_fattn_vp_cb_loaded[device] || tcq_hot_vp) {
-                    tcq_fattn_vp_cb_loaded[device] = true;
-                    turbo_tcq_load_kv_decode();
-                }
-                k_turbo3_tcq_dequant_f16<<<grid_vp, V_promoted->ne[0], 0, stream>>>(
-                    (const char *)V_promoted->data, vp_fp16, V_promoted->ne[0], V_promoted->ne[1], V_promoted->ne[2],
-                    V_promoted->nb[1], V_promoted->nb[2], V_promoted->nb[3], tcq_compute_alpha_v(V_promoted->type, V_promoted->ne[1]), 1);
-            } else if (V_promoted->type == GGML_TYPE_TURBO2_TCQ) {
-                static bool tcq2_fattn_vp_cb_loaded[GGML_CUDA_MAX_DEVICES] = {};
-                static int tcq2_hot_vp = -1; if (tcq2_hot_vp < 0) tcq2_hot_vp = getenv("TURBO_TCQ_HOTSWAP") ? 1 : 0;
-                if (!tcq2_fattn_vp_cb_loaded[device] || tcq2_hot_vp) {
-                    tcq2_fattn_vp_cb_loaded[device] = true;
-                    turbo2_tcq_load_kv_decode();
-                }
-                k_turbo2_tcq_dequant_f16<<<grid_vp, V_promoted->ne[0], 0, stream>>>(
-                    (const char *)V_promoted->data, vp_fp16, V_promoted->ne[0], V_promoted->ne[1], V_promoted->ne[2],
-                    V_promoted->nb[1], V_promoted->nb[2], V_promoted->nb[3], tcq_compute_alpha_v(V_promoted->type, V_promoted->ne[1]), 1);
-            } else if (V_promoted->type == GGML_TYPE_TURBO1_TCQ) {
-                k_turbo1_tcq_dequant_f16<<<grid_vp, 128, 0, stream>>>(
-                    (const char *)V_promoted->data, vp_fp16, V_promoted->ne[0], V_promoted->ne[1], V_promoted->ne[2],
-                    V_promoted->nb[1], V_promoted->nb[2], V_promoted->nb[3], tcq_compute_alpha_v(V_promoted->type, V_promoted->ne[1]), 1);
-            } else if (V_promoted->type == GGML_TYPE_TURBO4_0) {
-                k_turbo4_dequant_f16<<<grid_vp, V_promoted->ne[0], 0, stream>>>(
-                    (const char *)V_promoted->data, vp_fp16, V_promoted->ne[0], V_promoted->ne[1], V_promoted->ne[2],
-                    V_promoted->nb[1], V_promoted->nb[2], V_promoted->nb[3]);
-            } else if (V_promoted->type == GGML_TYPE_TURBO8_0) {
-                k_turbo8_dequant_f16<<<grid_vp, V_promoted->ne[0], 0, stream>>>(
-                    (const char *)V_promoted->data, vp_fp16, V_promoted->ne[0], V_promoted->ne[1], V_promoted->ne[2],
-                    V_promoted->nb[1], V_promoted->nb[2], V_promoted->nb[3]);
-            } else if (V_promoted->type == GGML_TYPE_Q8_0) {
-                k_q8_0_dequant_f16_tkhe<<<grid_vp, V_promoted->ne[0], 0, stream>>>(
-                    (const char *)V_promoted->data, vp_fp16, V_promoted->ne[0], V_promoted->ne[1], V_promoted->ne[2],
-                    V_promoted->nb[1], V_promoted->nb[2], V_promoted->nb[3]);
-            } else if (V_promoted->type == GGML_TYPE_BF16) {
-                k_bf16_to_f16_tkhe<<<grid_vp, V_promoted->ne[0], 0, stream>>>(
-                    (const char *)V_promoted->data, vp_fp16, V_promoted->ne[0], V_promoted->ne[1], V_promoted->ne[2],
-                    V_promoted->nb[1], V_promoted->nb[2], V_promoted->nb[3]);
-            } else if (V_promoted->type == GGML_TYPE_F16) {
-                k_vbr_stage2a_cast_native_f16_tkhe<<<grid_vp, V_promoted->ne[0], 0, stream>>>(
-                    (const char *)V_promoted->data, vp_fp16, V_promoted->ne[0], V_promoted->ne[1], V_promoted->ne[2],
-                    V_promoted->nb[1], V_promoted->nb[2], V_promoted->nb[3]);
-            }
-
-            if (v_promoted_needs_rot_to_orig || v_promoted_needs_orig_to_rot) {
-                GGML_ASSERT(V_promoted->ne[0] % 128 == 0);
-                dim3 grid_rot((unsigned int)(V_promoted->ne[0] / 128), V_promoted->ne[1], V_promoted->ne[2] * V_promoted->ne[3]);
-                if (v_promoted_needs_rot_to_orig) {
-                    k_vbr_stage2a_v_rotated_to_original_f16<<<grid_rot, 128, 0, stream>>>(
-                        vp_fp16, V_promoted->ne[0], V_promoted->ne[1], V_promoted->ne[2], V_promoted->ne[3]);
-                } else {
-                    k_vbr_stage2a_v_original_to_rotated_f16<<<grid_rot, 128, 0, stream>>>(
-                        vp_fp16, V_promoted->ne[0], V_promoted->ne[1], V_promoted->ne[2], V_promoted->ne[3]);
-                }
-            }
-
-            k_vbr_stage2a_copy_promoted_rows_f16<<<grid_copy, V->ne[0], 0, stream>>>(
-                v_fp16, vp_fp16, vbr_stage2a_v_row_bands_buf[device], V_row_bands->ne[1],
-                V_row_bands->ne[0], V->ne[0], V->ne[1], V_promoted->ne[1], V->ne[2]);
         }
     }
 
@@ -2463,7 +2211,6 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
-    const bool vbr_stage2a = dst->src[5] != nullptr || dst->src[6] != nullptr || dst->src[7] != nullptr || dst->src[8] != nullptr;
 
     // Turbo prefill: dequant to fp16 and use tensor core MMA for batched attention.
     // turbo4 K uses inverse FWHT during dequant — mixes centroids in float32 shmem before
@@ -2476,13 +2223,6 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     }();
     const bool turbo_kv = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO8_0 || K->type == GGML_TYPE_TURBO3_TCQ || K->type == GGML_TYPE_TURBO2_TCQ || K->type == GGML_TYPE_TURBO1 || K->type == GGML_TYPE_TURBO1_NSN || K->type == GGML_TYPE_TURBO1_CQ || K->type == GGML_TYPE_TURBO1_TCQ ||
                           V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO8_0 || V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ || V->type == GGML_TYPE_TURBO1 || V->type == GGML_TYPE_TURBO1_NSN || V->type == GGML_TYPE_TURBO1_CQ || V->type == GGML_TYPE_TURBO1_TCQ;
-
-    if (vbr_stage2a) {
-        GGML_ASSERT(turbo_kv);
-        GGML_ASSERT(Q->ne[0] <= 256);
-        ggml_cuda_turbo_prefill_attend(ctx, dst);
-        return;
-    }
 
     // Fused MMA turbo: reads raw turbo bytes directly in the MMA kernel, no intermediate fp16 buffers.
     // Phase 1: turbo4_0 matched K/V at D=128. Set GGML_TURBO_MMA_FUSED=0 to disable.
