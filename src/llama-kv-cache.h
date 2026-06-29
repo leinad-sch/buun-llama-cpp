@@ -93,14 +93,6 @@ public:
 
     using slot_info_vec_t = std::vector<slot_info>;
 
-    struct vbr_stage2a_k_row_band {
-        uint32_t row0;
-        uint32_t row1;
-        uint32_t physical0;
-        uint32_t physical1;
-        ggml_type tier;
-    };
-
     // TODO: refactor the memory instances to not depend on `llama_model`
     //       instead pass all necessary info (e.g. hparams, dev layers, arch, etc.) directly
     //       likely through `struct llama_memory_params`
@@ -177,16 +169,6 @@ public:
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
-    bool vbr_stage2a_has_k_row_bands(int32_t il) const;
-    bool vbr_stage2a_has_v_row_bands(int32_t il) const;
-    int64_t vbr_stage2a_max_k_row_bands(int32_t il) const;
-    int64_t vbr_stage2a_max_v_row_bands(int32_t il) const;
-    std::vector<vbr_stage2a_k_row_band> vbr_stage2a_get_k_row_bands(int32_t il, uint32_t n_kv) const;
-    std::vector<vbr_stage2a_k_row_band> vbr_stage2a_get_v_row_bands(int32_t il, uint32_t n_kv) const;
-    ggml_tensor * vbr_stage2a_get_k_promoted(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
-    ggml_tensor * vbr_stage2a_get_v_promoted(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
-    bool vbr_stage2a_k_promoted_is_compact(int32_t il) const;
-    bool vbr_stage2a_v_promoted_is_compact(int32_t il) const;
 
     // TurboQuant: get rotation matrices (stored as row-major C arrays)
     // turbo_rotation = R (forward rotation, for Q pre-rotate-queries)
@@ -197,8 +179,6 @@ public:
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
-    ggml_tensor * vbr_stage2a_cpy_k_promoted(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
-    ggml_tensor * vbr_stage2a_cpy_v_promoted(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
 
     //
     // preparation API
@@ -223,16 +203,12 @@ public:
     //
 
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
-    ggml_tensor * build_input_vbr_stage2a_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
-    ggml_tensor * build_input_vbr_stage2a_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
 
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
-    void set_input_vbr_stage2a_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
-    void set_input_vbr_stage2a_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
 
     void set_input_k_shift(ggml_tensor * dst) const;
@@ -396,16 +372,6 @@ public:
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
 
-    bool vbr_stage2a_has_k_row_bands(int32_t il) const;
-    bool vbr_stage2a_has_v_row_bands(int32_t il) const;
-    int64_t vbr_stage2a_max_k_row_bands(int32_t il) const;
-    int64_t vbr_stage2a_max_v_row_bands(int32_t il) const;
-    std::vector<llama_kv_cache::vbr_stage2a_k_row_band> vbr_stage2a_get_k_row_bands(int32_t il) const;
-    std::vector<llama_kv_cache::vbr_stage2a_k_row_band> vbr_stage2a_get_v_row_bands(int32_t il) const;
-    ggml_tensor * vbr_stage2a_get_k_promoted(ggml_context * ctx, int32_t il) const;
-    ggml_tensor * vbr_stage2a_get_v_promoted(ggml_context * ctx, int32_t il) const;
-    bool vbr_stage2a_k_promoted_is_compact(int32_t il) const;
-    bool vbr_stage2a_v_promoted_is_compact(int32_t il) const;
 
     // TurboQuant rotation accessors
     ggml_tensor * get_turbo_rotation() const;
@@ -423,23 +389,17 @@ public:
     //   - v_idxs [n_tokens] or [n_tokens*n_embd_v_gqa] depending if V cache is transposed
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const;
-    ggml_tensor * vbr_stage2a_cpy_k_promoted(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
-    ggml_tensor * vbr_stage2a_cpy_v_promoted(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const;
 
     // create destination indices for each head of the current batch for where it would be written in the KV cache
     // the indices address the global KV cache (not per stream) - this is not relevant for the user of this API, but
     //   helps understand the implementation logic of cpy_k and cpy_v
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
-    ggml_tensor * build_input_vbr_stage2a_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
-    ggml_tensor * build_input_vbr_stage2a_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
 
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
-    void set_input_vbr_stage2a_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
-    void set_input_vbr_stage2a_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_shift   (ggml_tensor * dst) const;

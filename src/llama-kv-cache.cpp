@@ -156,17 +156,6 @@ static bool turbo_vbr_type_from_str(const std::string & raw, ggml_type & out) {
     return false;
 }
 
-static bool turbo_vbr_stage2a_k_promoted_type_supported(ggml_type t) {
-    return t == GGML_TYPE_F16 ||
-           t == GGML_TYPE_BF16 ||
-           t == GGML_TYPE_Q8_0 ||
-           t == GGML_TYPE_TURBO2_TCQ ||
-           t == GGML_TYPE_TURBO1_TCQ ||
-           t == GGML_TYPE_TURBO3_TCQ ||
-           t == GGML_TYPE_TURBO4_0 ||
-           t == GGML_TYPE_TURBO8_0;
-}
-
 static double turbo_vbr_effective_bits(ggml_type t) {
     switch (t) {
         case GGML_TYPE_F16:        return 16.0;
@@ -183,41 +172,13 @@ static double turbo_vbr_effective_bits(ggml_type t) {
     }
 }
 
-static ggml_type turbo_vbr_stage2a_dynamic_recent_tier(ggml_type policy_tier) {
-    const char * e = turbo_vbr_getenv("VBR_STAGE2A_RECENT_TIER", "TURBO_VBR_STAGE2A_RECENT_TIER");
-    if (!e || !e[0]) {
-        return GGML_TYPE_BF16;
-    }
-
-    const std::string s = turbo_vbr_lower(turbo_vbr_trim(e));
-    if (s == "policy" || s == "schedule" || s == "measured") {
-        return policy_tier;
-    }
-
-    ggml_type tier = GGML_TYPE_COUNT;
-    if (!turbo_vbr_type_from_str(s, tier) || !turbo_vbr_stage2a_k_promoted_type_supported(tier)) {
-        throw std::runtime_error("unsupported VBR_STAGE2A_RECENT_TIER: " + s);
-    }
-    return tier;
-}
-
 struct turbo_vbr_layer_policy {
     bool enabled = false;
     bool has_turbo = false;
     bool has_turbo_k = false;
     bool has_turbo_v = false;
-    bool stage2a_parse_requested = false;
-    bool stage2a_alloc_requested = false;
-    bool stage2a_shape_supported = false;
     int layer_side_bands = 0;
     int ignored_bands = 0;
-    int stage2a_k_row_bands = 0;
-    int stage2a_v_row_bands = 0;
-    int stage2a_k_accepted_bands = 0;
-    int stage2a_v_accepted_bands = 0;
-    uint32_t stage2a_k_promoted_rows = 0;
-    uint32_t stage2a_v_promoted_rows = 0;
-    int stage2a_unsupported_bands = 0;
     int segmented_row_bands = 0;
     int segmented_coord_bands = 0;
     int segmented_generic_bands = 0;
@@ -226,10 +187,6 @@ struct turbo_vbr_layer_policy {
     int segmented_v_bands = 0;
     std::vector<ggml_type> k;
     std::vector<ggml_type> v;
-    std::vector<std::vector<llama_kv_cache::vbr_stage2a_k_row_band>> stage2a_k_rows_by_layer;
-    std::vector<std::vector<llama_kv_cache::vbr_stage2a_k_row_band>> stage2a_v_rows_by_layer;
-    std::vector<llama_kv_cache::vbr_stage2a_k_row_band> stage2a_k_physical_rows;
-    std::vector<llama_kv_cache::vbr_stage2a_k_row_band> stage2a_v_physical_rows;
 };
 
 static std::string turbo_vbr_segmented_reject_reason(const turbo_vbr_layer_policy & policy) {
@@ -241,17 +198,10 @@ static std::string turbo_vbr_segmented_reject_reason(const turbo_vbr_layer_polic
         reasons.push_back(format("%d generic segmented bands", policy.segmented_generic_bands));
     }
     if (policy.segmented_v_bands > 0) {
-        const int unsupported_v = policy.segmented_v_bands - policy.stage2a_v_accepted_bands;
-        if (unsupported_v > 0) {
-            reasons.push_back(format("%d V-side segmented bands outside supported Stage2A slice", unsupported_v));
-        }
+        reasons.push_back(format("%d V-side segmented bands (positional/row VBR not supported)", policy.segmented_v_bands));
     }
-    if (policy.segmented_k_bands > policy.stage2a_k_accepted_bands) {
-        reasons.push_back(format("%d K-side segmented bands outside supported Stage2A slice",
-                policy.segmented_k_bands - policy.stage2a_k_accepted_bands));
-    }
-    if (reasons.empty() && policy.stage2a_unsupported_bands > 0) {
-        reasons.push_back(format("%d unsupported segmented bands", policy.stage2a_unsupported_bands));
+    if (policy.segmented_k_bands > 0) {
+        reasons.push_back(format("%d K-side segmented bands (positional/row VBR not supported)", policy.segmented_k_bands));
     }
     if (reasons.empty()) {
         return "segmented schedule requires generic ragged VBR runtime support";
@@ -309,36 +259,6 @@ static int turbo_vbr_schedule_ctx(void) {
     return value > 0 ? value : 8192;
 }
 
-static bool turbo_vbr_stage2a_parse_requested(void) {
-    if (turbo_vbr_env_enabled("VBR_STAGE2A_PARSE", "TURBO_VBR_STAGE2A_PARSE")) {
-        return true;
-    }
-
-    return turbo_vbr_env_enabled("VBR_STAGE2A", "TURBO_VBR_STAGE2A");
-}
-
-static bool turbo_vbr_stage2a_alloc_requested(void) {
-    return turbo_vbr_env_enabled("VBR_STAGE2A", "TURBO_VBR_STAGE2A");
-}
-
-static bool turbo_vbr_stage2a_compact_requested(void) {
-    return turbo_vbr_env_enabled("VBR_STAGE2A_COMPACT", "TURBO_VBR_STAGE2A_COMPACT");
-}
-
-static bool turbo_vbr_stage2a_dynamic_recent_requested(void) {
-    return turbo_vbr_env_enabled("VBR_STAGE2A_DYNAMIC_RECENT", "TURBO_VBR_STAGE2A_DYNAMIC_RECENT");
-}
-
-static bool turbo_vbr_stage2a_dynamic_rows_requested(void) {
-    const char * e = turbo_vbr_getenv("VBR_STAGE2A_DYNAMIC_ROWS", "TURBO_VBR_STAGE2A_DYNAMIC_ROWS");
-    if (e && e[0]) {
-        return atoi(e) != 0;
-    }
-
-    const char * mode = turbo_vbr_getenv("VBR_MODE", "TURBO_VBR_MODE");
-    return mode && turbo_vbr_lower(mode) == "dynamic";
-}
-
 static bool turbo_vbr_parse_int_range(const std::string & s, int & lo, int & hi) {
     const size_t dash = s.find('-');
     if (dash == std::string::npos) {
@@ -361,10 +281,6 @@ static turbo_vbr_layer_policy turbo_vbr_layer_policy_from_env(
     turbo_vbr_layer_policy policy;
     policy.k.assign(n_layer, base_k);
     policy.v.assign(n_layer, base_v);
-    policy.stage2a_k_rows_by_layer.assign(n_layer, {});
-    policy.stage2a_v_rows_by_layer.assign(n_layer, {});
-    policy.stage2a_parse_requested = turbo_vbr_stage2a_parse_requested();
-    policy.stage2a_alloc_requested = turbo_vbr_stage2a_alloc_requested();
 
     const char * env = turbo_vbr_getenv("VBR_LAYER_SCHEDULE", "TURBO_VBR_LAYER_SCHEDULE");
     std::string src;
@@ -529,214 +445,6 @@ static turbo_vbr_layer_policy turbo_vbr_layer_policy_from_env(
     }
     policy.has_turbo = policy.has_turbo_k || policy.has_turbo_v;
 
-    if (policy.stage2a_parse_requested) {
-        auto normalize_stage2a_rows = [&](
-                std::vector<ggml_type> & layer_tiers,
-                std::vector<std::vector<llama_kv_cache::vbr_stage2a_k_row_band>> & rows_by_layer) {
-            int normalized_bands = 0;
-            for (uint32_t il = 0; il < n_layer; ++il) {
-                auto & rows = rows_by_layer[il];
-                if (rows.empty()) {
-                    continue;
-                }
-
-                std::vector<uint32_t> cuts;
-                cuts.reserve(2 + rows.size()*2);
-                cuts.push_back(0);
-                cuts.push_back(runtime_ctx);
-                for (const auto & band : rows) {
-                    const uint32_t row0 = std::min<uint32_t>(band.row0, runtime_ctx);
-                    const uint32_t row1 = std::min<uint32_t>(band.row1, runtime_ctx);
-                    if (row0 < row1) {
-                        cuts.push_back(row0);
-                        cuts.push_back(row1);
-                    }
-                }
-                std::sort(cuts.begin(), cuts.end());
-                cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
-
-                struct tier_segment {
-                    uint32_t row0;
-                    uint32_t row1;
-                    ggml_type tier;
-                };
-
-                std::vector<tier_segment> final_segments;
-                final_segments.reserve(cuts.size());
-
-                ggml_type storage_tier = layer_tiers[il];
-                double storage_bits = turbo_vbr_effective_bits(storage_tier);
-
-                for (size_t i = 1; i < cuts.size(); ++i) {
-                    const uint32_t row0 = cuts[i - 1];
-                    const uint32_t row1 = cuts[i];
-                    if (row0 >= row1) {
-                        continue;
-                    }
-
-                    ggml_type tier = layer_tiers[il];
-                    for (const auto & band : rows) {
-                        if (row0 >= band.row0 && row1 <= band.row1) {
-                            tier = band.tier;
-                        }
-                    }
-
-                    final_segments.push_back({ row0, row1, tier });
-                    const double bits = turbo_vbr_effective_bits(tier);
-                    if (bits < storage_bits) {
-                        storage_bits = bits;
-                        storage_tier = tier;
-                    }
-                }
-
-                layer_tiers[il] = storage_tier;
-                std::vector<llama_kv_cache::vbr_stage2a_k_row_band> normalized;
-                for (const auto & seg : final_segments) {
-                    if (seg.tier == storage_tier) {
-                        continue;
-                    }
-                    if (!normalized.empty() &&
-                            normalized.back().row1 == seg.row0 &&
-                            normalized.back().tier == seg.tier) {
-                        normalized.back().row1 = seg.row1;
-                    } else {
-                        normalized.push_back({
-                            seg.row0,
-                            seg.row1,
-                            0,
-                            0,
-                            seg.tier,
-                        });
-                    }
-                }
-
-                normalized_bands += (int) normalized.size();
-                rows = std::move(normalized);
-            }
-            return normalized_bands;
-        };
-
-        policy.stage2a_k_row_bands = normalize_stage2a_rows(policy.k, policy.stage2a_k_rows_by_layer);
-        policy.stage2a_v_row_bands = normalize_stage2a_rows(policy.v, policy.stage2a_v_rows_by_layer);
-
-        auto compact_physical_rows = [](
-                std::vector<std::vector<llama_kv_cache::vbr_stage2a_k_row_band>> & rows_by_layer,
-                std::vector<llama_kv_cache::vbr_stage2a_k_row_band> & physical_rows) {
-            std::vector<std::pair<uint32_t, uint32_t>> intervals;
-            for (const auto & rows : rows_by_layer) {
-                for (const auto & band : rows) {
-                    intervals.push_back({ band.row0, band.row1 });
-                }
-            }
-            std::sort(intervals.begin(), intervals.end());
-
-            std::vector<std::pair<uint32_t, uint32_t>> merged;
-            for (const auto & interval : intervals) {
-                if (interval.first >= interval.second) {
-                    continue;
-                }
-                if (merged.empty() || interval.first > merged.back().second) {
-                    merged.push_back(interval);
-                } else {
-                    merged.back().second = std::max(merged.back().second, interval.second);
-                }
-            }
-
-            uint32_t physical = 0;
-            for (const auto & interval : merged) {
-                physical_rows.push_back({
-                    interval.first,
-                    interval.second,
-                    physical,
-                    physical + interval.second - interval.first,
-                    GGML_TYPE_TURBO4_0,
-                });
-                physical += interval.second - interval.first;
-            }
-
-            for (auto & rows : rows_by_layer) {
-                std::vector<llama_kv_cache::vbr_stage2a_k_row_band> mapped_rows;
-                for (const auto & band : rows) {
-                    for (const auto & physical_band : physical_rows) {
-                        const uint32_t row0 = std::max(band.row0, physical_band.row0);
-                        const uint32_t row1 = std::min(band.row1, physical_band.row1);
-                        if (row0 >= row1) {
-                            continue;
-                        }
-                        mapped_rows.push_back({
-                            row0,
-                            row1,
-                            physical_band.physical0 + (row0 - physical_band.row0),
-                            physical_band.physical0 + (row1 - physical_band.row0),
-                            band.tier,
-                        });
-                    }
-                }
-                rows = std::move(mapped_rows);
-            }
-
-            return physical;
-        };
-
-        policy.stage2a_k_promoted_rows = compact_physical_rows(
-                policy.stage2a_k_rows_by_layer,
-                policy.stage2a_k_physical_rows);
-        policy.stage2a_v_promoted_rows = compact_physical_rows(
-                policy.stage2a_v_rows_by_layer,
-                policy.stage2a_v_physical_rows);
-
-        bool any_stage2a_layer_rows = false;
-        bool stage2a_layer_tiers_are_uniform = true;
-        for (uint32_t il = 0; il < n_layer; ++il) {
-            for (const auto * rows_ptr : { &policy.stage2a_k_rows_by_layer[il], &policy.stage2a_v_rows_by_layer[il] }) {
-                const auto & rows = *rows_ptr;
-                if (rows.empty()) {
-                    continue;
-                }
-                any_stage2a_layer_rows = true;
-                const ggml_type layer_tier = rows.front().tier;
-                for (const auto & band : rows) {
-                    stage2a_layer_tiers_are_uniform = stage2a_layer_tiers_are_uniform && band.tier == layer_tier;
-                }
-            }
-        }
-        policy.stage2a_shape_supported =
-            stage2a_layer_tiers_are_uniform &&
-            any_stage2a_layer_rows &&
-            (!policy.stage2a_k_physical_rows.empty() || !policy.stage2a_v_physical_rows.empty()) &&
-            policy.stage2a_unsupported_bands == 0;
-
-        LLAMA_LOG_INFO("llama_kv_cache: VBR Stage2A parse-only: k_row_bands=%d, v_row_bands=%d, promoted_rows={k:%u,v:%u}, unsupported_segmented_bands=%d, shape_supported=%d, segmented_axes={row:%d, coord:%d, generic:%d, layer_specific:%d, k:%d, v:%d}\n",
-                policy.stage2a_k_row_bands,
-                policy.stage2a_v_row_bands,
-                policy.stage2a_k_promoted_rows,
-                policy.stage2a_v_promoted_rows,
-                policy.stage2a_unsupported_bands,
-                policy.stage2a_shape_supported ? 1 : 0,
-                policy.segmented_row_bands,
-                policy.segmented_coord_bands,
-                policy.segmented_generic_bands,
-                policy.segmented_layer_specific_bands,
-                policy.segmented_k_bands,
-                policy.segmented_v_bands);
-        if (policy.stage2a_alloc_requested && policy.stage2a_shape_supported) {
-            LLAMA_LOG_WARN("llama_kv_cache: VBR Stage2A promoted K/V shadow allocation enabled; segmented attention requires TURBO_VBR_STAGE2A_ATTEND=1\n");
-        } else if (policy.stage2a_alloc_requested) {
-            throw std::runtime_error(format(
-                    "TURBO_VBR_STAGE2A=1 requested but the schedule does not match the Stage2A row-band slice "
-                    "(reason=%s, schedule_ctx=%d, stage2a_layer_tiers_are_uniform=%d, k_row_bands=%d, v_row_bands=%d, unsupported_segmented_bands=%d, layer_side_entries=%d, ignored_bands=%d)",
-                    turbo_vbr_segmented_reject_reason(policy).c_str(),
-                    schedule_ctx,
-                    stage2a_layer_tiers_are_uniform ? 1 : 0,
-                    policy.stage2a_k_row_bands,
-                    policy.stage2a_v_row_bands,
-                    policy.stage2a_unsupported_bands,
-                    policy.layer_side_bands,
-                    policy.ignored_bands));
-        } else {
-            LLAMA_LOG_WARN("llama_kv_cache: VBR Stage2A segmented storage/attention is not active yet; parsed row bands are still ignored by execution\n");
-        }
-    }
 
     LLAMA_LOG_INFO("llama_kv_cache: VBR layer schedule enabled from %s: schedule_ctx=%d, applied %d layer-side entries, ignored %d segmented bands, segmented_axes={row:%d, coord:%d, generic:%d, layer_specific:%d, k:%d, v:%d}\n",
             src.c_str(),
