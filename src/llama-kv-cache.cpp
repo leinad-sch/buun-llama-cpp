@@ -491,55 +491,11 @@ static turbo_vbr_layer_policy turbo_vbr_layer_policy_from_env(
             if (apply_v) {
                 policy.segmented_v_bands++;
             }
-            if (policy.stage2a_parse_requested) {
-                const bool is_stage2a_k_row =
-                    !covers_whole_active_cache &&
-                    !has_coord &&
-                    apply_k &&
-                    !apply_v &&
-                    turbo_vbr_stage2a_k_promoted_type_supported(tier) &&
-                    scaled_row0 < scaled_row1;
-                const bool is_stage2a_v_row =
-                    !covers_whole_active_cache &&
-                    !has_coord &&
-                    apply_v &&
-                    !apply_k &&
-                    turbo_vbr_stage2a_k_promoted_type_supported(tier) &&
-                    scaled_row0 < scaled_row1;
-                if (is_stage2a_k_row || is_stage2a_v_row) {
-                    if (!saw_layer) {
-                        layer0 = 0;
-                        layer1 = (int) n_layer - 1;
-                    }
-                    layer0 = std::max(layer0, 0);
-                    layer1 = std::min(layer1, (int) n_layer - 1);
-                    if (layer0 <= layer1) {
-                        for (int il = layer0; il <= layer1; ++il) {
-                            auto & side_rows = is_stage2a_k_row ?
-                                policy.stage2a_k_rows_by_layer[il] :
-                                policy.stage2a_v_rows_by_layer[il];
-                            side_rows.push_back({
-                                scaled_row0,
-                                scaled_row1,
-                                0,
-                                0,
-                                tier,
-                            });
-                        }
-                        if (is_stage2a_k_row) {
-                            policy.stage2a_k_row_bands++;
-                            policy.stage2a_k_accepted_bands++;
-                        } else {
-                            policy.stage2a_v_row_bands++;
-                            policy.stage2a_v_accepted_bands++;
-                        }
-                    } else {
-                        policy.stage2a_unsupported_bands++;
-                    }
-                } else {
-                    policy.stage2a_unsupported_bands++;
-                }
-            }
+            // Per-side static VBR allocator: only full-cache layer-side tiers are
+            // supported. Partial-row / coordinate (Stage2A) bands are no longer
+            // implemented — ignore them. (void the scaled rows to silence unused-warnings)
+            (void) scaled_row0;
+            (void) scaled_row1;
             policy.ignored_bands++;
             continue;
         }
