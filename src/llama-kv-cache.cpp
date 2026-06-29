@@ -836,35 +836,7 @@ llama_kv_cache::llama_kv_cache(
     const uint32_t n_layer_kv = hparams.n_layer_kv();
     turbo_vbr_layer_policy vbr_layer_policy =
         turbo_vbr_layer_policy_from_env(hparams.n_layer, type_k, type_v, kv_size);
-    const bool vbr_stage2a_alloc = vbr_layer_policy.stage2a_alloc_requested && vbr_layer_policy.stage2a_shape_supported;
-    const bool vbr_stage2a_compact = vbr_stage2a_alloc && turbo_vbr_stage2a_compact_requested();
-    vbr_stage2a_k_dynamic_recent = vbr_stage2a_compact && turbo_vbr_stage2a_dynamic_recent_requested();
-    vbr_stage2a_dynamic_rows = vbr_stage2a_compact && !vbr_stage2a_k_dynamic_recent && turbo_vbr_stage2a_dynamic_rows_requested();
-    if (vbr_stage2a_k_dynamic_recent) {
-        for (auto & rows : vbr_layer_policy.stage2a_k_rows_by_layer) {
-            if (rows.empty()) {
-                continue;
-            }
-            const ggml_type recent_tier = turbo_vbr_stage2a_dynamic_recent_tier(rows.front().tier);
-            for (auto & band : rows) {
-                band.tier = recent_tier;
-            }
-        }
-    }
-    vbr_stage2a_k_physical_row_bands = vbr_layer_policy.stage2a_k_physical_rows;
-    vbr_stage2a_v_physical_row_bands = vbr_layer_policy.stage2a_v_physical_rows;
-    if (vbr_layer_policy.stage2a_alloc_requested && vbr_layer_policy.stage2a_v_row_bands > 0 && v_trans) {
-        throw std::runtime_error("VBR Stage2A V row bands require non-transposed V cache / flash-attention layout");
-    }
-    if (vbr_stage2a_k_dynamic_recent) {
-        LLAMA_LOG_WARN("%s: VBR Stage2A dynamic-recent mode is an experimental recency heuristic, not the measured VBR policy planner\n", __func__);
-    }
-    if (vbr_stage2a_dynamic_rows) {
-        LLAMA_LOG_INFO("%s: VBR Stage2A dynamic-row mode enabled; compact overlay slots hold early rows until their measured final row owners arrive\n", __func__);
-    }
-    const int vbr_strict_ignored_bands = vbr_layer_policy.ignored_bands -
-        (vbr_stage2a_alloc ? vbr_layer_policy.stage2a_k_accepted_bands + vbr_layer_policy.stage2a_v_accepted_bands : 0);
-    if (vbr_layer_policy.enabled && turbo_vbr_layer_strict_enabled() && vbr_strict_ignored_bands > 0) {
+    if (vbr_layer_policy.enabled && turbo_vbr_layer_strict_enabled() && vbr_layer_policy.ignored_bands > 0) {
         throw std::runtime_error(format(
                 "TURBO_VBR_LAYER_SCHEDULE contains unsupported segmented bands but TURBO_VBR_LAYER_STRICT=1 was set: %s",
                 turbo_vbr_segmented_reject_reason(vbr_layer_policy).c_str()));
@@ -884,9 +856,8 @@ llama_kv_cache::llama_kv_cache(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             const size_t n_turbo_extra = is_turbo ? 8 : 0; // rotation matrices + safety margin
-            const size_t n_stage2a_extra = vbr_stage2a_alloc ? 2*(1 + n_stream)*n_layer_kv : 0;
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t((2u*(1 + n_stream)*n_layer_kv + n_stage2a_extra + n_turbo_extra)*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t((2u*(1 + n_stream)*n_layer_kv + n_turbo_extra)*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -1125,49 +1096,21 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, layer_type_k, n_embd_k_alloc, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, layer_type_v, n_embd_v_alloc, kv_size, n_stream) : nullptr;
-        const uint32_t vbr_stage2a_k_rows =
-            vbr_stage2a_compact && vbr_layer_policy.stage2a_k_promoted_rows > 0 ?
-                vbr_layer_policy.stage2a_k_promoted_rows : kv_size;
-        const uint32_t vbr_stage2a_v_rows =
-            vbr_stage2a_compact && vbr_layer_policy.stage2a_v_promoted_rows > 0 ?
-                vbr_layer_policy.stage2a_v_promoted_rows : kv_size;
-        const auto & vbr_stage2a_k_layer_rows = vbr_layer_policy.stage2a_k_rows_by_layer[il];
-        const auto & vbr_stage2a_v_layer_rows = vbr_layer_policy.stage2a_v_rows_by_layer[il];
-        const bool vbr_stage2a_k_layer_alloc = vbr_stage2a_alloc && !vbr_stage2a_k_layer_rows.empty();
-        const bool vbr_stage2a_v_layer_alloc = vbr_stage2a_alloc && !vbr_stage2a_v_layer_rows.empty();
-        const ggml_type vbr_stage2a_k_layer_type = vbr_stage2a_k_layer_alloc ? vbr_stage2a_k_layer_rows.front().tier : GGML_TYPE_COUNT;
-        const ggml_type vbr_stage2a_v_layer_type = vbr_stage2a_v_layer_alloc ? vbr_stage2a_v_layer_rows.front().tier : GGML_TYPE_COUNT;
-        ggml_tensor * k_stage2a = (has_k && vbr_stage2a_k_layer_alloc) ? ggml_new_tensor_3d(ctx, vbr_stage2a_k_layer_type, n_embd_k_alloc, vbr_stage2a_k_rows, n_stream) : nullptr;
-        ggml_tensor * v_stage2a = (has_v && vbr_stage2a_v_layer_alloc) ? ggml_new_tensor_3d(ctx, vbr_stage2a_v_layer_type, n_embd_v_alloc, vbr_stage2a_v_rows, n_stream) : nullptr;
 
         has_k && ggml_format_name(k, "cache_k_l%d", il);
         has_v && ggml_format_name(v, "cache_v_l%d", il);
-        if (k_stage2a) {
-            ggml_format_name(k_stage2a, "cache_k_stage2a_l%d", il);
-        }
-        if (v_stage2a) {
-            ggml_format_name(v_stage2a, "cache_v_stage2a_l%d", il);
-        }
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
-        std::vector<ggml_tensor *> k_stage2a_stream;
-        std::vector<ggml_tensor *> v_stage2a_stream;
 
         for (uint32_t s = 0; s < n_stream; ++s) {
             k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2]) : nullptr);
             v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
-            k_stage2a_stream.push_back(k_stage2a ? ggml_view_2d(ctx, k_stage2a, n_embd_k_gqa, vbr_stage2a_k_rows, k_stage2a->nb[1], s*k_stage2a->nb[2]) : nullptr);
-            v_stage2a_stream.push_back(v_stage2a ? ggml_view_2d(ctx, v_stage2a, n_embd_v_gqa, vbr_stage2a_v_rows, v_stage2a->nb[1], s*v_stage2a->nb[2]) : nullptr);
         }
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stage2a, v_stage2a,
-                vbr_stage2a_compact, vbr_stage2a_compact,
-                vbr_stage2a_k_rows, vbr_stage2a_v_rows,
-                k_stream, v_stream, k_stage2a_stream, v_stage2a_stream,
-                vbr_stage2a_k_layer_rows, vbr_stage2a_v_layer_rows, });
+        layers.push_back({ il, k, v, k_stream, v_stream });
 
         // TurboQuant: create rotation matrix tensors (once, shared across layers)
         if (turbo_rotation == nullptr &&
@@ -1270,29 +1213,6 @@ llama_kv_cache::llama_kv_cache(
             LLAMA_LOG_INFO("%s: VBR actual layer types: K {%s}, V {%s}\n", __func__,
                     type_histogram(true).c_str(),
                     type_histogram(false).c_str());
-            if (vbr_stage2a_alloc) {
-                LLAMA_LOG_INFO("%s: VBR Stage2A promoted K/V shadow tensors: layers=%d, row_bands={k:%d,v:%d}, promoted_rows={k:%u,v:%u}, compact=%d, tiers=per-layer\n", __func__,
-                        (int) layers.size(),
-                        vbr_layer_policy.stage2a_k_row_bands,
-                        vbr_layer_policy.stage2a_v_row_bands,
-                        vbr_layer_policy.stage2a_k_promoted_rows,
-                        vbr_layer_policy.stage2a_v_promoted_rows,
-                        vbr_stage2a_compact ? 1 : 0);
-                if (vbr_stage2a_k_dynamic_recent) {
-                    ggml_type recent_tier = GGML_TYPE_COUNT;
-                    for (const auto & layer : layers) {
-                        if (layer.vbr_stage2a_k_promoted) {
-                            recent_tier = layer.vbr_stage2a_k_promoted->type;
-                            break;
-                        }
-                    }
-                    LLAMA_LOG_INFO("%s: VBR Stage2A promoted-K recent-ring mode enabled, recent_tier=%s\n", __func__,
-                            recent_tier == GGML_TYPE_COUNT ? "none" : ggml_type_name(recent_tier));
-                }
-                if (vbr_stage2a_dynamic_rows) {
-                    LLAMA_LOG_INFO("%s: VBR Stage2A dynamic-row mode uses measured final row owners with temporary prefix fill\n", __func__);
-                }
-            }
         }
     }
 
@@ -1797,12 +1717,6 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
                 const auto & layer = layers[il];
 
                 ggml_backend_tensor_copy(layer.k_stream[ssrc], layer.k_stream[sdst]);
-                if (layer.vbr_stage2a_k_promoted_stream[ssrc]) {
-                    ggml_backend_tensor_copy(layer.vbr_stage2a_k_promoted_stream[ssrc], layer.vbr_stage2a_k_promoted_stream[sdst]);
-                }
-                if (layer.vbr_stage2a_v_promoted_stream[ssrc]) {
-                    ggml_backend_tensor_copy(layer.vbr_stage2a_v_promoted_stream[ssrc], layer.vbr_stage2a_v_promoted_stream[sdst]);
-                }
 
                 if (layer.v_stream[ssrc]) {
                     ggml_backend_tensor_copy(layer.v_stream[ssrc], layer.v_stream[sdst]);
@@ -2130,11 +2044,6 @@ bool llama_kv_cache::get_can_shift() const {
         return false;
     }
     if (hparams.n_pos_per_embd() > 1) {
-        return false;
-    }
-    if (std::any_of(layers.begin(), layers.end(), [](const kv_layer & layer) {
-        return layer.vbr_stage2a_k_promoted != nullptr && layer.vbr_stage2a_k_promoted_compact;
-    })) {
         return false;
     }
     return true;
@@ -2784,9 +2693,6 @@ size_t llama_kv_cache::size_k_bytes() const {
 
     for (const auto & layer : layers) {
         size_k_bytes += ggml_nbytes(layer.k);
-        if (layer.vbr_stage2a_k_promoted) {
-            size_k_bytes += ggml_nbytes(layer.vbr_stage2a_k_promoted);
-        }
     }
 
     return size_k_bytes;
@@ -2797,9 +2703,6 @@ size_t llama_kv_cache::size_v_bytes() const {
 
     for (const auto & layer : layers) {
         size_v_bytes += layer.v ? ggml_nbytes(layer.v) : 0;
-        if (layer.vbr_stage2a_v_promoted) {
-            size_v_bytes += ggml_nbytes(layer.vbr_stage2a_v_promoted);
-        }
     }
 
     return size_v_bytes;
@@ -2922,22 +2825,6 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
         ggml_tensor * cur = build_rope_shift(cparams, ctx, k, inp->k_shift, inp->k_rot, rope_factors, freq_base_l, freq_scale_l, il);
 
         ggml_build_forward_expand(gf, cur);
-
-        if (layer.vbr_stage2a_k_promoted) {
-            if (layer.vbr_stage2a_k_promoted_compact) {
-                throw std::runtime_error("VBR Stage2A compact promoted-K KV shift is not implemented yet");
-            }
-
-            ggml_tensor * k_promoted =
-                ggml_view_3d(ctx, layer.vbr_stage2a_k_promoted,
-                    n_rot, n_head_kv, get_size()*n_stream,
-                    ggml_row_size(layer.vbr_stage2a_k_promoted->type, n_embd_head_k),
-                    ggml_row_size(layer.vbr_stage2a_k_promoted->type, n_embd_k_gqa),
-                    ggml_row_size(layer.vbr_stage2a_k_promoted->type, n_embd_nope));
-
-            ggml_tensor * cur_promoted = build_rope_shift(cparams, ctx, k_promoted, inp->k_shift, inp->k_rot, rope_factors, freq_base_l, freq_scale_l, il);
-            ggml_build_forward_expand(gf, cur_promoted);
-        }
     }
 
     res->add_input(std::move(inp));
@@ -2947,12 +2834,6 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
 void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     GGML_UNUSED(flags);
-
-    if (std::any_of(layers.begin(), layers.end(), [](const kv_layer & layer) {
-        return layer.vbr_stage2a_k_promoted != nullptr || layer.vbr_stage2a_v_promoted != nullptr;
-    })) {
-        throw std::runtime_error("VBR Stage2A promoted K/V state write is not implemented yet");
-    }
 
     io.write(&n_stream, sizeof(n_stream));
 
@@ -3008,12 +2889,6 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
     GGML_UNUSED(flags);
 
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
-
-    if (std::any_of(layers.begin(), layers.end(), [](const kv_layer & layer) {
-        return layer.vbr_stage2a_k_promoted != nullptr || layer.vbr_stage2a_v_promoted != nullptr;
-    })) {
-        throw std::runtime_error("VBR Stage2A promoted K/V state read is not implemented yet");
-    }
 
     uint32_t n_stream_cur;
     io.read(&n_stream_cur, sizeof(n_stream_cur));

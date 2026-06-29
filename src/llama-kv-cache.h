@@ -254,20 +254,9 @@ private:
 
         ggml_tensor * k;
         ggml_tensor * v;
-        ggml_tensor * vbr_stage2a_k_promoted;
-        ggml_tensor * vbr_stage2a_v_promoted;
-        bool vbr_stage2a_k_promoted_compact;
-        bool vbr_stage2a_v_promoted_compact;
-        uint32_t vbr_stage2a_k_promoted_rows;
-        uint32_t vbr_stage2a_v_promoted_rows;
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
-        std::vector<ggml_tensor *> vbr_stage2a_k_promoted_stream;
-        std::vector<ggml_tensor *> vbr_stage2a_v_promoted_stream;
-
-        std::vector<vbr_stage2a_k_row_band> vbr_stage2a_k_row_bands;
-        std::vector<vbr_stage2a_k_row_band> vbr_stage2a_v_row_bands;
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -315,20 +304,6 @@ private:
     stream_copy_info sc_info;
 
     std::vector<kv_layer> layers;
-    std::vector<vbr_stage2a_k_row_band> vbr_stage2a_k_physical_row_bands;
-    std::vector<vbr_stage2a_k_row_band> vbr_stage2a_v_physical_row_bands;
-    bool vbr_stage2a_k_dynamic_recent = false;
-    bool vbr_stage2a_dynamic_rows = false;
-
-    std::vector<vbr_stage2a_k_row_band> vbr_stage2a_get_dynamic_row_bands(
-            int32_t  il,
-            uint32_t n_kv,
-            bool     want_k) const;
-
-    int64_t vbr_stage2a_dynamic_physical_row(
-            uint32_t row,
-            uint32_t active_n_kv,
-            bool     want_k) const;
 
     // TurboQuant rotation matrices (128x128, row-major stored)
     ggml_tensor * turbo_rotation = nullptr;      // R (forward rotation)
