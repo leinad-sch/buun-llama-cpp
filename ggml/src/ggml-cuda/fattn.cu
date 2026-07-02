@@ -2313,7 +2313,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     // turbo1 has no fused MMA-turbo instance (dequant-to-f16 codec only); exclude it so it
     // does not enter the fused path and fall through with no kernel launched.
     const bool turbo_matched = K->type == V->type && turbo_kv && K->type != GGML_TYPE_TURBO1 && K->type != GGML_TYPE_TURBO1_NSN && K->type != GGML_TYPE_TURBO1_CQ && K->type != GGML_TYPE_TURBO1_TCQ;
-    const bool turbo1_tcq_matched = K->type == GGML_TYPE_TURBO1_TCQ && V->type == GGML_TYPE_TURBO1_TCQ && Q->ne[0] == 128;
+    const bool turbo1_tcq_matched = K->type == GGML_TYPE_TURBO1_TCQ && V->type == GGML_TYPE_TURBO1_TCQ &&
+                                    (Q->ne[0] == 128 || Q->ne[0] == 256);
     // Asymmetric fused "q6 sweet spot" (6.124 bpw): turbo8 K + turbo4 V. Only this pair is
     // instantiated, and only at D=256 (dense Qwen geometry). Both stay WHT-rotated like the
     // matched path (Q pre-rotated below, V un-rotated at graph level).
@@ -2343,11 +2344,12 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             }
         }
 
-        // Pre-rotate Q: most fused turbo K types stay in WHT-rotated domain. The turbo1_tcq
-        // fused loader emits original-domain K/V after inverse FWHT, matching its unfused path.
+        // Pre-rotate Q: ALL fused turbo K types (incl. turbo1_tcq since 2026-07-02) keep K in the
+        // WHT-rotated domain — the stored trellis/LUT coeffs are consumed directly and Q is
+        // rotated once to match. Only V is decoded to the original domain inside the loader.
         ggml_tensor Q_rot_fused;
         ggml_tensor * orig_q_fused = nullptr;
-        const bool fused_k_original_domain = K->type == GGML_TYPE_TURBO1_TCQ;
+        const bool fused_k_original_domain = false;
         if (!fused_k_original_domain && Q->ne[0] % 128 == 0) {
             const size_t q_size = ggml_nelements(Q) * sizeof(float);
             if (q_size > q_rot_buf_size[device]) {
@@ -2388,9 +2390,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         else TURBO_FUSED_DISPATCH(GGML_TYPE_TURBO8_0,   GGML_TYPE_TURBO8_0)
         else TURBO_FUSED_DISPATCH(GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO3_TCQ)
         else TURBO_FUSED_DISPATCH(GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO2_TCQ)
-        else if (K->type == GGML_TYPE_TURBO1_TCQ && V->type == GGML_TYPE_TURBO1_TCQ) {
-            ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO1_TCQ, GGML_TYPE_TURBO1_TCQ>(ctx, dst);
-        }
+        else TURBO_FUSED_DISPATCH(GGML_TYPE_TURBO1_TCQ, GGML_TYPE_TURBO1_TCQ)
         else TURBO_FUSED_DISPATCH(GGML_TYPE_TURBO3_0,   GGML_TYPE_TURBO3_0)
         else TURBO_FUSED_DISPATCH(GGML_TYPE_TURBO2_0,   GGML_TYPE_TURBO2_0)
 #undef TURBO_FUSED_DISPATCH

@@ -271,6 +271,30 @@ static constexpr __device__ int ggml_cuda_fattn_mma_get_nthreads(const int DKQ, 
     return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols).nthreads;
 }
 
+// turbo1_tcq runs a latency-bound FWHT chain inside its tile loader; the stock D=256 decode
+// configs leave only 2 blocks x 2 warps resident per SM (ncu: 82% no-eligible cycles). Halving
+// nbatch_fa halves the KV tile's shared memory so twice as many blocks fit per SM — more
+// resident warps without touching the per-block MMA tiling (np, accumulator sizes unchanged).
+// Scoped to DKQ=DV=256; the D=128 shapes have different np/nbatch relations and are untested.
+static constexpr __host__ __device__ int ggml_cuda_fattn_mma_nbatch_fa_typed_adjust(
+        const int nbatch_fa, const int DKQ, const int DV, const ggml_type type_K, const ggml_type type_V) {
+    return (type_K == GGML_TYPE_TURBO1_TCQ || type_V == GGML_TYPE_TURBO1_TCQ) &&
+           DKQ == 256 && DV == 256 && nbatch_fa > 32
+        ? nbatch_fa / 2 : nbatch_fa;
+}
+
+static __host__ int ggml_cuda_fattn_mma_get_nbatch_fa_typed(
+        const int DKQ, const int DV, const int ncols, const int cc, const ggml_type type_K, const ggml_type type_V) {
+    return ggml_cuda_fattn_mma_nbatch_fa_typed_adjust(
+        ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, cc).nbatch_fa, DKQ, DV, type_K, type_V);
+}
+
+static constexpr __device__ int ggml_cuda_fattn_mma_get_nbatch_fa_typed(
+        const int DKQ, const int DV, const int ncols, const ggml_type type_K, const ggml_type type_V) {
+    return ggml_cuda_fattn_mma_nbatch_fa_typed_adjust(
+        ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols).nbatch_fa, DKQ, DV, type_K, type_V);
+}
+
 static __host__ int ggml_cuda_fattn_mma_get_occupancy(const int DKQ, const int DV, const int ncols, const int cc) {
     return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, cc).occupancy;
 }
@@ -765,22 +789,39 @@ static __device__ __forceinline__ void flash_attn_ext_turbo1_tcq_load_tile(
         const int stride_bytes,
         const int i_sup) {
     static_assert(D % QK_TURBO1_TCQ == 0, "turbo1_tcq fused loader requires 128-wide groups");
-    static_assert(nthreads >= 128, "turbo1_tcq fused loader requires at least 128 threads");
-
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
-    constexpr int blocks_per_row = D / QK_TURBO1_TCQ;
-    const int tid = threadIdx.y * warp_size + threadIdx.x;
+    static_assert(warp_size == 32, "turbo1_tcq fused loader assumes 32-lane warps");
+    static_assert(nthreads % warp_size == 0, "turbo1_tcq fused loader requires whole warps");
 
-    __shared__ float fwht_smem[128];
+    constexpr int nwarps         = nthreads / warp_size;
+    constexpr int blocks_per_row = D / QK_TURBO1_TCQ;
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+
     const float alpha = is_value ? d_tcq_decode_alpha_v_fattn : d_tcq_decode_alpha_k_fattn;
     constexpr float inv_sqrt_128 = 0.08838834764831845f;
 
-    for (int row = 0; row < nbatch_fa; ++row) {
+    // Per-lane loop invariants, hoisted: the sign/InnerQ arrays are indexed divergently per
+    // lane, and divergent __constant__ reads serialize into one transaction per distinct
+    // address — done per element per block they dominate the loader. Loaded once instead.
+    float sg_pre[4];   // signs2[e]                                    (applied before the FWHT)
+    float sg_post[4];  // inv_sqrt_128 * signs1[e] * innerq_inv[e]     (applied after)
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int e = lane + 32*k;
+        sg_pre[k]  = d_turbo_wht_signs2_fattn[e];
+        sg_post[k] = inv_sqrt_128 * d_turbo_wht_signs1_fattn[e] * d_innerq_channel_scale_inv_fattn[e];
+    }
+
+    // One row per warp, barrier-free: lane l holds elements {l, l+32, l+64, l+96} of each
+    // 128-group. FWHT-128 stages h=1..16 are intra-warp shuffles applied to all 4 registers;
+    // h=32 pairs v[0]<->v[1] and v[2]<->v[3] in-register; h=64 pairs v[0]<->v[2], v[1]<->v[3].
+    // The caller's __syncthreads() after the load publishes the tile.
+    for (int row = warp; row < nbatch_fa; row += nwarps) {
         if (oob_check && row >= i_sup) {
-            for (int b = tid; b < D/2; b += nthreads) {
+            for (int b = lane; b < D/2; b += warp_size) {
                 tile[row * stride_tile + b] = make_half2(0.0f, 0.0f);
             }
-            __syncthreads();
             continue;
         }
 
@@ -788,31 +829,67 @@ static __device__ __forceinline__ void flash_attn_ext_turbo1_tcq_load_tile(
 
 #pragma unroll
         for (int blk_idx = 0; blk_idx < blocks_per_row; ++blk_idx) {
-            float val = 0.0f;
-            if (tid < 128) {
-                const block_turbo1_tcq * blk = (const block_turbo1_tcq *)(row_ptr) + blk_idx;
-                const int byte_idx = tid >> 3;
-                const int bit_off  = tid & 7;
-                const uint16_t packed = (uint16_t)blk->qs[byte_idx] | ((uint16_t)blk->qs[byte_idx + 1] << 8);
-                const int state = (packed >> bit_off) & 0xFF;
-                const float norm = __half2float(blk->norm) * alpha;
-                val = norm * cb[state] * d_turbo_wht_signs2_fattn[tid];
+            const block_turbo1_tcq * blk = (const block_turbo1_tcq *)(row_ptr) + blk_idx;
+            const float norm = __half2float(blk->norm) * alpha;
+
+            if constexpr (!is_value) {
+                // K stays in the WHT-rotated domain (Q is pre-rotated to match, like turbo2/3):
+                // the stored trellis coeffs ARE the rotated coordinates, so the tile load is a
+                // pure LUT — no FWHT, no sign vectors. V cannot do this (per-row original-domain
+                // decode is coherence-critical), so only the K side takes this path.
+                half * tile_h = (half *)(tile + row * stride_tile + blk_idx * 64);
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    const int e = lane + 32*k;
+                    const uint16_t packed = (uint16_t)blk->qs[e >> 3] | ((uint16_t)blk->qs[(e >> 3) + 1] << 8);
+                    const int state = (packed >> (e & 7)) & 0xFF;
+                    tile_h[e] = __float2half(norm * cb[state]);
+                }
+                continue;
             }
 
-            val = fwht128_butterfly_linear(val, fwht_smem, tid);
-
-            if (tid < 128) {
-                fwht_smem[tid] = val * inv_sqrt_128 * d_turbo_wht_signs1_fattn[tid] *
-                    d_innerq_channel_scale_inv_fattn[tid];
+            float v[4];
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const int e = lane + 32*k;
+                const uint16_t packed = (uint16_t)blk->qs[e >> 3] | ((uint16_t)blk->qs[(e >> 3) + 1] << 8);
+                const int state = (packed >> (e & 7)) & 0xFF;
+                v[k] = norm * cb[state] * sg_pre[k];
             }
-            __syncthreads();
 
-            if (tid < 64) {
-                tile[row * stride_tile + blk_idx * 64 + tid] = __floats2half2_rn(
-                    fwht_smem[2 * tid + 0],
-                    fwht_smem[2 * tid + 1]);
+#pragma unroll
+            for (int h = 1; h <= 16; h *= 2) {
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    const float other = __shfl_xor_sync(0xFFFFFFFFULL, v[k], h);
+                    v[k] = (lane & h) ? (other - v[k]) : (v[k] + other);
+                }
             }
-            __syncthreads();
+            {   // h=32: element pairs (e, e^32) sit in adjacent registers.
+                const float a0 = v[0], a1 = v[1], a2 = v[2], a3 = v[3];
+                v[0] = a0 + a1; v[1] = a0 - a1;
+                v[2] = a2 + a3; v[3] = a2 - a3;
+            }
+            {   // h=64: element pairs (e, e^64).
+                const float a0 = v[0], a1 = v[1], a2 = v[2], a3 = v[3];
+                v[0] = a0 + a2; v[2] = a0 - a2;
+                v[1] = a1 + a3; v[3] = a1 - a3;
+            }
+
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                v[k] *= sg_post[k];
+            }
+
+            // half2 stores pair consecutive elements (2j, 2j+1) = same register on adjacent
+            // lanes; even lanes fetch the odd lane's value and write.
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const float v_hi = __shfl_xor_sync(0xFFFFFFFFULL, v[k], 1);
+                if ((lane & 1) == 0) {
+                    tile[row * stride_tile + blk_idx * 64 + (lane + 32*k)/2] = __floats2half2_rn(v[k], v_hi);
+                }
+            }
         }
     }
 }
@@ -855,7 +932,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr int  cols_per_warp   = T_B_KQ::I;
     constexpr int  cols_per_thread = get_cols_per_thread();
     constexpr int  np              = cols_per_warp > ncols ? nwarps : nwarps * cols_per_warp/ncols; // Number of parallel CUDA warps per Q column.
-    constexpr int  nbatch_fa       = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols);
+    constexpr int  nbatch_fa       = ggml_cuda_fattn_mma_get_nbatch_fa_typed(DKQ, DV, ncols, type_K, type_V);
     constexpr int  nbatch_K2       = ggml_cuda_fattn_mma_get_nbatch_K2(DKQ, DV, ncols);
     constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg (DKQ, DV, ncols);
@@ -1496,7 +1573,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int  cols_per_warp   = T_B_KQ::I;
     constexpr int  cols_per_thread = get_cols_per_thread();
     constexpr int  np              = cols_per_warp > ncols ? nwarps : nwarps * cols_per_warp/ncols; // Number of parallel CUDA warps per Q column.
-    constexpr int  nbatch_fa       = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols);
+    constexpr int  nbatch_fa       = ggml_cuda_fattn_mma_get_nbatch_fa_typed(DKQ, DV, ncols, type_K, type_V);
     constexpr int  nbatch_K2       = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols);
     constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols);
     constexpr int  nbatch_combine  = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols);
@@ -2128,7 +2205,7 @@ static __global__ void flash_attn_ext_f16(
 
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int ncols     = ncols1 * ncols2;
-    constexpr int nbatch_fa = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols);
+    constexpr int nbatch_fa = ggml_cuda_fattn_mma_get_nbatch_fa_typed(DKQ, DV, ncols, type_K, type_V);
     constexpr int nthreads  = ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols);
     constexpr int nwarps    = nthreads / warp_size;
 
