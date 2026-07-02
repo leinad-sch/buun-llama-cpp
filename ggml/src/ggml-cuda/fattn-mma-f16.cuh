@@ -271,16 +271,15 @@ static constexpr __device__ int ggml_cuda_fattn_mma_get_nthreads(const int DKQ, 
     return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols).nthreads;
 }
 
-// turbo1_tcq: halve nbatch_fa at the D=256 decode shapes. Measured BOTH ways (2026-07-02):
-// with the FWHT-era loader the extra resident blocks were worth +10%; with the pure-LUT
-// loader the doubled per-tile overhead costs instructions BUT the occupancy still wins
-// (32: 27.5 t/s @32k vs 64: 25.6) — the loader's instruction count needs the latency hiding.
-// Scoped to DKQ=DV=256; the D=128 shapes have different np/nbatch relations and are untested.
+// Typed nbatch_fa hook — an identity today, kept as the seam for per-type tile tuning.
+// History (2026-07-02, 27B/3090 @32k): halving to 32 for turbo1_tcq was worth +10% while its
+// loader was a latency-bound FWHT chain (needed the occupancy), and its warp-per-row LUT
+// successor still needed it (27.75 @32 vs 25.46 @64). Moot once t1 moved to the row-per-thread
+// generic-loader shape (28.94 @64) — which requires nbatch_fa >= nthreads to keep threads fed.
 static constexpr __host__ __device__ int ggml_cuda_fattn_mma_nbatch_fa_typed_adjust(
         const int nbatch_fa, const int DKQ, const int DV, const ggml_type type_K, const ggml_type type_V) {
-    return (type_K == GGML_TYPE_TURBO1_TCQ || type_V == GGML_TYPE_TURBO1_TCQ) &&
-           DKQ == 256 && DV == 256 && nbatch_fa > 32
-        ? nbatch_fa / 2 : nbatch_fa;
+    GGML_UNUSED_VARS(DKQ, DV, type_K, type_V);
+    return nbatch_fa;
 }
 
 static __host__ int ggml_cuda_fattn_mma_get_nbatch_fa_typed(
@@ -737,6 +736,30 @@ static __device__ __forceinline__ void flash_attn_ext_turbo_load_tile(
                                        __float2half(cb[state1] * norm));
                 }
             }
+        } else if constexpr (turbo_type == GGML_TYPE_TURBO1_TCQ) {
+            // turbo1_tcq in the row-per-thread shape that wins for all cheap LUT decodes —
+            // unrolled b keeps the window byte/shift arithmetic compile-time constant. This
+            // replaced the warp-per-row loader (needed only while the loader carried an
+            // in-kernel FWHT): 27.75 -> 28.94 t/s @32k, ahead of t2_tcq, 0.2 behind f16.
+            const float alpha = is_value ? d_tcq_decode_alpha_v_fattn : d_tcq_decode_alpha_k_fattn;
+            constexpr int blocks_per_row = D / QK_TURBO1_TCQ;
+#pragma unroll
+            for (int blk_idx = 0; blk_idx < blocks_per_row; ++blk_idx) {
+                const block_turbo1_tcq * blk = (const block_turbo1_tcq *)(row_ptr) + blk_idx;
+                const float norm = __half2float(blk->norm) * alpha;
+#pragma unroll
+                for (int b = 0; b < QK_TURBO1_TCQ/2; ++b) {
+                    const int t0 = b * 2;
+                    const int t1 = t0 + 1;
+                    const uint16_t raw0 = (uint16_t)blk->qs[t0/8] | ((uint16_t)blk->qs[t0/8+1] << 8);
+                    const int state0 = (raw0 >> (t0%8)) & 0xFF;
+                    const uint16_t raw1 = (uint16_t)blk->qs[t1/8] | ((uint16_t)blk->qs[t1/8+1] << 8);
+                    const int state1 = (raw1 >> (t1%8)) & 0xFF;
+                    tile[row * stride_tile + blk_idx * (QK_TURBO1_TCQ/2) + b] =
+                        __halves2half2(__float2half(cb[state0] * norm),
+                                       __float2half(cb[state1] * norm));
+                }
+            }
         } else if constexpr (turbo_type == GGML_TYPE_TURBO2_TCQ) {
             const float alpha = is_value ? d_tcq_decode_alpha_v_fattn : d_tcq_decode_alpha_k_fattn;
             constexpr int blocks_per_row = D / QK_TURBO2_TCQ;
@@ -791,65 +814,6 @@ static __device__ __forceinline__ float fwht128_butterfly_linear(float val, floa
     return val;
 }
 
-
-template <int D, int stride_tile, int nbatch_fa, int nthreads, bool oob_check, bool is_value>
-static __device__ __forceinline__ void flash_attn_ext_turbo1_tcq_load_tile(
-        const char * __restrict__ raw,
-        half2      * __restrict__ tile,
-        const float * __restrict__ cb,
-        const int stride_bytes,
-        const int i_sup) {
-    static_assert(D % QK_TURBO1_TCQ == 0, "turbo1_tcq fused loader requires 128-wide groups");
-    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
-    static_assert(warp_size == 32, "turbo1_tcq fused loader assumes 32-lane warps");
-    static_assert(nthreads % warp_size == 0, "turbo1_tcq fused loader requires whole warps");
-
-    constexpr int nwarps         = nthreads / warp_size;
-    constexpr int blocks_per_row = D / QK_TURBO1_TCQ;
-    const int lane = threadIdx.x;
-    const int warp = threadIdx.y;
-
-    const float alpha = is_value ? d_tcq_decode_alpha_v_fattn : d_tcq_decode_alpha_k_fattn;
-
-    // One row per warp, barrier-free; lane l handles elements {l, l+32, l+64, l+96} of each
-    // 128-group. The caller's __syncthreads() after the load publishes the tile.
-    for (int row = warp; row < nbatch_fa; row += nwarps) {
-        if (oob_check && row >= i_sup) {
-            for (int b = lane; b < D/2; b += warp_size) {
-                tile[row * stride_tile + b] = make_half2(0.0f, 0.0f);
-            }
-            continue;
-        }
-
-        const char * row_ptr = raw + (int64_t)row * stride_bytes;
-
-#pragma unroll
-        for (int blk_idx = 0; blk_idx < blocks_per_row; ++blk_idx) {
-            // Both K and V are consumed in the WHT-rotated domain: the stored trellis coeffs
-            // ARE the rotated coordinates, so the tile load is a pure LUT — no FWHT, no sign
-            // vectors. Q is pre-rotated to match; the attention output is un-rotated at graph
-            // level for V (ggml_turbo_wht keyed on v->type — turbo2/3_tcq contract, and the
-            // rotated coeffs are near-exactly f16-representable, unlike post-FWHT values).
-            //
-            // The 20-byte block is read as 5 aligned words (broadcast within the warp). The
-            // 8-bit state window of element e = lane + 32k sits at absolute bit 16+lane+32k:
-            // the funnel-shift amount (16+lane)&31 is k-independent, the low word is bw[k]
-            // for lanes 0-15 and bw[k+1] for lanes 16-31, and the high word is always bw[k+1]
-            // (for lanes >= 16 the shift is <= 15 so the high word provably cannot contribute).
-            const uint32_t * bw = (const uint32_t *)(row_ptr + blk_idx * sizeof(block_turbo1_tcq));
-            const float norm = __half2float(__ushort_as_half((unsigned short)(bw[0] & 0xFFFF))) * alpha;
-            const int shift = (16 + lane) & 31;
-
-            half * tile_h = (half *)(tile + row * stride_tile + blk_idx * 64);
-#pragma unroll
-            for (int k = 0; k < 4; ++k) {
-                const uint32_t lo = (lane < 16) ? bw[k] : bw[k + 1];
-                const int state = (int)(__funnelshift_r(lo, bw[k + 1], shift) & 0xFF);
-                tile_h[lane + 32*k] = __float2half(norm * cb[state]);
-            }
-        }
-    }
-}
 
 template<int DKQ, int DV, int ncols1, int ncols2, int nwarps,
     bool use_logit_softcap, bool V_is_K_view, bool needs_fixup, bool is_fixup, bool last_iter, bool oob_check,
@@ -952,11 +916,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 constexpr int nthreads_turbo = nwarps * ggml_cuda_get_physical_warp_size();
                 flash_attn_ext_turbo8_load_tile<DKQ, stride_tile_K, nbatch_fa, nthreads_turbo, oob_check>(
                     K_raw + int64_t(k_VKQ_0) * stride_K, tile_K, stride_K, k_VKQ_sup);
-            } else if constexpr (type_K == GGML_TYPE_TURBO1_TCQ) {
-                const char * K_raw = (const char *)K_h2;
-                constexpr int nthreads_turbo = nwarps * ggml_cuda_get_physical_warp_size();
-                flash_attn_ext_turbo1_tcq_load_tile<DKQ, stride_tile_K, nbatch_fa, nthreads_turbo, oob_check, false>(
-                    K_raw + int64_t(k_VKQ_0) * stride_K, tile_K, smem_cb, stride_K, k_VKQ_sup);
             } else {
                 const char * K_raw = (const char *)K_h2;
                 constexpr int nthreads_turbo = nwarps * ggml_cuda_get_physical_warp_size();
@@ -1328,12 +1287,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 constexpr int nthreads_turbo = nwarps * ggml_cuda_get_physical_warp_size();
                 flash_attn_ext_turbo8_load_tile<DV, stride_tile_V, nbatch_fa, nthreads_turbo, oob_check>(
                     V_raw + int64_t(k_VKQ_0) * stride_V, tile_V, stride_V, k_VKQ_sup);
-                __syncthreads();
-            } else if constexpr (type_V == GGML_TYPE_TURBO1_TCQ) {
-                const char * V_raw = (const char *)V_h2;
-                constexpr int nthreads_turbo = nwarps * ggml_cuda_get_physical_warp_size();
-                flash_attn_ext_turbo1_tcq_load_tile<DV, stride_tile_V, nbatch_fa, nthreads_turbo, oob_check, true>(
-                    V_raw + int64_t(k_VKQ_0) * stride_V, tile_V, smem_cb_v, stride_V, k_VKQ_sup);
                 __syncthreads();
             } else {
                 const char * V_raw = (const char *)V_h2;
