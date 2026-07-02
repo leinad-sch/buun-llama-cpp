@@ -1162,7 +1162,7 @@ static __global__ void k_turbo3_tcq_dequant_f16_inv_fwht(
         const char * __restrict__ src, half * __restrict__ dst,
         const int64_t ne0, const int64_t ne1, const int64_t ne2,
         const size_t nb1, const size_t nb2, const size_t nb3,
-        const float alpha) {
+        const float alpha, const int is_v = 0) {
     const int64_t row  = blockIdx.x;
     const int64_t head = blockIdx.y;
     const int64_t strm = blockIdx.z;
@@ -1189,7 +1189,7 @@ static __global__ void k_turbo3_tcq_dequant_f16_inv_fwht(
         const int bit_off = bit_pos % 8;
         const uint16_t raw = (uint16_t)blk->qs[byte_idx] | ((uint16_t)blk->qs[byte_idx + 1] << 8);
         const int state = (raw >> bit_off) & 0x1FF;
-        const float c = d_turbo3_tcq_codebook_fattn[state];
+        const float c = (is_v ? d_turbo3_tcq_codebook_v_fattn : d_turbo3_tcq_codebook_fattn)[state];
 
         float val = fwht128_butterfly_inplace(c * s2[tid], smem);
 
@@ -1204,7 +1204,7 @@ static __global__ void k_turbo2_tcq_dequant_f16_inv_fwht(
         const char * __restrict__ src, half * __restrict__ dst,
         const int64_t ne0, const int64_t ne1, const int64_t ne2,
         const size_t nb1, const size_t nb2, const size_t nb3,
-        const float alpha) {
+        const float alpha, const int is_v = 0) {
     const int64_t row  = blockIdx.x;
     const int64_t head = blockIdx.y;
     const int64_t strm = blockIdx.z;
@@ -1231,7 +1231,7 @@ static __global__ void k_turbo2_tcq_dequant_f16_inv_fwht(
         const int bit_off = bit_pos % 8;
         const uint16_t raw = (uint16_t)blk->qs[byte_idx] | ((uint16_t)blk->qs[byte_idx + 1] << 8);
         const int state = (raw >> bit_off) & 0xFF;
-        const float c = d_turbo2_tcq_codebook_fattn[state];
+        const float c = (is_v ? d_turbo2_tcq_codebook_v_fattn : d_turbo2_tcq_codebook_fattn)[state];
 
         float val = fwht128_butterfly_inplace(c * s2[tid], smem);
 
@@ -1511,6 +1511,82 @@ static __global__ void k_vbr_stage2a_v_original_to_rotated_f16(
     constexpr float inv_sqrt_128 = 0.08838834764831845f;
     val = val * inv_sqrt_128 * d_turbo_wht_signs2_fattn[tid];
     data[off] = __float2half(val);
+}
+
+// ---- Dynamic VBR transcode, Stage 1 (read side) ----------------------------------------------
+#include "vbr-transcode.cuh"
+
+// f16 -> f32 with a uniform scale (set_rows needs F32 src0). The scale carries the V decode-alpha
+// correction for cross-tier transcode (see vbr_dequant_turbo_to_f32).
+static __global__ void k_vbr_f16_to_f32_scaled(const half * __restrict__ src, float * __restrict__ dst,
+                                               int64_t n, float scale) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { dst[i] = __half2float(src[i]) * scale; }
+}
+
+// V decode-alpha for a tier (1.0 for non-TCQ / K). The runtime V decode multiplies recon by this.
+// NOTE: the TCQ-type guard is load-bearing — tcq_compute_alpha_v returns the TURBO_TCQ_DECODE_ALPHA_V
+// static override for ANY type, so calling it unguarded would apply a spurious alpha to turbo4/8.
+static inline float vbr_alpha_v_decode(ggml_type t, int64_t n_kv) {
+    return (t == GGML_TYPE_TURBO3_TCQ || t == GGML_TYPE_TURBO2_TCQ || t == GGML_TYPE_TURBO1_TCQ)
+        ? tcq_compute_alpha_v(t, n_kv) : 1.0f;
+}
+
+// Dequant n_cells rows of a turbo KV tensor (type A) to ORIGINAL-domain dense f32 [n_cells, ne0],
+// pre-scaled so re-encoding to type B then decoding B reproduces A's reconstruction. Lives in
+// fattn.cu so the decode codebooks/InnerQ/alpha (static to this TU) are visible.
+void vbr_dequant_turbo_to_f32(const char * src, ggml_type src_type, ggml_type type_B,
+                              half * scratch_f16, float * dst_f32,
+                              int64_t n_cells, int64_t ne0, size_t nb1,
+                              bool is_v, int device, cudaStream_t stream) {
+    GGML_ASSERT(ne0 % 128 == 0); // turbo FWHT blocks are 128-wide; the dequant loops ne0/128 blocks per cell
+    // Treat the tensor as [ne0, n_cells]: one block per cell, 128 threads, ne0/128 FWHT blocks/cell.
+    // head/stream dims collapse to 1 (nb2/nb3 unused since blockIdx.y/z == 0).
+    const dim3 grid((unsigned) n_cells, 1, 1);
+    const int iv = is_v ? 1 : 0;
+    // V-mean affine tap: this dequant emits stored-domain (V - mu_V) — the graph restores mu_V at
+    // decode. The transcode re-encode (vbr-transcode.cu) suppresses the encode tap so it does NOT
+    // re-subtract mu, keeping the stored domain intact (no double-subtract). See g_turbo_meansub_suppress.
+    // load_tcq_decode_alpha + the natural decode alpha are shared by the TCQ cases (one-shot loader,
+    // harmless for non-TCQ; alpha is unused by the turbo4/8 kernels which take no alpha arg).
+    load_tcq_decode_alpha(device);
+    const float alpha = is_v ? tcq_compute_alpha_v(src_type, n_cells) : d_tcq_decode_alpha_k;
+    switch (src_type) {
+        case GGML_TYPE_TURBO4_0:
+            k_turbo4_dequant_f16_inv_fwht<<<grid, 128, 0, stream>>>(
+                src, scratch_f16, ne0, n_cells, 1, nb1, nb1, nb1);
+            break;
+        case GGML_TYPE_TURBO8_0:
+            k_turbo8_dequant_f16_inv_fwht<<<grid, 128, 0, stream>>>(
+                src, scratch_f16, ne0, n_cells, 1, nb1, nb1, nb1);
+            break;
+        case GGML_TYPE_TURBO3_TCQ:
+            turbo_tcq_load_kv_decode();          // idempotent codebook staging (K+V)
+            k_turbo3_tcq_dequant_f16_inv_fwht<<<grid, 128, 0, stream>>>(
+                src, scratch_f16, ne0, n_cells, 1, nb1, nb1, nb1, alpha, iv);
+            break;
+        case GGML_TYPE_TURBO2_TCQ:
+            turbo2_tcq_load_kv_decode();
+            k_turbo2_tcq_dequant_f16_inv_fwht<<<grid, 128, 0, stream>>>(
+                src, scratch_f16, ne0, n_cells, 1, nb1, nb1, nb1, alpha, iv);
+            break;
+        case GGML_TYPE_TURBO1_TCQ:
+            turbo1_tcq_load_cb_fattn();
+            // turbo1_tcq decodes per-row, FWHT applied inside the kernel → original domain.
+            k_turbo1_tcq_dequant_f16<<<grid, 128, 0, stream>>>(
+                src, scratch_f16, ne0, n_cells, 1, nb1, nb1, nb1, alpha, iv);
+            break;
+        default:
+            GGML_ABORT("vbr_dequant_turbo_to_f32: unsupported src_type %d", (int) src_type);
+    }
+    // f16 -> f32, dividing V by the TARGET tier's decode-alpha so the later decode(B)'s *alpha_v(B)
+    // reproduces A's reconstruction. For A->A this makes the round-trip byte-exact; K is unaffected
+    // (alpha 1.0). The dequant above already applied A's natural decode alpha.
+    const float vscale = is_v ? 1.0f / vbr_alpha_v_decode(type_B, n_cells) : 1.0f;
+    const int64_t n_elem  = n_cells * ne0;
+    const int64_t threads = 256;
+    const int64_t blocks  = (n_elem + threads - 1) / threads;
+    k_vbr_f16_to_f32_scaled<<<(unsigned) blocks, (unsigned) threads, 0, stream>>>(scratch_f16, dst_f32, n_elem, vscale);
 }
 
 static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
