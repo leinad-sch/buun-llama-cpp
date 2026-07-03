@@ -92,24 +92,33 @@ static void vbr_fidelity_report(const char * name, ggml_type tA, ggml_type tB,
             (long long) worst_row, worst_rms);
 }
 
-// Transcode the first n_cells rows of src_A (turbo type A) into dst_B_data as turbo type B.
-// dst_B_data points into the KV pool at the destination region. dst_name MUST be the real cache
+// Transcode the first n_cells rows of p->src (turbo type A) into p->dst as turbo type B.
+// p->dst points into the KV pool at the destination region. p->src->name MUST be the real cache
 // tensor name (cache_k_l<L> / cache_v_l<L>) — the encoder keys its K/V codebook + kmean tap off it.
 //
 // STREAMING + IN-PLACE (VBR design decisions #2/#3): processed one TILE of cells at a time, so the
 // f32/f16 scratch is bounded (~few MB, independent of n_cells) — NOT the whole-tensor f32 buffer.
-// Safe when dst_B_data == src_A->data (in-place degrade): a degrade has rB <= rA, so the dest write
+// Safe when dst == src->data (in-place degrade): a degrade has rB <= rA, so the dest write
 // offset (c*rB) always trails the source read offset (c*rA); ascending tiles + same-stream ordering
 // mean a tile's write never clobbers a later tile's unread source. (rB > rA, i.e. an UPGRADE, would
 // violate this — degrades only.)
+// ASYNC (S5): no end-of-call sync — everything is stream-ordered on ctx.stream(). The pool-alloc
+// scratch returns to the per-context pool at scope exit; reuse by the NEXT transcode on the same
+// stream is ordered behind this one's kernels, so that is safe by construction.
 // NOTE: assumes decode-side InnerQ (d_innerq_channel_scale_inv_fattn) is already identity/calibrated
 // from prior decode (true in the live decode-time path).
 void ggml_cuda_vbr_kv_transcode(ggml_backend_cuda_context & ctx,
-                                const ggml_tensor * src_A, ggml_type type_B,
-                                void * dst_B_data, ggml_backend_buffer_t pool_buf,
-                                const char * dst_name, int64_t n_cells, bool is_v,
-                                const void * stash_f16, int64_t stash_rows) {
+                                const ggml_backend_cuda_kv_transcode_params * p) {
     cudaStream_t stream = ctx.stream();
+    const ggml_tensor * src_A      = p->src;
+    const ggml_type     type_B     = p->type_B;
+    void *              dst_B_data = p->dst;
+    const int64_t       n_cells    = p->n_cells;
+    const bool          is_v       = p->is_v;
+    const void *        stash_f16  = p->stash_f16;
+    const int64_t       stash_rows = p->stash_rows;
+    const char *        dst_name   = src_A->name;
+    ggml_backend_buffer_t pool_buf = p->pool_buf;
     const int64_t ne0 = src_A->ne[0];
     const size_t  rA  = src_A->nb[1];                       // source bytes/cell
     const size_t  rB  = ggml_row_size(type_B, ne0);         // dest bytes/cell (contiguous)
@@ -195,6 +204,12 @@ void ggml_cuda_vbr_kv_transcode(ggml_backend_cuda_context & ctx,
     }
     ggml_free(tctx);
 
+    // scrub stale tier-A bytes on kept pages past the new tier-B extent (stream-ordered after the
+    // final tile's writes — the scrub region starts at the write high-water mark)
+    if (p->scrub_bytes > 0) {
+        CUDA_CHECK(cudaMemsetAsync((char *) dst_B_data + (size_t) n_cells * rB, 0, p->scrub_bytes, stream));
+    }
+
     if (fidelity) {
         std::vector<float> fidB;
         vbr_fidelity_dequant_all(ctx, (const char *) dst_B_data, type_B, rB, n_cells, ne0, is_v, stream, fidB);
@@ -220,7 +235,8 @@ void ggml_cuda_vbr_kv_transcode(ggml_backend_cuda_context & ctx,
 }
 
 // Capture the f16 sink stash: dequant the first n_rows of src (original/stored domain, same
-// convention as the transcode's Stage 1) and pack to f16 at stash_f16.
+// convention as the transcode's Stage 1) and pack to f16 at stash_f16. ASYNC (S5): stream-ordered
+// ahead of the same-stream transcode that consumes/overwrites the source rows.
 extern "C" void ggml_backend_cuda_kv_stash_capture(ggml_backend_t backend, const struct ggml_tensor * src,
                                                    void * stash_f16, int64_t n_rows, bool is_v) {
     ggml_backend_cuda_context & ctx = *(ggml_backend_cuda_context *) backend->context;
@@ -231,21 +247,52 @@ extern "C" void ggml_backend_cuda_kv_stash_capture(ggml_backend_t backend, const
     vbr_dequant_turbo_to_f32((const char *) src->data, src->type, src->type,
                              s16.get(), s32.get(), n_rows, ne0, src->nb[1], is_v, ctx.device, stream);
     ggml_get_to_fp16_cuda(GGML_TYPE_F32)(s32.get(), (half *) stash_f16, n_rows * ne0, stream);
-    CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
 // Host-facing wrapper (callable from llama-kv-cache under GGML_USE_CUDA). extern "C" to match the
 // ggml-cuda.h declaration (C linkage).
 extern "C" void ggml_backend_cuda_kv_transcode(ggml_backend_t backend,
-                                    const ggml_tensor * src_A, enum ggml_type type_B,
-                                    void * dst_B_data, ggml_backend_buffer_t pool_buf,
-                                    const char * dst_name, int64_t n_cells, bool is_v,
-                                    const void * stash_f16, int64_t stash_rows) {
+                                               const struct ggml_backend_cuda_kv_transcode_params * params) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
-    ggml_cuda_vbr_kv_transcode(*cuda_ctx, src_A, type_B, dst_B_data, pool_buf, dst_name, n_cells, is_v,
-                               stash_f16, stash_rows);
+    ggml_cuda_vbr_kv_transcode(*cuda_ctx, params);
 }
 
-extern "C" void ggml_backend_cuda_sync_device(void) {
+extern "C" void ggml_backend_cuda_sync_device(int device) {
+    if (device >= 0) {
+        ggml_cuda_set_device(device);
+    }
     cudaDeviceSynchronize();
+}
+
+// S5 side-stream fence: one event per device. arm() records on the VBR side stream after a degrade
+// wave's async work; the next graph_compute on the device consumes it with a GPU-side stream wait,
+// so the decode graph runs after the transcodes without the host ever blocking. Re-arming before a
+// consume simply re-records the (same-stream) event — waiting on the newest record covers all
+// earlier wave work. Single-threaded by design (both sites run on the llama_decode thread).
+static cudaEvent_t g_vbr_fence_ev[GGML_CUDA_MAX_DEVICES]    = {};
+static bool        g_vbr_fence_armed[GGML_CUDA_MAX_DEVICES] = {};
+
+extern "C" void ggml_backend_cuda_vbr_fence_arm(ggml_backend_t backend) {
+    ggml_backend_cuda_context & ctx = *(ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx.device);
+    if (g_vbr_fence_ev[ctx.device] == nullptr) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&g_vbr_fence_ev[ctx.device], cudaEventDisableTiming));
+    }
+    CUDA_CHECK(cudaEventRecord(g_vbr_fence_ev[ctx.device], ctx.stream()));
+    g_vbr_fence_armed[ctx.device] = true;
+}
+
+void ggml_cuda_vbr_fence_consume(int device, cudaStream_t stream) {
+    if (g_vbr_fence_armed[device]) {
+        CUDA_CHECK(cudaStreamWaitEvent(stream, g_vbr_fence_ev[device], 0));
+        // disarm only once the wave has RETIRED: another graph_compute on this device (e.g. the
+        // transcode oracle's throwaway backend) must not steal the decode graph's pending wait.
+        // While in flight every graph waits (correct either way); after retirement the first
+        // consumer clears the flag and the fast path is a single branch again.
+        if (cudaEventQuery(g_vbr_fence_ev[device]) == cudaSuccess) {
+            g_vbr_fence_armed[device] = false;
+        } else {
+            (void) cudaGetLastError(); // absorb the benign cudaErrorNotReady from the query
+        }
+    }
 }

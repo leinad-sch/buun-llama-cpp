@@ -54,6 +54,7 @@
 #include "ggml-cuda/topk-moe.cuh"
 #include "ggml-cuda/unary.cuh"
 #include "ggml-cuda/upscale.cuh"
+#include "ggml-cuda/vbr-transcode.cuh"
 #include "ggml-cuda/wkv.cuh"
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
@@ -4502,6 +4503,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    // VBR S5: if a KV degrade wave is in flight on the side stream, GPU-wait on it here (before
+    // any capture/launch) so this graph reads the flipped tensors post-transcode. Host never blocks.
+    ggml_cuda_vbr_fence_consume(cuda_ctx->device, cuda_ctx->stream());
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;

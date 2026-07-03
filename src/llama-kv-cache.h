@@ -6,6 +6,7 @@
 #include "llama-memory.h"
 
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 struct llama_cparams;
@@ -243,14 +244,12 @@ private:
         std::vector<ggml_tensor *> v_stream;
     };
 
-    // Dynamic VBR (M2): per-(layer,side) descriptor over the shared KV pool buffer.
-    // M2 records the current placement bit-identically; M3 mutates {tensor,type,byte_off,byte_len}
-    // when a tensor is transcoded down a tier (freed bytes return to the pool's free region).
+    // Dynamic VBR (M2): per-(layer,side) descriptor over the shared KV pool buffer. Tier and cell
+    // width are NOT mirrored here — the cache tensor (layers[ikv].k/.v) is the single source of
+    // truth for {type, ne0}; a degrade flips the tensor and this descriptor only tracks placement.
     struct vbr_extent {
         size_t    byte_off = 0;                 // offset of this tensor's data within the pool buffer
-        size_t    byte_len = 0;                 // current byte size
-        ggml_type type     = GGML_TYPE_F16;     // current tier
-        int64_t   ne0      = 0;                 // padded per-cell embd dim (tier-independent cell count)
+        size_t    byte_len = 0;                 // current byte size (0 = tensor not pooled)
         size_t    stash_off   = 0;              // offset into the f16 sink-stash buffer
         uint32_t  stash_valid = 0;              // rows captured (0 = not yet)
     };
@@ -282,10 +281,20 @@ private:
     size_t         vbr_degrade_cursor_ = 0;
     size_t         vbr_budget_bytes_   = 0;           // mapped-physical budget; 0 = no trigger
     ggml_backend_t vbr_backend_        = nullptr;     // dedicated transcode backend (lazy; the side stream)
+    // S5 overlap: transcodes run async on vbr_backend_'s stream; the next decode graph GPU-waits
+    // via the armed fence (ggml_backend_cuda_vbr_fence_arm). Tail pages a transcode may still READ
+    // (rA extent > kept rB extent) can only be unmapped once it finishes — queue them and flush at
+    // the next decode boundary, when the wave is long done.
+    bool vbr_wave_pending_ = false;                   // async GPU work enqueued, fence not yet armed
+    std::vector<std::pair<size_t, size_t>> vbr_unmap_deferred_; // {pool byte_off, len}
+    void     vbr_flush_deferred_unmaps();
+    char *   vbr_stash_ensure();                      // lazy sink-stash buffer; returns base
     void     vbr_load_degrade_order();                // baked table, or VBR_DEGRADE_ORDER=<file> override
     size_t   vbr_vmm_projected_bytes(uint32_t wm_cells) const;
     uint32_t vbr_watermark_cells(uint32_t extra_tokens) const; // shared by prepare() + ensure_mapped
-    bool     vbr_degrade_next();                      // one step down the order; false = exhausted
+    bool     vbr_degrade_next(uint32_t wm_next);      // one step down the order; false = exhausted
+                                                      // wm_next = projected watermark incl. the
+                                                      // incoming batch (bounds live pages/scrub)
 
     bool v_trans = true;  // the value tensor is transposed
 

@@ -1019,6 +1019,31 @@ static void common_params_postprocess_vbr(common_params & params) {
     }
     params.vbr_budget = budget;
     if (common_vbr_budget_is_dynamic(budget)) {
+        // M3 runtime controller: an explicit VRAM budget in dynamic mode arms the decode-time
+        // degrade controller (VMM-backed pool, price-ordered in-place transcodes) instead of a
+        // pre-baked static schedule. The cache starts at the turbo8 entry tier (the baked degrade
+        // order's F16 band no-ops on a t8 start) and tensors degrade selectively as mapped bytes
+        // approach the budget. Envs are set loudly — the CLI wins over any pre-set VBR_VMM /
+        // VBR_BUDGET_MIB (a stale env silently fighting the flag = instrument-is-the-bug trap).
+        if (params.vbr_vram_budget_explicit && vram_budget_bytes > 0) {
+            const uint64_t budget_mib = std::max<uint64_t>(1, vram_budget_bytes / (1024ull * 1024ull));
+            if (getenv("VBR_VMM") || getenv("VBR_BUDGET_MIB")) {
+                LOG_WRN("VBR dynamic: overriding pre-set VBR_VMM/VBR_BUDGET_MIB env with CLI values\n");
+            }
+            common_setenv_override("VBR_VMM", "1");
+            common_setenv_override("VBR_BUDGET_MIB", std::to_string(budget_mib));
+            if (params.vbr_cache_type_k) {
+                params.cache_type_k = GGML_TYPE_TURBO8_0;
+            }
+            if (params.vbr_cache_type_v) {
+                params.cache_type_v = GGML_TYPE_TURBO8_0;
+            }
+            common_setenv_override("TURBO_VBR_MODE", "dynamic");
+            common_setenv_override("VBR_MODE", "dynamic");
+            LOG_INF("VBR dynamic runtime controller: KV budget %llu MiB (mapped-physical), entry tier turbo8, "
+                    "price-ordered decode-time degrades\n", (unsigned long long) budget_mib);
+            return;
+        }
         bool has_policy = false;
         const std::string policy_path = common_vbr_policy_arg(params, has_policy);
         if (!policy_path.empty() && floor_bits > 0.0) {

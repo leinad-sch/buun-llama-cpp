@@ -18,3 +18,9 @@ void vbr_dequant_turbo_to_f32(const char * src, enum ggml_type src_type, enum gg
                               half * scratch_f16, float * dst_f32,
                               int64_t n_cells, int64_t ne0, size_t nb1,
                               bool is_v, int device, cudaStream_t stream);
+
+// S5 side-stream fence, consume side (defined in vbr-transcode.cu): if a VBR degrade wave armed
+// the per-device fence (ggml_backend_cuda_vbr_fence_arm), make `stream` GPU-wait on it and disarm.
+// Called at the top of every CUDA graph_compute so the next decode graph orders after the wave's
+// async transcodes without a host block. No-op when unarmed (one branch on a static bool).
+void ggml_cuda_vbr_fence_consume(int device, cudaStream_t stream);

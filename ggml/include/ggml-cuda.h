@@ -22,24 +22,41 @@ extern "C" {
 // backend API
 GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
 
-// Dynamic VBR: transcode the first n_cells rows of a turbo KV tensor (src_A) to a lower turbo tier
-// (type_B), writing into dst_B_data (a region of the KV pool buffer). dst_name must be the cache
-// tensor name (cache_k_l<L> / cache_v_l<L>) so the encoder picks the right K/V codebook.
-// stash_f16/stash_rows (nullable/0): f16 sink-stash — rows [0, stash_rows) re-encode from this
-// pristine snapshot instead of the tier-A recon, capping the permanently-hot sink rows at
-// single-hop error across any number of degrades. Capture it at the tensor's FIRST degrade.
+// Dynamic VBR: transcode the first n_cells rows of a turbo KV tensor (src) to a lower turbo tier
+// (type_B), writing into dst (a region of the KV pool buffer; == src->data for the in-place
+// degrade). src->name must be the cache tensor name (cache_k_l<L> / cache_v_l<L>) so the encoder
+// picks the right K/V codebook. stash_f16/stash_rows (nullable/0): f16 sink-stash — rows
+// [0, stash_rows) re-encode from this pristine snapshot instead of the tier-A recon, capping the
+// permanently-hot sink rows at single-hop error across any number of degrades; capture it at the
+// tensor's FIRST degrade. scrub_bytes: zero this many bytes after the tier-B extent (stale tier-A
+// bytes on kept pages read as padding can carry NaN f16 scales).
+// ASYNC: everything is enqueued on the backend's stream; the caller orders consumers with
+// ggml_backend_cuda_vbr_fence_arm or ggml_backend_synchronize.
+struct ggml_backend_cuda_kv_transcode_params {
+    const struct ggml_tensor * src;
+    enum ggml_type             type_B;
+    void *                     dst;
+    ggml_backend_buffer_t      pool_buf;
+    int64_t                    n_cells;
+    bool                       is_v;
+    const void *               stash_f16;
+    int64_t                    stash_rows;
+    size_t                     scrub_bytes;
+};
 GGML_BACKEND_API void ggml_backend_cuda_kv_transcode(ggml_backend_t backend,
-                                                     const struct ggml_tensor * src_A, enum ggml_type type_B,
-                                                     void * dst_B_data, ggml_backend_buffer_t pool_buf,
-                                                     const char * dst_name, int64_t n_cells, bool is_v,
-                                                     const void * stash_f16, int64_t stash_rows);
+                                                     const struct ggml_backend_cuda_kv_transcode_params * params);
 GGML_BACKEND_API void ggml_backend_cuda_kv_stash_capture(ggml_backend_t backend, const struct ggml_tensor * src,
                                                          void * stash_f16, int64_t n_rows, bool is_v);
 
-// Block until all pending GPU work on the current device completes. Used to serialize a VBR transcode
-// (which reads the live KV on a side backend/stream) against the model's KV writes. v1 brute-force
-// equivalent of an event-based cudaStreamWaitEvent.
-GGML_BACKEND_API void ggml_backend_cuda_sync_device(void);
+// Block until all pending GPU work on `device` completes. Serializes a VBR degrade wave (which
+// reads the live KV on a side backend/stream) against the model's in-flight KV writes; one call
+// per wave, before the first transcode.
+GGML_BACKEND_API void ggml_backend_cuda_sync_device(int device);
+
+// S5 side-stream overlap: record an event on the (VBR side) backend's stream and arm a per-device
+// fence. The next CUDA graph_compute on that device inserts a GPU-side cudaStreamWaitEvent before
+// running, so the decode graph waits for the degrade wave's transcodes WITHOUT blocking the host.
+GGML_BACKEND_API void ggml_backend_cuda_vbr_fence_arm(ggml_backend_t backend);
 
 GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
 
