@@ -2741,6 +2741,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_NO_HOST"));
     add_opt(common_arg(
+        {"-ct", "--cache-type"}, "TYPE",
+        string_format(
+            "KV cache data type for both K and V (shorthand for -ctk TYPE -ctv TYPE; a later\n"
+            "-ctk/-ctv overrides its side)\n"
+            "allowed values: %s",
+            get_all_kv_cache_types().c_str()
+        ),
+        [](common_params & params, const std::string & value) {
+            params.vbr_cache_type_k = common_vbr_is_alias(value);
+            params.vbr_cache_type_v = params.vbr_cache_type_k;
+            params.cache_type_k = kv_cache_type_from_str(value);
+            params.cache_type_v = params.cache_type_k;
+        }
+    ).set_env("LLAMA_ARG_CACHE_TYPE"));
+    add_opt(common_arg(
         {"-ctk", "--cache-type-k"}, "TYPE",
         string_format(
             "KV cache data type for K\n"
