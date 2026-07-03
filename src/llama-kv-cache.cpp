@@ -181,22 +181,6 @@ static bool turbo_vbr_type_from_str(const std::string & raw, ggml_type & out) {
     return false;
 }
 
-static double turbo_vbr_effective_bits(ggml_type t) {
-    switch (t) {
-        case GGML_TYPE_F16:        return 16.0;
-        case GGML_TYPE_BF16:       return 16.0;
-        case GGML_TYPE_Q8_0:       return 8.5;
-        case GGML_TYPE_TURBO8_0:   return 8.125;
-        case GGML_TYPE_TURBO4_0:   return 4.125;
-        case GGML_TYPE_TURBO3_TCQ: return 3.25;
-        case GGML_TYPE_TURBO3_0:   return 3.125;
-        case GGML_TYPE_TURBO2_TCQ: return 2.25;
-        case GGML_TYPE_TURBO2_0:   return 2.125;
-        case GGML_TYPE_TURBO1_TCQ: return 1.25;
-        default:                   return 16.0;
-    }
-}
-
 struct turbo_vbr_layer_policy {
     bool enabled = false;
     bool has_turbo = false;

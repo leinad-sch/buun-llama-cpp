@@ -1316,26 +1316,6 @@ static __global__ void k_bf16_to_f16_tkhe(
     dst[strm * (ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0 + j] = __float2half(val);
 }
 
-static bool vbr_stage2a_promoted_k_type_supported(ggml_type t) {
-    return t == GGML_TYPE_F16 ||
-           t == GGML_TYPE_BF16 ||
-           t == GGML_TYPE_Q8_0 ||
-           t == GGML_TYPE_TURBO2_TCQ ||
-           t == GGML_TYPE_TURBO1_TCQ ||
-           t == GGML_TYPE_TURBO3_TCQ ||
-           t == GGML_TYPE_TURBO4_0 ||
-           t == GGML_TYPE_TURBO8_0;
-}
-
-static bool vbr_stage2a_v_type_uses_rotated_domain(ggml_type t) {
-    return t == GGML_TYPE_TURBO2_0 ||
-           t == GGML_TYPE_TURBO3_0 ||
-           t == GGML_TYPE_TURBO4_0 ||
-           t == GGML_TYPE_TURBO8_0 ||
-           t == GGML_TYPE_TURBO3_TCQ ||
-           t == GGML_TYPE_TURBO2_TCQ;
-}
-
 // Persistent Q rotation buffer per device (shared between prefill and decode paths)
 static float * q_rot_buf[GGML_CUDA_MAX_DEVICES] = {};
 static size_t  q_rot_buf_size[GGML_CUDA_MAX_DEVICES] = {};
@@ -1343,16 +1323,8 @@ static size_t  q_rot_buf_size[GGML_CUDA_MAX_DEVICES] = {};
 // Persistent K/V fp16 dequant buffers per device (shared between prefill and decode paths)
 static half * kv_dequant_k_buf[GGML_CUDA_MAX_DEVICES] = {};
 static size_t  kv_dequant_k_buf_size[GGML_CUDA_MAX_DEVICES] = {};
-static half * kv_dequant_k_promoted_buf[GGML_CUDA_MAX_DEVICES] = {};
-static size_t  kv_dequant_k_promoted_buf_size[GGML_CUDA_MAX_DEVICES] = {};
-static int32_t * vbr_stage2a_k_row_bands_buf[GGML_CUDA_MAX_DEVICES] = {};
-static size_t    vbr_stage2a_k_row_bands_buf_size[GGML_CUDA_MAX_DEVICES] = {};
 static half * kv_dequant_v_buf[GGML_CUDA_MAX_DEVICES] = {};
 static size_t  kv_dequant_v_buf_size[GGML_CUDA_MAX_DEVICES] = {};
-static half * kv_dequant_v_promoted_buf[GGML_CUDA_MAX_DEVICES] = {};
-static size_t  kv_dequant_v_promoted_buf_size[GGML_CUDA_MAX_DEVICES] = {};
-static int32_t * vbr_stage2a_v_row_bands_buf[GGML_CUDA_MAX_DEVICES] = {};
-static size_t    vbr_stage2a_v_row_bands_buf_size[GGML_CUDA_MAX_DEVICES] = {};
 
 // === FWHT rotation kernels for pre-rotate-queries approach ===
 // Forward rotation on Q before attention (both prefill and decode paths).
@@ -1382,166 +1354,6 @@ static __global__ void k_turbo_fwht_forward(
         atomicAdd_double(&d_q_channel_sq_fattn[threadIdx.x], (double)(val * val));
         if (threadIdx.x == 0) atomicAdd(&d_q_channel_count_fattn, 1);
     }
-}
-
-static __device__ int64_t vbr_stage2a_src_row_for_logical_row(
-        const int64_t row,
-        const int32_t * __restrict__ bands,
-        const int64_t n_bands,
-        const int64_t band_stride) {
-    for (int64_t ib = 0; ib < n_bands; ++ib) {
-        const int64_t bo = ib * band_stride;
-        const int32_t row0 = bands[bo + 0];
-        const int32_t row1 = bands[bo + 1];
-        if (row0 < 0 || row1 < 0) {
-            continue;
-        }
-        if (row >= row0 && row < row1) {
-            if (band_stride >= 4 && bands[bo + 2] >= 0) {
-                return (int64_t) bands[bo + 2] + (row - row0);
-            }
-            return row;
-        }
-    }
-    return -1;
-}
-
-static __global__ void k_vbr_stage2a_copy_promoted_rows_f16(
-        half * __restrict__ dst,
-        const half * __restrict__ src,
-        const int32_t * __restrict__ bands,
-        const int64_t n_bands,
-        const int64_t band_stride,
-        const int64_t ne0, const int64_t dst_ne1, const int64_t src_ne1, const int64_t ne2) {
-    const int64_t row  = blockIdx.x;
-    const int64_t head = blockIdx.y;
-    const int64_t strm = blockIdx.z;
-    const int j = threadIdx.x;
-    if (j >= ne0 || row >= dst_ne1) {
-        return;
-    }
-
-    const int64_t src_row = vbr_stage2a_src_row_for_logical_row(row, bands, n_bands, band_stride);
-    if (src_row < 0 || src_row >= src_ne1) {
-        return;
-    }
-
-    const int64_t dst_off = strm * (dst_ne1 * ne2 * ne0) + row     * (ne2 * ne0) + head * ne0 + j;
-    const int64_t src_off = strm * (src_ne1 * ne2 * ne0) + src_row * (ne2 * ne0) + head * ne0 + j;
-    dst[dst_off] = src[src_off];
-}
-
-static __global__ void k_vbr_stage2a_copy_promoted_rows_bf16(
-        half * __restrict__ dst,
-        const char * __restrict__ src,
-        const int32_t * __restrict__ bands,
-        const int64_t n_bands,
-        const int64_t band_stride,
-        const int64_t ne0, const int64_t dst_ne1, const int64_t src_ne1, const int64_t ne2,
-        const size_t src_nb1, const size_t src_nb2, const size_t src_nb3) {
-    const int64_t row  = blockIdx.x;
-    const int64_t head = blockIdx.y;
-    const int64_t strm = blockIdx.z;
-    const int j = threadIdx.x;
-    if (j >= ne0 || row >= dst_ne1) {
-        return;
-    }
-
-    const int64_t src_row = vbr_stage2a_src_row_for_logical_row(row, bands, n_bands, band_stride);
-    if (src_row < 0 || src_row >= src_ne1) {
-        return;
-    }
-
-    const int64_t dst_off = strm * (dst_ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0 + j;
-    const nv_bfloat16 * src_ptr = (const nv_bfloat16 *) (src + strm * src_nb3 + src_row * src_nb1 + head * src_nb2);
-    dst[dst_off] = __float2half(__bfloat162float(src_ptr[j]));
-}
-
-static __global__ void k_vbr_stage2a_copy_promoted_rows_native_f16(
-        half * __restrict__ dst,
-        const char * __restrict__ src,
-        const int32_t * __restrict__ bands,
-        const int64_t n_bands,
-        const int64_t band_stride,
-        const int64_t ne0, const int64_t dst_ne1, const int64_t src_ne1, const int64_t ne2,
-        const size_t src_nb1, const size_t src_nb2, const size_t src_nb3) {
-    const int64_t row  = blockIdx.x;
-    const int64_t head = blockIdx.y;
-    const int64_t strm = blockIdx.z;
-    const int j = threadIdx.x;
-    if (j >= ne0 || row >= dst_ne1) {
-        return;
-    }
-
-    const int64_t src_row = vbr_stage2a_src_row_for_logical_row(row, bands, n_bands, band_stride);
-    if (src_row < 0 || src_row >= src_ne1) {
-        return;
-    }
-
-    const int64_t dst_off = strm * (dst_ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0 + j;
-    const half * src_ptr = (const half *) (src + strm * src_nb3 + src_row * src_nb1 + head * src_nb2);
-    dst[dst_off] = src_ptr[j];
-}
-
-static __global__ void k_vbr_stage2a_cast_native_f16_tkhe(
-        const char * __restrict__ src, half * __restrict__ dst,
-        const int64_t ne0, const int64_t ne1, const int64_t ne2,
-        const size_t nb1, const size_t nb2, const size_t nb3) {
-    const int64_t row  = blockIdx.x;
-    const int64_t head = blockIdx.y;
-    const int64_t strm = blockIdx.z;
-    const int j = threadIdx.x;
-    if (j >= ne0) {
-        return;
-    }
-
-    const half * src_ptr = (const half *) (src + strm * nb3 + row * nb1 + head * nb2);
-    const int64_t dst_off = strm * (ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0 + j;
-    dst[dst_off] = src_ptr[j];
-}
-
-static __global__ void k_vbr_stage2a_v_rotated_to_original_f16(
-        half * __restrict__ data,
-        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3) {
-    const int64_t group = blockIdx.x;
-    const int64_t row   = blockIdx.y;
-    const int64_t hz    = blockIdx.z;
-    const int64_t head  = hz % ne2;
-    const int64_t strm  = hz / ne2;
-    const int tid = threadIdx.x;
-    if (tid >= 128 || group * 128 + tid >= ne0 || row >= ne1 || strm >= ne3) {
-        return;
-    }
-
-    const int64_t off = strm * (ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0 + group * 128 + tid;
-    __shared__ float smem[128];
-    const float val0 = __half2float(data[off]) * d_turbo_wht_signs2_fattn[tid];
-    float val = fwht128_butterfly_inplace(val0, smem);
-    constexpr float inv_sqrt_128 = 0.08838834764831845f;
-    val = val * inv_sqrt_128 * d_turbo_wht_signs1_fattn[tid] * d_innerq_channel_scale_inv_fattn[tid];
-    data[off] = __float2half(val);
-}
-
-static __global__ void k_vbr_stage2a_v_original_to_rotated_f16(
-        half * __restrict__ data,
-        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3) {
-    const int64_t group = blockIdx.x;
-    const int64_t row   = blockIdx.y;
-    const int64_t hz    = blockIdx.z;
-    const int64_t head  = hz % ne2;
-    const int64_t strm  = hz / ne2;
-    const int tid = threadIdx.x;
-    if (tid >= 128 || group * 128 + tid >= ne0 || row >= ne1 || strm >= ne3) {
-        return;
-    }
-
-    const int64_t off = strm * (ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0 + group * 128 + tid;
-    __shared__ float smem[128];
-    const float val0 = __half2float(data[off]) * d_turbo_wht_signs1_fattn[tid];
-    float val = fwht128_butterfly_inplace(val0, smem);
-    constexpr float inv_sqrt_128 = 0.08838834764831845f;
-    val = val * inv_sqrt_128 * d_turbo_wht_signs2_fattn[tid];
-    data[off] = __float2half(val);
 }
 
 // ---- Dynamic VBR transcode, Stage 1 (read side) ----------------------------------------------

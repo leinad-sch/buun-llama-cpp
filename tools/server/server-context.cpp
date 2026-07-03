@@ -42,20 +42,11 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
-static bool server_env_truthy(const char * name) {
-    const char * value = std::getenv(name);
-    if (value == nullptr || value[0] == '\0') {
-        return false;
-    }
-
-    std::string s(value);
-    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
-        return std::tolower(c);
-    });
-    return s != "0" && s != "false" && s != "off" && s != "no";
-}
-
-static bool server_vbr_stage2a_active(const common_params & params) {
+// The dynamic VBR runtime controller flips KV tensor types in place as the context fills; state
+// save/restore, context checkpoints and cache reuse all assume a fixed cache layout and would
+// restore/reuse bytes under the wrong tier. Gate them off whenever the controller can arm.
+// (This replaces the old VBR_STAGE2A env gate — Stage2A itself is gone.)
+static bool server_vbr_dynamic_active(const common_params & params) {
     const bool vbr_enabled =
         params.vbr_cache_type_k ||
         params.vbr_cache_type_v ||
@@ -64,8 +55,8 @@ static bool server_vbr_stage2a_active(const common_params & params) {
         params.vbr_vram_budget_explicit ||
         params.vbr_policy_explicit;
 
-    return vbr_enabled &&
-        (server_env_truthy("VBR_STAGE2A") || server_env_truthy("TURBO_VBR_STAGE2A"));
+    // common_params_postprocess_vbr normalizes vbr_budget (empty -> "dynamic") when VBR is selected
+    return vbr_enabled && (params.vbr_budget == "dynamic" || params.vbr_budget == "auto");
 }
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
@@ -1479,18 +1470,18 @@ private:
             batch = llama_batch_init(std::max(n_batch, params_base.n_parallel), 0, 1);
         }
 
-        if (server_vbr_stage2a_active(params_base)) {
+        if (server_vbr_dynamic_active(params_base)) {
             if (params_base.cache_ram_mib != 0) {
                 params_base.cache_ram_mib = 0;
-                SRV_WRN("%s\n", "prompt cache state storage is not supported by VBR Stage2A, it will be disabled");
+                SRV_WRN("%s\n", "prompt cache state storage is not supported by dynamic VBR (KV tiers change at runtime), it will be disabled");
             }
             if (params_base.n_ctx_checkpoints > 0) {
                 params_base.n_ctx_checkpoints = 0;
-                SRV_WRN("%s\n", "context checkpoints are not supported by VBR Stage2A, they will be disabled");
+                SRV_WRN("%s\n", "context checkpoints are not supported by dynamic VBR (KV tiers change at runtime), they will be disabled");
             }
             if (params_base.n_cache_reuse) {
                 params_base.n_cache_reuse = 0;
-                SRV_WRN("%s\n", "cache_reuse is not supported by VBR Stage2A, it will be disabled");
+                SRV_WRN("%s\n", "cache_reuse is not supported by dynamic VBR (KV tiers change at runtime), it will be disabled");
             }
         }
 
