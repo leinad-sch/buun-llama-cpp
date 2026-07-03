@@ -1050,9 +1050,20 @@ llama_kv_cache::llama_kv_cache(
             // direct overrides for experiments.
             if (vbr_pool_.vmm != nullptr) {
                 vbr_load_degrade_order();
+                vbr_floor_clamp_order();
                 if (const char * env = getenv("VBR_BUDGET_MIB")) {
                     vbr_budget_bytes_ = (size_t) strtoull(env, nullptr, 10) * 1024 * 1024;
                     LLAMA_LOG_INFO("%s: VBR budget: %.2f MiB mapped-physical (degrade trigger armed)\n",
+                            __func__, vbr_budget_bytes_/1024.0/1024.0);
+                } else if (const char * mode = getenv("VBR_MODE"); mode && strcmp(mode, "dynamic") == 0) {
+                    // dynamic mode reached us without a fit-resolved budget (fit disabled, failed,
+                    // or took a branch without the VBR hook): fall back to the floor-layout cost —
+                    // the minimum budget that guarantees the advertised full context fits. VRAM
+                    // above it goes unused in this path (conservative; the fit-armed budget is
+                    // the one that spends all headroom on quality).
+                    vbr_budget_bytes_ = vbr_floor_cost_bytes_;
+                    LLAMA_LOG_INFO("%s: VBR budget: %.2f MiB mapped-physical (floor-layout cost of the "
+                            "full context; fit did not resolve an auto budget — conservative fallback)\n",
                             __func__, vbr_budget_bytes_/1024.0/1024.0);
                 }
                 // f16 sink-stash: DEFAULT ON (128 rows) since the S6 long-decode gate (2026-07-03)
@@ -1575,9 +1586,13 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         const uint32_t wm_next = vbr_watermark_cells(n_tokens);
         while (vbr_vmm_projected_bytes(wm_next) > vbr_budget_bytes_) {
             if (!vbr_degrade_next(wm_next)) {
-                LLAMA_LOG_WARN("%s: VBR budget %.2f MiB exceeded with degrade order exhausted (projected %.2f MiB at %u cells)\n",
-                        __func__, vbr_budget_bytes_/1024.0/1024.0,
-                        vbr_vmm_projected_bytes(wm_next)/1024.0/1024.0, wm_next);
+                if (!vbr_budget_warned_) { // terminal state — one warning, not one per batch
+                    vbr_budget_warned_ = true;
+                    LLAMA_LOG_WARN("%s: VBR budget %.2f MiB exceeded with the degrade order %s (projected %.2f MiB at %u cells)\n",
+                            __func__, vbr_budget_bytes_/1024.0/1024.0,
+                            vbr_degrade_limit_ < vbr_degrade_order_.size() ? "clamped at the --vbr-floor" : "exhausted",
+                            vbr_vmm_projected_bytes(wm_next)/1024.0/1024.0, wm_next);
+                }
                 break;
             }
         }
@@ -2185,6 +2200,85 @@ void llama_kv_cache::vbr_load_degrade_order() {
     LLAMA_LOG_INFO("%s: VBR degrade order: %zu baked steps (5 bands x 32 units)\n", __func__, vbr_degrade_order_.size());
 }
 
+// --vbr-floor (env VBR_MIN_BITS, decimal bits/value): a LITERAL aggregate floor. Walk the order
+// against the initial layout and clamp the cursor at the first step that would take the aggregate
+// below the floor — e.g. floor 4.25 with t4 = 4.125 bpv stops with a few units still a tier
+// higher. Strict-prefix clamp: the aggregate is monotone decreasing along the order, and skipping
+// ahead to a cheaper later step would violate the measured price order. The default t1 floor
+// (1.25) equals the full order's end point, so nothing clamps.
+void llama_kv_cache::vbr_floor_clamp_order() {
+    vbr_degrade_limit_ = vbr_degrade_order_.size();
+    double floor_bpv = 0.0;
+    if (const char * env = getenv("VBR_MIN_BITS")) {
+        floor_bpv = atof(env); // "auto"/"none" parse to 0 -> the t1 default below
+    }
+    if (floor_bpv <= 0.0) {
+        floor_bpv = 8.0 * ggml_type_size(GGML_TYPE_TURBO1_TCQ) / ggml_blck_size(GGML_TYPE_TURBO1_TCQ);
+    }
+    // simulate the order over the per-unit tiers of the initial layout
+    std::vector<ggml_type> sim(layers.size() * 2, GGML_TYPE_COUNT);
+    double  sum_bits = 0.0;
+    int64_t sum_vals = 0;
+    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+        for (int side = 0; side < 2; ++side) {
+            const vbr_extent  & e = side ? vbr_pool_.v[ikv] : vbr_pool_.k[ikv];
+            const ggml_tensor * t = side ? layers[ikv].v    : layers[ikv].k;
+            if (e.byte_len == 0 || t == nullptr) {
+                continue;
+            }
+            sim[ikv*2 + side] = t->type;
+            sum_bits += 8.0 * ggml_row_size(t->type, t->ne[0]);
+            sum_vals += t->ne[0];
+        }
+    }
+    if (sum_vals == 0) {
+        return;
+    }
+    for (size_t i = 0; i < vbr_degrade_order_.size(); ++i) {
+        const auto & st = vbr_degrade_order_[i];
+        const auto it = map_layer_ids.find(st.il);
+        if (it == map_layer_ids.end()) {
+            continue;
+        }
+        const size_t slot = (size_t) it->second * 2 + (st.is_v ? 1 : 0);
+        const ggml_tensor * t = st.is_v ? layers[it->second].v : layers[it->second].k;
+        if (sim[slot] == GGML_TYPE_COUNT || t == nullptr) {
+            continue;
+        }
+        const ggml_type type_B = vbr_tier_type(st.tier);
+        const size_t rA = ggml_row_size(sim[slot], t->ne[0]);
+        const size_t rB = ggml_row_size(type_B,    t->ne[0]);
+        if (sim[slot] == type_B || rB >= rA) {
+            continue; // same no-op rule as vbr_degrade_next
+        }
+        const double bits_next = sum_bits - 8.0*rA + 8.0*rB;
+        if (bits_next / sum_vals < floor_bpv - 1e-9) {
+            vbr_degrade_limit_ = i;
+            LLAMA_LOG_INFO("%s: VBR floor %.4g bits/value: degrade order clamped at %zu/%zu steps "
+                    "(next step would drop the aggregate to %.4g)\n",
+                    __func__, floor_bpv, i, vbr_degrade_order_.size(), bits_next / sum_vals);
+            break;
+        }
+        sim[slot] = type_B;
+        sum_bits  = bits_next;
+    }
+
+    // page-exact mapped-physical cost of the FLOOR layout (the sim's end state) at full kv_size —
+    // the minimum budget that guarantees the advertised context fits. Used as the fallback budget
+    // when dynamic mode reaches us without a fit-resolved one.
+    vbr_floor_cost_bytes_ = vbr_pool_.mapped_base;
+    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+        for (int side = 0; side < 2; ++side) {
+            const ggml_tensor * t = side ? layers[ikv].v : layers[ikv].k;
+            if (sim[ikv*2 + side] == GGML_TYPE_COUNT || t == nullptr) {
+                continue;
+            }
+            const size_t need = ggml_row_size(sim[ikv*2 + side], t->ne[0]) * (size_t) t->ne[1];
+            vbr_floor_cost_bytes_ += GGML_PAD(need, vbr_pool_.gran);
+        }
+    }
+}
+
 // lazily size + allocate the f16 sink-stash buffer (one slab, per-extent offsets); returns its base
 char * llama_kv_cache::vbr_stash_ensure() {
     if (vbr_pool_.stash_buf == nullptr) {
@@ -2209,7 +2303,7 @@ char * llama_kv_cache::vbr_stash_ensure() {
 }
 
 bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
-    while (vbr_degrade_cursor_ < vbr_degrade_order_.size()) {
+    while (vbr_degrade_cursor_ < std::min(vbr_degrade_order_.size(), vbr_degrade_limit_)) {
         const auto & st = vbr_degrade_order_[vbr_degrade_cursor_++];
 
         const auto it = map_layer_ids.find(st.il);

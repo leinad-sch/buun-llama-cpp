@@ -287,6 +287,13 @@ private:
     // the next decode boundary, when the wave is long done.
     bool vbr_wave_pending_ = false;                   // async GPU work enqueued, fence not yet armed
     std::vector<std::pair<size_t, size_t>> vbr_unmap_deferred_; // {pool byte_off, len}
+    // --vbr-floor (env VBR_MIN_BITS): first order step the aggregate bits/value floor forbids;
+    // the cursor never advances past it (default = order size, i.e. unclamped)
+    size_t vbr_degrade_limit_ = (size_t) -1;
+    size_t vbr_floor_cost_bytes_ = 0;                 // page-exact cost of the floor layout at full
+                                                      // kv_size (fallback budget in dynamic mode)
+    bool   vbr_budget_warned_ = false;                // budget-unmeetable warning fired (terminal)
+    void     vbr_floor_clamp_order();
     void     vbr_flush_deferred_unmaps();
     char *   vbr_stash_ensure();                      // lazy sink-stash buffer; returns base
     void     vbr_load_degrade_order();                // baked table, or VBR_DEGRADE_ORDER=<file> override

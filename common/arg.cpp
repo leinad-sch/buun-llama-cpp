@@ -865,58 +865,6 @@ static common_vbr_policy_choice common_vbr_select_policy(
     return best;
 }
 
-static double common_vbr_policy_capacity_floor(
-        const std::string & raw_policy_path,
-        double requested_bits,
-        bool allow_dynamic = false) {
-    if (requested_bits <= 0.0) {
-        return 0.0;
-    }
-
-    const std::string policy_file = common_vbr_resolve_policy_file(raw_policy_path);
-    std::ifstream f(policy_file);
-    if (!f) {
-        throw std::invalid_argument("could not open VBR policy ladder: " + raw_policy_path);
-    }
-
-    json ladder;
-    f >> ladder;
-    if (!ladder.contains("static_ladder") && (!allow_dynamic || !ladder.contains("dynamic_ladder"))) {
-        throw std::invalid_argument("VBR policy ladder is missing static_ladder: " + policy_file);
-    }
-
-    double best = 0.0;
-    auto scan_ladder = [&](const char * key, bool dynamic_policy) {
-        if (!ladder.contains(key)) {
-            return;
-        }
-        if (!ladder[key].is_array()) {
-            throw std::invalid_argument(std::string("VBR policy ladder field is not an array: ") + key);
-        }
-        for (const auto & row : ladder[key]) {
-            const bool runtime_supported = row.value("runtime_supported", !dynamic_policy);
-            if (!runtime_supported) {
-                continue;
-            }
-            const double bpv = row.value("bpv", 0.0);
-            if (bpv + 1e-9 >= requested_bits && (best <= 0.0 || bpv < best)) {
-                best = bpv;
-            }
-        }
-    };
-
-    scan_ladder("static_ladder", false);
-    if (allow_dynamic) {
-        scan_ladder("dynamic_ladder", true);
-    }
-
-    if (best <= 0.0) {
-        throw std::invalid_argument("VBR policy ladder has no capacity floor at or above requested BPV " + common_vbr_format_bits(requested_bits));
-    }
-
-    return best;
-}
-
 static double common_vbr_apply_policy_ladder(
         common_params & params,
         double cap_bits,
@@ -1019,63 +967,55 @@ static void common_params_postprocess_vbr(common_params & params) {
     }
     params.vbr_budget = budget;
     if (common_vbr_budget_is_dynamic(budget)) {
-        // M3 runtime controller: an explicit VRAM budget in dynamic mode arms the decode-time
-        // degrade controller (VMM-backed pool, price-ordered in-place transcodes) instead of a
-        // pre-baked static schedule. The cache starts at the turbo8 entry tier (the baked degrade
-        // order's F16 band no-ops on a t8 start) and tensors degrade selectively as mapped bytes
-        // approach the budget. Envs are set loudly — the CLI wins over any pre-set VBR_VMM /
+        // Dynamic = the M3 runtime degrade controller (VMM-backed pool, price-ordered in-place
+        // transcodes). The cache starts at the turbo8 entry tier (the baked degrade order's F16
+        // band no-ops on a t8 start) and whole (layer,side) tensors degrade selectively as mapped
+        // bytes approach the KV VRAM budget:
+        //   --vbr-vram <SIZE>  explicit budget, armed here;
+        //   --vbr-vram auto    (default) budget derived from remaining VRAM after model/overhead
+        //                      by the fit pass (common_fit_params), which also advertises
+        //                      n_ctx = capacity of that budget at the --vbr-floor tier (t1 default)
+        //                      when -c is unset.
+        // --vbr-floor is a LITERAL aggregate bits/value floor enforced by the controller (the
+        // degrade order stops at the last step whose aggregate stays >= the floor — e.g. 4.25 with
+        // t4 = 4.125 bpv means "t4 layout with a few units held one tier higher"), NOT a snap-up
+        // to the next physical tier. Envs are set loudly — the CLI wins over any pre-set VBR_VMM /
         // VBR_BUDGET_MIB (a stale env silently fighting the flag = instrument-is-the-bug trap).
+        if (params.vbr_policy_explicit) {
+            LOG_WRN("VBR dynamic: --vbr-policy is ignored in dynamic mode (the runtime controller "
+                    "uses the baked/override degrade order, not a policy ladder)\n");
+        }
+        if (getenv("VBR_VMM") || getenv("VBR_BUDGET_MIB")) {
+            LOG_WRN("VBR dynamic: overriding pre-set VBR_VMM/VBR_BUDGET_MIB env with CLI values\n");
+        }
+        common_setenv_override("VBR_VMM", "1");
         if (params.vbr_vram_budget_explicit && vram_budget_bytes > 0) {
             const uint64_t budget_mib = std::max<uint64_t>(1, vram_budget_bytes / (1024ull * 1024ull));
-            if (getenv("VBR_VMM") || getenv("VBR_BUDGET_MIB")) {
-                LOG_WRN("VBR dynamic: overriding pre-set VBR_VMM/VBR_BUDGET_MIB env with CLI values\n");
-            }
-            common_setenv_override("VBR_VMM", "1");
             common_setenv_override("VBR_BUDGET_MIB", std::to_string(budget_mib));
-            if (params.vbr_cache_type_k) {
-                params.cache_type_k = GGML_TYPE_TURBO8_0;
-            }
-            if (params.vbr_cache_type_v) {
-                params.cache_type_v = GGML_TYPE_TURBO8_0;
-            }
-            common_setenv_override("TURBO_VBR_MODE", "dynamic");
-            common_setenv_override("VBR_MODE", "dynamic");
-            LOG_INF("VBR dynamic runtime controller: KV budget %llu MiB (mapped-physical), entry tier turbo8, "
-                    "price-ordered decode-time degrades\n", (unsigned long long) budget_mib);
-            return;
         }
-        bool has_policy = false;
-        const std::string policy_path = common_vbr_policy_arg(params, has_policy);
-        if (!policy_path.empty() && floor_bits > 0.0) {
-            params.vbr_capacity_bits = common_vbr_policy_capacity_floor(policy_path, floor_bits, true);
-            common_setenv_override("TURBO_VBR_CAPACITY_BITS", common_vbr_format_bits(params.vbr_capacity_bits));
-            common_setenv_override("VBR_CAPACITY_BITS", common_vbr_format_bits(params.vbr_capacity_bits));
-        }
-        // The floor is an aggregate VBR capacity contract, not a per-unit codec
-        // ban. Until the ragged VBR allocator can reserve fractional average
-        // budgets directly, use the smallest existing physical tier that is not
-        // below the requested effective bits/value as a conservative allocation
-        // surrogate. Do not enable a recency heuristic here: dynamic VBR policy
-        // has to come from measured layer/side/row pricing, not token age.
-        const ggml_type storage_type = floor_bits > 0.0 ? common_vbr_capacity_surrogate_type(floor_bits) : GGML_TYPE_TURBO3_TCQ;
         if (params.vbr_cache_type_k) {
-            params.cache_type_k = storage_type;
+            params.cache_type_k = GGML_TYPE_TURBO8_0;
         }
         if (params.vbr_cache_type_v) {
-            params.cache_type_v = storage_type;
+            params.cache_type_v = GGML_TYPE_TURBO8_0;
         }
         common_setenv_override("TURBO_VBR_MODE", "dynamic");
-        common_setenv_override("TURBO_VBR_BUDGET", "dynamic");
         common_setenv_override("VBR_MODE", "dynamic");
-        common_setenv_override("VBR_BUDGET", "dynamic");
-        const double selected_bpv = common_vbr_apply_policy_ladder(params, params.vbr_capacity_bits > 0.0 ? params.vbr_capacity_bits : 3.25, floor_bits, true);
-        if (selected_bpv > 0.0) {
-            params.vbr_capacity_bits = selected_bpv;
-        } else if (params.vbr_capacity_bits <= 0.0) {
-            params.vbr_capacity_bits = 3.25;
-        }
+        // capacity contract for telemetry/server metadata: the floor the advertised n_ctx is
+        // computed at (explicit --vbr-floor, else the t1 floor tier)
+        params.vbr_capacity_bits = floor_bits > 0.0 ? floor_bits
+            : 8.0 * ggml_type_size(GGML_TYPE_TURBO1_TCQ) / ggml_blck_size(GGML_TYPE_TURBO1_TCQ);
         common_setenv_override("TURBO_VBR_CAPACITY_BITS", common_vbr_format_bits(params.vbr_capacity_bits));
         common_setenv_override("VBR_CAPACITY_BITS", common_vbr_format_bits(params.vbr_capacity_bits));
+        params.vbr_selected_family = "dynamic";
+        params.vbr_selected_policy = "runtime-controller";
+        params.vbr_selected_bpv    = params.vbr_capacity_bits;
+        const std::string budget_desc = (params.vbr_vram_budget_explicit && vram_budget_bytes > 0)
+            ? std::to_string(vram_budget_bytes / (1024ull*1024ull)) + " MiB (explicit)"
+            : "auto (remaining VRAM, resolved by fit)";
+        LOG_INF("VBR dynamic runtime controller: KV budget %s, entry tier turbo8, floor %.4g bits/value, "
+                "price-ordered decode-time degrades\n",
+                budget_desc.c_str(), params.vbr_capacity_bits);
         return;
     }
 
@@ -2830,7 +2770,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
         {"--vbr-bits", "--vbr-budget"}, "VALUE",
-        "VBR target budget: dynamic/auto for measured-policy capacity planning, or fixed f16, 8/t8, 4/t4, 3/t3, 2/t2 (default: dynamic when cache type is vbr)",
+        "VBR target budget: dynamic/auto = runtime degrade controller (starts at turbo8, degrades down the measured price order as the KV VRAM budget fills; see --vbr-vram/--vbr-floor); or a fixed tier f16, 8/t8, 4/t4, 3/t3, 2/t2, 1/t1; or numeric bits/value with --vbr-policy (default: dynamic when cache type is vbr)",
         [](common_params & params, const std::string & value) {
             params.vbr_budget = value;
             params.vbr_budget_explicit = true;
@@ -2838,7 +2778,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_VBR_BUDGET"));
     add_opt(common_arg(
         {"--vbr-floor", "--vbr-min-bits"}, "BITS",
-        "aggregate VBR effective bits/value floor for dynamic capacity planning; accepts decimal bits or tier aliases f16, t8, t4, t3, t2 and uses the nearest supported capacity floor at or above the request (default: auto)",
+        "aggregate VBR bits/value floor; accepts decimal bits or tier aliases f16, t8, t4, t3, t2, t1. Dynamic mode enforces it LITERALLY: the degrade order stops at the last step whose aggregate stays at or above the floor (e.g. 4.25 = t4 layout with a few units held a tier higher), and the advertised context capacity is computed at this floor (default: t1 = 1.25)",
         [](common_params & params, const std::string & value) {
             params.vbr_min_bits = value;
             params.vbr_min_bits_explicit = true;
@@ -2846,7 +2786,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_VBR_MIN_BITS"));
     add_opt(common_arg(
         {"--vbr-vram", "--vbr-vram-budget"}, "SIZE",
-        "VBR KV VRAM budget: auto for remaining VRAM after model/overhead, or an explicit size like 24G, 24576M, or bytes (default: auto)",
+        "VBR KV VRAM budget: auto = remaining VRAM after model/overhead (resolved by the fit pass; in dynamic mode this arms the runtime degrade controller and, when -c is unset, advertises n_ctx = the budget's capacity at the --vbr-floor tier), or an explicit size like 24G, 24576M, or bytes (default: auto)",
         [](common_params & params, const std::string & value) {
             params.vbr_vram_budget = value;
             params.vbr_vram_budget_explicit = true;
