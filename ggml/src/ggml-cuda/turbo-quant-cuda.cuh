@@ -627,6 +627,13 @@ static __constant__ float d_turbo_mid_4bit[15] = {
      0.070693f,  0.097191f,  0.127056f,  0.162977f,  0.212232f,
 };
 
+// Runtime vanilla-book override (encode-side twin of turbo_vanilla_cb_load_fattn; see
+// fattn-common.cuh). Overriding turbo8 also arms d_turbo8_cb_override: the stock encoder is
+// a uniform-grid round which never consults the book, so a companded book switches encode to
+// a binary search over d_turbo_mid_8bit.
+static __constant__ float d_turbo_mid_8bit[255] = {};
+static __constant__ int   d_turbo8_cb_override = 0;
+
 // === TURBO8: 8-bit codebook (uniform grid centroid[i]=(i-127.5)/127.5 in [-1,1]; per-block absmax scale in norm) ===
 static __constant__ float d_turbo_centroids_8bit[256] = {
     -1.00000000f, -0.99215686f, -0.98431373f, -0.97647059f, -0.96862745f, -0.96078431f, -0.95294118f, -0.94509804f,
@@ -668,6 +675,48 @@ static __constant__ float d_turbo_wht_signs1[128] = {
 static __constant__ float d_turbo_wht_signs2[128] = {
     1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f};
 // QJL sign arrays removed — turbo4 now uses pure 4-bit PolarQuant (no QJL correction)
+
+// Encode-side runtime vanilla-book override: TURBO_CB_T2/T3/T4/T8 (raw f32, ascending, exact
+// count 4/8/16/256). Updates THIS TU's centroid + midpoint __constant__ copies; for turbo8 it
+// also uploads 255 mids and arms d_turbo8_cb_override (stock encode is a uniform round that
+// never reads the book). static inline per-TU, same pattern as turbo_tcq_load_kv_encode.
+static inline void turbo_vanilla_cb_load_encode() {
+    static const char * p2 = getenv("TURBO_CB_T2");
+    static const char * p3 = getenv("TURBO_CB_T3");
+    static const char * p4 = getenv("TURBO_CB_T4");
+    static const char * p8 = getenv("TURBO_CB_T8");
+    if (!p2 && !p3 && !p4 && !p8) return;
+    int dev = 0; cudaGetDevice(&dev);
+    static bool done[GGML_CUDA_MAX_DEVICES] = {};
+    if (done[dev]) return;
+    done[dev] = true;
+    auto load = [](const char * p, const void * cent_sym, const void * mid_sym, int n, const char * name) {
+        if (!p || !p[0]) return false;
+        float buf[256], mids[255];
+        FILE * f = fopen(p, "rb");
+        if (!f) { fprintf(stderr, "TURBO_CB: cannot open %s\n", p); return false; }
+        const bool ok = fread(buf, sizeof(float), n, f) == (size_t) n;
+        // optional trailing n-1 EXACT mids (else computed midpoints; a 5e-7 boundary shift is
+        // quality-neutral but breaks bit-compat with the compiled tables via KV chaos)
+        const bool mids_in_file = ok && fread(mids, sizeof(float), n - 1, f) == (size_t) (n - 1);
+        fclose(f);
+        if (!ok) { fprintf(stderr, "TURBO_CB: short file %s (need %d f32)\n", p, n); return false; }
+        if (!mids_in_file) {
+            for (int i = 0; i + 1 < n; i++) mids[i] = 0.5f * (buf[i] + buf[i + 1]);
+        }
+        cudaMemcpyToSymbol(cent_sym, buf, n * sizeof(float));
+        if (mid_sym) cudaMemcpyToSymbol(mid_sym, mids, (n - 1) * sizeof(float));
+        fprintf(stderr, "TURBO_CB: %s encode book <- %s (mids %s)\n", name, p, mids_in_file ? "from file" : "computed");
+        return true;
+    };
+    load(p2, d_turbo_centroids_2bit, d_turbo_mid_2bit, 4,  "turbo2");
+    load(p3, d_turbo_centroids_3bit, d_turbo_mid_3bit, 8,  "turbo3");
+    load(p4, d_turbo_centroids_4bit, d_turbo_mid_4bit, 16, "turbo4");
+    if (load(p8, d_turbo_centroids_8bit, d_turbo_mid_8bit, 256, "turbo8")) {
+        const int one = 1;
+        cudaMemcpyToSymbol(d_turbo8_cb_override, &one, sizeof(int));
+    }
+}
 
 // === FWHT rotation functions ===
 static __device__ __forceinline__
@@ -978,10 +1027,25 @@ void quantize_f32_turbo8_0_block(const float * src, block_turbo8_0 * dst) {
     for (int j = 0; j < 128; j++) absmax = fmaxf(absmax, fabsf(x[j]));
     float scale = absmax > 1e-10f ? absmax : 1e-10f;
     float inv_scale = 1.0f / scale;
-    for (int j = 0; j < 128; j++) {
-        int idx = (int)lrintf(x[j] * inv_scale * 127.5f + 127.5f);
-        idx = idx < 0 ? 0 : (idx > 255 ? 255 : idx);
-        dst->qs[j] = (uint8_t)idx;
+    if (d_turbo8_cb_override) {
+        // Companded book (TURBO_CB_T8): nearest centroid via lower-bound over the 255 mids
+        // (the uniform round below assumes the stock evenly-spaced grid).
+        for (int j = 0; j < 128; j++) {
+            const float v = x[j] * inv_scale;
+            int idx = 0;
+            #pragma unroll
+            for (int step = 128; step >= 1; step >>= 1) {
+                const int cand = idx + step;
+                if (cand <= 255 && d_turbo_mid_8bit[cand - 1] < v) idx = cand;
+            }
+            dst->qs[j] = (uint8_t)idx;
+        }
+    } else {
+        for (int j = 0; j < 128; j++) {
+            int idx = (int)lrintf(x[j] * inv_scale * 127.5f + 127.5f);
+            idx = idx < 0 ? 0 : (idx > 255 ? 255 : idx);
+            dst->qs[j] = (uint8_t)idx;
+        }
     }
     dst->norm = __float2half(norm * scale);
 }

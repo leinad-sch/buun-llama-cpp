@@ -617,6 +617,11 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
     const ggml_tensor * KQV = dst;
     const ggml_tensor * Q   = dst->src[0];
 
+    // Vanilla-book override: THIS vec instance TU's __constant__ copies feed vec_dot/dequantize_V.
+    // (The TCQ vec paths have NO per-TU load — they rely on dispatch preferring fused/materialize;
+    // do not copy that assumption for book overrides.)
+    turbo_vanilla_cb_load_fattn();
+
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 

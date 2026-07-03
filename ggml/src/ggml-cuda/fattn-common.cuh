@@ -48,6 +48,11 @@ static __constant__ float d_turbo3_ss_v_fattn[128] = {
     +1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,
     +1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1};
 #endif
+// Runtime vanilla-book override (sweep infrastructure, 2026-07-03): TURBO_CB_T2/T3/T4/T8 =
+// binary f32 file of 4/8/16/256 ascending centroids. turbo_vanilla_cb_load_fattn() below is
+// static inline → each calling TU updates its OWN __constant__ copies (same per-TU pattern
+// as turbo_tcq_load_kv_decode). Decode needs centroids only; encode-side mids live in
+// turbo-quant-cuda.cuh's twin loader turbo_vanilla_cb_load_encode().
 static __constant__ float d_turbo_centroids_4bit_fattn[16] = {
     -0.241556f, -0.182907f, -0.143047f, -0.111065f,
     -0.083317f, -0.058069f, -0.034311f, -0.011353f,
@@ -307,6 +312,37 @@ static __constant__ float d_turbo_wht_signs1_fattn[128] = {
     -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f};
 static __constant__ float d_turbo_wht_signs2_fattn[128] = {
     1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f};
+
+// Definition of the vanilla-book override loader declared above the constants. Reads each
+// env once per process (paths cached), loads once per TU per device. Files: raw f32,
+// ascending centroids, exact count (T2=4, T3=8, T4=16, T8=256). A short/absent file leaves
+// the compiled-in book untouched for that type.
+static inline void turbo_vanilla_cb_load_fattn() {
+    static const char * p2 = getenv("TURBO_CB_T2");
+    static const char * p3 = getenv("TURBO_CB_T3");
+    static const char * p4 = getenv("TURBO_CB_T4");
+    static const char * p8 = getenv("TURBO_CB_T8");
+    if (!p2 && !p3 && !p4 && !p8) return;
+    int dev = 0; cudaGetDevice(&dev);
+    static bool done[GGML_CUDA_MAX_DEVICES] = {};
+    if (done[dev]) return;
+    done[dev] = true;
+    auto load = [](const char * p, const void * sym, int n, const char * name) {
+        if (!p || !p[0]) return;
+        float buf[256];
+        FILE * f = fopen(p, "rb");
+        if (!f) { fprintf(stderr, "TURBO_CB: cannot open %s\n", p); return; }
+        const bool ok = fread(buf, sizeof(float), n, f) == (size_t) n;
+        fclose(f);
+        if (!ok) { fprintf(stderr, "TURBO_CB: short file %s (need %d f32)\n", p, n); return; }
+        cudaMemcpyToSymbol(sym, buf, n * sizeof(float));
+        fprintf(stderr, "TURBO_CB: %s decode book <- %s\n", name, p);
+    };
+    load(p2, d_turbo_centroids_2bit_fattn, 4,   "turbo2");
+    load(p3, d_turbo_centroids_3bit_fattn, 8,   "turbo3");
+    load(p4, d_turbo_centroids_4bit_fattn, 16,  "turbo4");
+    load(p8, d_turbo_centroids_8bit_fattn, 256, "turbo8");
+}
 
 // InnerQ: per-channel inverse scale for Q pre-rotation (fattn compilation unit)
 // Updated by turbo_innerq_finalize_calibration(). MUST carry a compile-time identity

@@ -1682,6 +1682,8 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
 
+    turbo_vanilla_cb_load_encode();  // TURBO_CB_T2/3/4/8: this TU's encode centroids + mids
+
     if (cert_state != -1) {
         cert_dump_rows(ctx, src0, dst->name);
     }

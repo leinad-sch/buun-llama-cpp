@@ -1395,6 +1395,7 @@ void vbr_dequant_turbo_to_f32(const char * src, ggml_type src_type, ggml_type ty
     GGML_ASSERT(ne0 % 128 == 0); // turbo FWHT blocks are 128-wide; the dequant loops ne0/128 blocks per cell
     // Treat the tensor as [ne0, n_cells]: one block per cell, 128 threads, ne0/128 FWHT blocks/cell.
     // head/stream dims collapse to 1 (nb2/nb3 unused since blockIdx.y/z == 0).
+    turbo_vanilla_cb_load_fattn();  // vanilla-book override for the transcode dequant kernels
     const dim3 grid((unsigned) n_cells, 1, 1);
     const int iv = is_v ? 1 : 0;
     // V-mean affine tap: this dequant emits stored-domain (V - mu_V) — the graph restores mu_V at
@@ -2136,6 +2137,7 @@ static void cert_dump_q(ggml_backend_cuda_context & ctx, const ggml_tensor * dst
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+    turbo_vanilla_cb_load_fattn();  // TURBO_CB_T2/3/4/8 vanilla-book override (this TU's copies)
     turbo1_tcq_load_cb_fattn();  // E7: turbo1_tcq K/V decode codebooks (TURBO1_TCQ_CB_K/_V, cold-start = turbo2 anchor)
 
     turbo1_load_dither_fattn();  // E6: one-time TURBO1_DITHER env → fattn decode constants

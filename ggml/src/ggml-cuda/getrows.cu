@@ -272,6 +272,7 @@ void get_rows_cuda(
         int64_t ne10, int64_t ne11, int64_t ne12, size_t nb10, size_t nb11, size_t nb12,
         size_t nb1, size_t nb2, size_t nb3,
         cudaStream_t stream) {
+    turbo_vanilla_cb_load_encode();  // TURBO_CB_T2/3/4/8: this TU's dequant centroids
     switch (dst_type) {
         case GGML_TYPE_F32:
             ggml_cuda_get_rows_switch_src0_type(src0_d, src0_type, src1_d, (float *) dst_d,

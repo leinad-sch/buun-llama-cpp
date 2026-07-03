@@ -78,6 +78,7 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
 
     // Set TCQ constants in THIS compilation unit's __constant__ memory before kernel launch.
     // Each template instance .cu file has its own static __constant__ copies.
+    turbo_vanilla_cb_load_fattn();  // TURBO_CB_T2/3/4/8 override, self-guarded per device
     if constexpr (type_K == GGML_TYPE_TURBO3_TCQ || type_V == GGML_TYPE_TURBO3_TCQ) {
         static bool cb3_loaded = false;
         if (!cb3_loaded) {
