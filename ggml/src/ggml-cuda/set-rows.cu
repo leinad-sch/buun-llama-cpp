@@ -344,6 +344,10 @@ static __global__ void k_set_rows_turbo1_nsn(
 // table, selected by cache_k_/cache_v_ name). Returns nullptr (no tap) unless the dst is a
 // cache_{k,v}_l<N> tensor within table bounds AND a mean table is loaded (TURBO_KMEAN/VMEAN_SUB).
 static inline const float * turbo_tap_mu(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, int64_t ne00) {
+    // Tap tier gate: no mean-sub at 8-bit — measured zero median gain and +9.5% mean KLD cost
+    // (native flat A/B, q27 16k×8ch, 2026-07-05). Tap stays on for t4 and coarser (t4 median
+    // −33%, t3 −39%). The graph-side V restore carries the matching TURBO8_0 exclusion.
+    if (dst->type == GGML_TYPE_TURBO8_0) return nullptr;
     if (strncmp(dst->name, "cache_k_l", 9) != 0 && strncmp(dst->name, "cache_v_l", 9) != 0) return nullptr;
     const int pf_layer = atoi(dst->name + 9);
     if (pf_layer < 0 || pf_layer >= PFHEAD_MAX_L || ne00 > PFHEAD_MAX_C) return nullptr;
@@ -824,17 +828,24 @@ static __global__ void k_set_rows_ragged_roundtrip(
         for (int j = 0; j < 128; j++) dst_blk[j] = ggml_cuda_cast<half>(src_blk[j]);
         return;
     }
+    // Tap tier gate: t8 rows quantize RAW (no centering benefit at 8-bit — 2026-07-05 A/B).
+    // The container contract stays uniform: under rotv=1 the graph adds mu_V back for the whole
+    // layer, so gated V rows store (Q(x) − mu) — center AFTER the roundtrip instead of before.
+    const bool tap_tier = (tier != 8);
     float src_local[128];
     for (int j = 0; j < 128; j++) {
         float v = ggml_cuda_cast<float>(src_blk[j]);
-        if (kvmean_mu != nullptr) v -= kvmean_mu[cb*128 + j];
+        if (tap_tier && kvmean_mu != nullptr) v -= kvmean_mu[cb*128 + j];
         src_local[j] = v;
     }
     float out[128];
     turbo_roundtrip_block_to_orig(src_local, out, tier, is_k);
+    if (!tap_tier && !is_k && kvmean_mu != nullptr && v_rotated) {
+        for (int j = 0; j < 128; j++) out[j] -= kvmean_mu[cb*128 + j];
+    }
     if (write_rotated_v) {
         turbo_rotate_forward_cuda(out, d_turbo_wht_signs1, d_turbo_wht_signs2);
-    } else if (!is_k && kvmean_mu != nullptr) {
+    } else if (tap_tier && !is_k && kvmean_mu != nullptr) {
         for (int j = 0; j < 128; j++) out[j] += kvmean_mu[cb*128 + j];
     }
     for (int j = 0; j < 128; j++) dst_blk[j] = __float2half(out[j]);

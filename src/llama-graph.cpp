@@ -2562,7 +2562,8 @@ ggml_tensor * llm_graph_context::build_attn(
             // V-mean tap: restore mu_V once (weights sum to 1 -> mean re-enters as a constant).
             // View this layer's prefix of the pdim-wide mu row: narrower layers (gemma4 SWA vs
             // global) must still restore or encode-side subtraction leaves V shifted by -mu.
-            if (inp->self_vmean && inp->self_vmean->ne[0] >= cur->ne[0]) {
+            // TURBO8_0 excluded: its encode is tap-gated (turbo_tap_mu), so nothing to restore.
+            if (v->type != GGML_TYPE_TURBO8_0 && inp->self_vmean && inp->self_vmean->ne[0] >= cur->ne[0]) {
                 ggml_tensor * mu = ggml_view_2d(ctx0, inp->self_vmean, cur->ne[0], 1,
                         inp->self_vmean->nb[1], (size_t) il * inp->self_vmean->nb[1]);
                 cur = ggml_add(ctx0, cur, mu);
@@ -2845,8 +2846,9 @@ ggml_tensor * llm_graph_context::build_attn(
             cur = ggml_cont(ctx0, cur);
             cur = ggml_turbo_wht(ctx0, cur, 1);  // 1 = inverse
             // V-mean tap: restore mu_V once (weights sum to 1 -> mean re-enters as a constant).
-            // Prefix view per layer — see the primary attention site for why >= / cur->ne[0].
-            if (inp->self_vmean && inp->self_vmean->ne[0] >= cur->ne[0]) {
+            // Prefix view per layer — see the primary attention site for why >= / cur->ne[0]
+            // and the turbo_tap_mu gate for why TURBO8_0 is excluded.
+            if (v->type != GGML_TYPE_TURBO8_0 && inp->self_vmean && inp->self_vmean->ne[0] >= cur->ne[0]) {
                 ggml_tensor * mu = ggml_view_2d(ctx0, inp->self_vmean, cur->ne[0], 1,
                         inp->self_vmean->nb[1], (size_t) il * inp->self_vmean->nb[1]);
                 cur = ggml_add(ctx0, cur, mu);
