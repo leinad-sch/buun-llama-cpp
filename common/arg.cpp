@@ -978,6 +978,16 @@ static void common_params_postprocess_vbr(common_params & params) {
             LOG_WRN("VBR dynamic: overriding pre-set VBR_VMM/VBR_BUDGET_MIB env with CLI values\n");
         }
         common_setenv_override("VBR_VMM", "1");
+        // Dynamic VBR requires single-stream KV (the VMM pool + degrade controller are gated on
+        // n_stream == 1). With -np > 1 the default per-sequence streams silently disarm the whole
+        // controller and the cache degrades to a static max-tier buffer — force unified KV instead
+        // (multi-slot works fine through one unified stream; validated by the 2026-07-05
+        // multi-slot stress: 16/16 correct with degrade waves firing across 4 slots).
+        if (params.n_parallel > 1 && !params.kv_unified) {
+            LOG_WRN("VBR dynamic: -np %d without --kv-unified would disarm the degrade controller "
+                    "(per-seq KV streams) — forcing --kv-unified\n", params.n_parallel);
+            params.kv_unified = true;
+        }
         if (params.vbr_vram_budget_explicit && vram_budget_bytes > 0) {
             const uint64_t budget_mib = std::max<uint64_t>(1, vram_budget_bytes / (1024ull * 1024ull));
             common_setenv_override("VBR_BUDGET_MIB", std::to_string(budget_mib));

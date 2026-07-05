@@ -862,6 +862,9 @@ llama_kv_cache::llama_kv_cache(
     // so nothing ever relocates. Env-gated for S2 bring-up; S4 ties this to cparams.vbr_dynamic.
     const bool vbr_vmm_wanted = getenv("VBR_VMM") != nullptr && !hparams.no_alloc &&
                                 (vbr_layer_policy.enabled || is_turbo) && n_stream == 1 && !v_trans;
+    LLAMA_LOG_DEBUG("%s: VBR_VMM gate: env=%d no_alloc=%d policy=%d is_turbo=%d n_stream=%u v_trans=%d -> wanted=%d\n",
+            __func__, getenv("VBR_VMM") != nullptr, (int) hparams.no_alloc, (int) vbr_layer_policy.enabled,
+            (int) is_turbo, n_stream, (int) v_trans, (int) vbr_vmm_wanted);
 
     auto try_vmm_alloc = [&](ggml_context * c, ggml_backend_buffer_type_t bft) -> ggml_backend_buffer_t {
         int device = -1;
