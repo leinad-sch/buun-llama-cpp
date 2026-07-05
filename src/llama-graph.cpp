@@ -2553,7 +2553,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // TurboQuant V un-rotation at graph level (CUDA graph compatible).
     // Ragged V can opt into the same contract while using an F16 cache by writing rotated-domain V.
-    const bool turbo_v_rotated = v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO8_0 || v->type == GGML_TYPE_TURBO3_TCQ || v->type == GGML_TYPE_TURBO2_TCQ || v->type == GGML_TYPE_TURBO1_TCQ;
+    const bool turbo_v_rotated = ggml_is_turbo_kv_type(v->type);
     const bool ragged_v_rotated = v->type == GGML_TYPE_F16 && turbo_ragged_v_rotated_enabled();
     if (turbo_v_rotated || ragged_v_rotated) {
         if (cur->ne[0] % 128 == 0) {
@@ -2839,7 +2839,7 @@ ggml_tensor * llm_graph_context::build_attn(
     cb(cur, "kqv_out", il);
 
     // TurboQuant V un-rotation at graph level (CUDA graph compatible).
-    const bool turbo_v_rotated = v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO8_0 || v->type == GGML_TYPE_TURBO3_TCQ || v->type == GGML_TYPE_TURBO2_TCQ || v->type == GGML_TYPE_TURBO1_TCQ;
+    const bool turbo_v_rotated = ggml_is_turbo_kv_type(v->type);
     const bool ragged_v_rotated = v->type == GGML_TYPE_F16 && turbo_ragged_v_rotated_enabled();
     if (turbo_v_rotated || ragged_v_rotated) {
         if (cur->ne[0] % 128 == 0) {

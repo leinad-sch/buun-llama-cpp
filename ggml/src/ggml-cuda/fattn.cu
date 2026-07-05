@@ -1281,8 +1281,8 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
     cudaStream_t stream = ctx.stream();
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
-    const bool turbo_k = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO8_0 || K->type == GGML_TYPE_TURBO3_TCQ || K->type == GGML_TYPE_TURBO2_TCQ || K->type == GGML_TYPE_TURBO1_TCQ;
-    const bool turbo_v = V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO8_0 || V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ || V->type == GGML_TYPE_TURBO1_TCQ;
+    const bool turbo_k = ggml_is_turbo_kv_type(K->type);
+    const bool turbo_v = ggml_is_turbo_kv_type(V->type);
     // Mixed (asymmetric) K/V: a q8_0 side must be dequanted to f16 here too, otherwise the raw
     // q8_0 bytes are handed to the f16-only MMA kernel below and read as f16 → garbage. f16 sides
     // need no conversion (already f16). This is the prefill mirror of the decode dequant path.
@@ -1732,8 +1732,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 #ifndef GGML_CUDA_FA_ALL_QUANTS
     {
         auto is_turbo_type = [](ggml_type t) {
-            return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0 || t == GGML_TYPE_TURBO8_0 ||
-                   t == GGML_TYPE_TURBO3_TCQ || t == GGML_TYPE_TURBO2_TCQ || t == GGML_TYPE_TURBO1_TCQ;
+            return ggml_is_turbo_kv_type(t);
         };
         // Asymmetric turbo K/V (e.g. q8_0 K + turbo4 V) is handled by the turbo dequant-to-f16
         // FA paths (ggml_cuda_turbo_prefill_attend for prefill, do_decode_dequant for decode).
@@ -1776,13 +1775,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // TurboQuant: only the vec kernel has native turbo dequant support.
-    if (K->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO2_0 ||
-        K->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO3_0 ||
-        K->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO4_0 ||
-        K->type == GGML_TYPE_TURBO8_0 || V->type == GGML_TYPE_TURBO8_0 ||
-        K->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO3_TCQ ||
-        K->type == GGML_TYPE_TURBO2_TCQ || V->type == GGML_TYPE_TURBO2_TCQ ||
-        K->type == GGML_TYPE_TURBO1_TCQ || V->type == GGML_TYPE_TURBO1_TCQ) {
+    if (ggml_is_turbo_kv_type(K->type) || ggml_is_turbo_kv_type(V->type)) {
         if (Q->ne[0] <= 512 && Q->ne[0] % 64 == 0)
             return BEST_FATTN_KERNEL_VEC;
         return BEST_FATTN_KERNEL_NONE;
@@ -1951,8 +1944,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         if (e) fprintf(stderr, "TURBO_PREFILL_VEC=%s: forcing vec prefill for turbo types\n", e);
         return e != nullptr;
     }();
-    const bool turbo_kv = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO8_0 || K->type == GGML_TYPE_TURBO3_TCQ || K->type == GGML_TYPE_TURBO2_TCQ || K->type == GGML_TYPE_TURBO1_TCQ ||
-                          V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO8_0 || V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ || V->type == GGML_TYPE_TURBO1_TCQ;
+    const bool turbo_kv = ggml_is_turbo_kv_type(K->type) || ggml_is_turbo_kv_type(V->type);
 
     // Fused MMA turbo: reads raw turbo bytes directly in the MMA kernel, no intermediate fp16 buffers.
     // Phase 1: turbo4_0 matched K/V at D=128. Set GGML_TURBO_MMA_FUSED=0 to disable.
@@ -2129,8 +2121,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         // K and V are turbo (Gemma 4 ISWA global layers with K=V — Bug A2). Mixed q8_0+turbo
         // at D=512 stays on native VEC path because post-dequant q8_0 K + f16 V has no
         // working VEC template at D=512.
-        const bool turbo_k_only = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO8_0 || K->type == GGML_TYPE_TURBO3_TCQ || K->type == GGML_TYPE_TURBO2_TCQ || K->type == GGML_TYPE_TURBO1_TCQ;
-        const bool turbo_v_only = V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO8_0 || V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ || V->type == GGML_TYPE_TURBO1_TCQ;
+        const bool turbo_k_only = ggml_is_turbo_kv_type(K->type);
+        const bool turbo_v_only = ggml_is_turbo_kv_type(V->type);
         // Mixed f16/q8_0 + turbo at D=512: dequant K (and turbo V) to f16 so FA dispatches as
         // F16/F16 D=512 (which exists). Without this, the native VEC templates needed are
         // either missing (F16↔turbo) or have buggy SASS on sm_120 PTX-JIT (Q8_0↔turbo4 etc).

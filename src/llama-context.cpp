@@ -411,8 +411,8 @@ llama_context::llama_context(
         // Must enable FA BEFORE sched_reserve() so the scheduler knows FA is required
         // and builds the graph plan with FA ops on GPU from the start.
         {
-            const bool turbo_k = (params.type_k == GGML_TYPE_TURBO2_0 || params.type_k == GGML_TYPE_TURBO3_0 || params.type_k == GGML_TYPE_TURBO4_0 || params.type_k == GGML_TYPE_TURBO8_0 || params.type_k == GGML_TYPE_TURBO3_TCQ || params.type_k == GGML_TYPE_TURBO2_TCQ || params.type_k == GGML_TYPE_TURBO1_TCQ);
-            const bool turbo_v = (params.type_v == GGML_TYPE_TURBO2_0 || params.type_v == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO4_0 || params.type_v == GGML_TYPE_TURBO8_0 || params.type_v == GGML_TYPE_TURBO3_TCQ || params.type_v == GGML_TYPE_TURBO2_TCQ || params.type_v == GGML_TYPE_TURBO1_TCQ);
+            const bool turbo_k = ggml_is_turbo_kv_type(params.type_k);
+            const bool turbo_v = ggml_is_turbo_kv_type(params.type_v);
             const bool vbr_layer_schedule = turbo_vbr_layer_schedule_enabled();
             if (turbo_k || turbo_v || vbr_layer_schedule) {
                 if (!cparams.flash_attn) {
@@ -5003,8 +5003,8 @@ llama_context * llama_init_from_model(
 
     // Auto-enable flash attention for turbo KV cache types
     {
-        const bool turbo_k = (params.type_k == GGML_TYPE_TURBO2_0 || params.type_k == GGML_TYPE_TURBO3_0 || params.type_k == GGML_TYPE_TURBO4_0 || params.type_k == GGML_TYPE_TURBO8_0 || params.type_k == GGML_TYPE_TURBO3_TCQ || params.type_k == GGML_TYPE_TURBO2_TCQ || params.type_k == GGML_TYPE_TURBO1_TCQ);
-        const bool turbo_v = (params.type_v == GGML_TYPE_TURBO2_0 || params.type_v == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO4_0 || params.type_v == GGML_TYPE_TURBO8_0 || params.type_v == GGML_TYPE_TURBO3_TCQ || params.type_v == GGML_TYPE_TURBO2_TCQ || params.type_v == GGML_TYPE_TURBO1_TCQ);
+        const bool turbo_k = ggml_is_turbo_kv_type(params.type_k);
+        const bool turbo_v = ggml_is_turbo_kv_type(params.type_v);
         const bool vbr_layer_schedule = turbo_vbr_layer_schedule_enabled();
         if ((turbo_k || turbo_v || vbr_layer_schedule) && params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
             LLAMA_LOG_WARN("%s: turbo/VBR KV cache requires flash attention — enabling automatically\n", __func__);
