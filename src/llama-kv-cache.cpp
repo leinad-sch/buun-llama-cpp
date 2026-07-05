@@ -41,7 +41,7 @@ static ggml_type vbr_tier_type(uint8_t tier) {
     }
 }
 
-#include "llama-vbr-degrade-order.inc"
+#include "llama-vbr-degrade-orders.inc"  // arch-keyed registry (matrix v3, 2026-07-05)
 
 // Turbo TCQ prompt cache safety: compute a fingerprint from the codebook env
 // vars so that loading a cache created with a different codebook is detected.
@@ -2360,15 +2360,20 @@ void llama_kv_cache::vbr_load_degrade_order() {
                 __func__, path, tok.c_str());
         vbr_degrade_order_.clear();
     }
-    // the baked order was measured on Qwen3.6-27B (16 KV layers, il=3..63 stride 4); applying it
-    // to a different arch would silently degrade in a foreign price order — refuse instead
-    if (model.arch != LLM_ARCH_QWEN35 || hparams.n_layer != 64) {
-        LLAMA_LOG_WARN("%s: baked VBR degrade order is Qwen3.6-27B-specific (arch/n_layer mismatch) — "
-                "no order loaded; set VBR_DEGRADE_ORDER=<file> for this model\n", __func__);
-        return;
+    // Arch-keyed baked orders (matrix v3, 2026-07-05): per-model price orders measured under the
+    // deployment-true tap config with reliability-gated statistics (bench-validated lens per
+    // model; fp16->t8 band from the frac lens). Keyed on (arch, n_layer) so the gemma4 family
+    // resolves per MODEL — their price structures are opposite (front-hot vs deep-hot).
+    for (const auto & e : vbr_baked_orders) {
+        if (e.arch == model.arch && e.n_layer == hparams.n_layer) {
+            vbr_degrade_order_.assign(e.steps, e.steps + e.n);
+            LLAMA_LOG_INFO("%s: VBR degrade order: %zu baked steps (arch-matched, matrix v3)\n",
+                    __func__, vbr_degrade_order_.size());
+            return;
+        }
     }
-    vbr_degrade_order_.assign(std::begin(vbr_degrade_order_baked), std::end(vbr_degrade_order_baked));
-    LLAMA_LOG_INFO("%s: VBR degrade order: %zu baked steps (5 bands x 32 units)\n", __func__, vbr_degrade_order_.size());
+    LLAMA_LOG_WARN("%s: no baked VBR degrade order for this arch/n_layer — "
+            "set VBR_DEGRADE_ORDER=<file> for this model\n", __func__);
 }
 
 // --vbr-floor (env VBR_MIN_BITS, decimal bits/value): a LITERAL aggregate floor. Walk the order
