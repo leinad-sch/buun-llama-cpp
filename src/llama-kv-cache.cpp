@@ -5,8 +5,6 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
-#include "ggml-cuda.h" // Dynamic VBR M3: direct CUDA transcode (ggml_backend_cuda_kv_transcode); CUDA-only feature
-
 #include <algorithm>
 #include <cassert>
 #include <cctype>
@@ -81,9 +79,24 @@ static bool ggml_type_is_turbo_tcq(enum ggml_type t) {
 }
 
 static bool ggml_type_is_turbo(enum ggml_type t) {
-    return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0 ||
-           t == GGML_TYPE_TURBO8_0 || t == GGML_TYPE_TURBO3_TCQ || t == GGML_TYPE_TURBO2_TCQ ||
-           t == GGML_TYPE_TURBO1_TCQ;
+    return ggml_is_turbo_kv_type(t);
+}
+
+// Resolve the backend's turbo/VBR vtable (ggml-vbr.h) for a KV buffer type. Returns nullptr
+// when the owning backend does not export GGML_VBR_BACKEND_IFACE_PROC — i.e. it cannot host
+// turbo-typed KV at all (CPU, or a GPU backend without the kernels). libllama never links
+// backend symbols for this feature; everything goes through the resolved vtable.
+static const ggml_vbr_backend_iface * llama_vbr_backend_iface_for_buft(ggml_backend_buffer_type_t buft) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+    const auto get = (ggml_backend_vbr_iface_fn_t) ggml_backend_reg_get_proc_address(reg, GGML_VBR_BACKEND_IFACE_PROC);
+    return get != nullptr ? get() : nullptr;
 }
 
 static bool ggml_is_power_of_2(int n) {
@@ -866,19 +879,25 @@ llama_kv_cache::llama_kv_cache(
             (int) is_turbo, n_stream, (int) v_trans, (int) vbr_vmm_wanted);
 
     auto try_vmm_alloc = [&](ggml_context * c, ggml_backend_buffer_type_t bft) -> ggml_backend_buffer_t {
+        const ggml_vbr_backend_iface * be = llama_vbr_backend_iface_for_buft(bft);
+        if (be == nullptr) {
+            LLAMA_LOG_WARN("%s: VBR_VMM requested but the KV buffer type (%s) has no turbo/VBR backend support "
+                    "— falling back to static allocation\n", __func__, ggml_backend_buft_name(bft));
+            return nullptr;
+        }
         int device = -1;
-        for (int i = 0; i < ggml_backend_cuda_get_device_count(); ++i) {
-            if (ggml_backend_cuda_buffer_type(i) == bft) {
+        for (int i = 0; i < be->get_device_count(); ++i) {
+            if (be->buffer_type(i) == bft) {
                 device = i;
                 break;
             }
         }
-        if (device < 0 || !ggml_backend_cuda_vmm_available(device)) {
+        if (device < 0 || !be->vmm_available(device)) {
             LLAMA_LOG_WARN("%s: VBR_VMM requested but %s — falling back to static allocation\n", __func__,
-                    device < 0 ? "the KV buffer type is not a CUDA device" : "the device lacks VMM support");
+                    device < 0 ? "the KV buffer type is not a device-default buffer" : "the device lacks VMM support");
             return nullptr;
         }
-        const size_t gran = ggml_backend_cuda_vmm_granularity(device);
+        const size_t gran = be->vmm_granularity(device);
 
         // layout: every non-view tensor gets a page-aligned VA slot; cache tensors are sized for the
         // max tier so a later tier change never moves them
@@ -900,15 +919,15 @@ llama_kv_cache::llama_kv_cache(
         }
         const size_t va_size = GGML_PAD(off, gran);
 
-        ggml_cuda_vmm_pool * pool = ggml_backend_cuda_vmm_pool_init(device, va_size);
+        ggml_vbr_vmm_pool * pool = be->vmm_pool_init(device, va_size);
         if (pool == nullptr) {
             LLAMA_LOG_WARN("%s: VBR_VMM: VA reservation of %.2f MiB failed — falling back\n", __func__, va_size/1024.0/1024.0);
             return nullptr;
         }
-        char * base = (char *) ggml_backend_cuda_vmm_pool_base(pool);
-        ggml_backend_buffer_t b = ggml_backend_cuda_buffer_from_ptr(device, base, va_size);
+        char * base = (char *) be->vmm_pool_base(pool);
+        ggml_backend_buffer_t b = be->buffer_from_ptr(device, base, va_size);
         if (b == nullptr) {
-            ggml_backend_cuda_vmm_pool_free(pool);
+            be->vmm_pool_free(pool);
             return nullptr;
         }
         for (auto & [t, o] : places) {
@@ -916,9 +935,9 @@ llama_kv_cache::llama_kv_cache(
             t->data   = base + o;
             // non-cache tensors (rotation matrices) are small model constants: map them up front
             if (strncmp(t->name, "cache_", 6) != 0 &&
-                !ggml_backend_cuda_vmm_pool_map(pool, o, ggml_nbytes(t))) {
+                !be->vmm_pool_map(pool, o, ggml_nbytes(t))) {
                 ggml_backend_buffer_free(b);
-                ggml_backend_cuda_vmm_pool_free(pool);
+                be->vmm_pool_free(pool);
                 return nullptr;
             }
         }
@@ -932,10 +951,11 @@ llama_kv_cache::llama_kv_cache(
         p.buf         = b;
         p.base        = base;
         p.size        = va_size;
+        p.be          = be;
         p.vmm         = pool;
         p.device      = device;
         p.gran        = gran;
-        p.mapped_base = ggml_backend_cuda_vmm_pool_mapped(pool);
+        p.mapped_base = be->vmm_pool_mapped(pool);
         vbr_pools_.push_back(std::move(p));
         LLAMA_LOG_INFO("%s: VBR VMM pool #%zu: %.2f MiB VA reserved (device %d, %zu KiB pages), %.2f MiB mapped up front\n",
                 __func__, vbr_pools_.size() - 1, va_size/1024.0/1024.0, device, gran/1024,
@@ -945,6 +965,22 @@ llama_kv_cache::llama_kv_cache(
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
     for (auto & [buft, ctx] : ctx_map) {
+        // Turbo-typed KV requires a backend exporting the VBR interface (ggml-vbr.h): the codecs
+        // have no CPU decode path (CPU set_rows would call a null from_float; CPU attention can't
+        // read turbo bits). Refuse at init instead of crashing at the first decode. no_alloc
+        // (externally managed KV) is exempt.
+        if (!hparams.no_alloc && llama_vbr_backend_iface_for_buft(buft) == nullptr) {
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                if (ggml_is_turbo_kv_type(t->type)) {
+                    LLAMA_LOG_ERROR("%s: KV cache type %s (tensor %s) needs a backend with TurboQuant support "
+                            "(currently: CUDA), but its KV buffer type is %s — offload the KV cache to a "
+                            "supported GPU (-ngl on all layers, without --no-kv-offload) or use a standard "
+                            "cache type (f16/q8_0)\n",
+                            __func__, ggml_type_name(t->type), t->name, ggml_backend_buft_name(buft));
+                    throw std::runtime_error("turbo KV cache type on a backend without TurboQuant support");
+                }
+            }
+        }
         ggml_backend_buffer_t buf = nullptr;
         if (hparams.no_alloc) {
             buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
@@ -1221,7 +1257,7 @@ llama_kv_cache::~llama_kv_cache() {
     // ctxs_bufs are freed by member destructors afterwards and never dereference the VA
     for (auto & p : vbr_pools_) {
         if (p.vmm != nullptr) {
-            ggml_backend_cuda_vmm_pool_free(p.vmm);
+            p.be->vmm_pool_free(p.vmm);
             p.vmm = nullptr;
         }
     }
@@ -1254,7 +1290,7 @@ void llama_kv_cache::clear(bool data) {
             }
             if (p != nullptr) {
                 // a full-buffer clear would memset unmapped VA; zero only the mapped pages
-                ggml_backend_cuda_vmm_pool_clear(p->vmm);
+                p->be->vmm_pool_clear(p->vmm);
             } else {
                 ggml_backend_buffer_clear(buf.get(), 0);
             }
@@ -1691,14 +1727,14 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             }
             LLAMA_LOG_DEBUG("%s: VBR pool #%zu (device %d): projected %.2f / budget %.2f MiB (mapped %.2f) at %u cells\n",
                     __func__, pi, p.device, vbr_vmm_projected_bytes(p, wm_next)/1024.0/1024.0,
-                    p.budget/1024.0/1024.0, ggml_backend_cuda_vmm_pool_mapped(p.vmm)/1024.0/1024.0, wm_next);
+                    p.budget/1024.0/1024.0, p.be->vmm_pool_mapped(p.vmm)/1024.0/1024.0, wm_next);
         }
         // S5: the wave's transcodes/scrubs are queued on each pool's side stream — arm that
         // device's fence so the next graph_compute GPU-waits on them; the host proceeds straight
         // to graph build.
         for (auto & p : vbr_pools_) {
             if (p.wave_pending) {
-                ggml_backend_cuda_vbr_fence_arm(p.backend);
+                p.be->fence_arm(p.backend);
                 p.wave_pending = false;
             }
         }
@@ -2145,11 +2181,11 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 // debug census (VBR_MAP_RAWSCAN / VBR_DEGRADE_RAWSCAN): raw nonzero-byte census of the first
 // `rows` rows per 512-row band — separates "cache rows truly zero" from "dequant misreads them".
 // Device-syncs so in-flight writes are visible before the host read (debug path; blocking is fine).
-static void vbr_raw_census(const ggml_tensor * t, int64_t rows, int device, const char * hdr) {
-    if (rows <= 0) {
+static void vbr_raw_census(const ggml_tensor * t, int64_t rows, const ggml_vbr_backend_iface * be, int device, const char * hdr) {
+    if (rows <= 0 || be == nullptr) {
         return;
     }
-    ggml_backend_cuda_sync_device(device);
+    be->sync_device(device);
     const size_t rbytes = t->nb[1];
     std::vector<uint8_t> raw((size_t) rows * rbytes);
     ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
@@ -2222,8 +2258,8 @@ bool llama_kv_cache::vbr_over_budget(uint32_t wm_cells) const {
         }
         size_t budget_eff = p.budget;
         size_t free_b = 0, total_b = 0;
-        ggml_backend_cuda_get_device_memory(p.device, &free_b, &total_b);
-        const size_t mapped_now = ggml_backend_cuda_vmm_pool_mapped(p.vmm);
+        p.be->get_device_memory(p.device, &free_b, &total_b);
+        const size_t mapped_now = p.be->vmm_pool_mapped(p.vmm);
         const size_t cap = mapped_now + (free_b > headroom ? free_b - headroom : 0);
         if (cap < budget_eff) {
             budget_eff = cap;
@@ -2251,7 +2287,7 @@ void llama_kv_cache::vbr_vmm_ensure_mapped() {
                 }
                 char hdr[64];
                 snprintf(hdr, sizeof(hdr), "VBR MAPSCAN wm %u->%u", pool.wm_cells, wm);
-                vbr_raw_census(layers[ikv].k, pool.wm_cells, pool.device, hdr); // OLD watermark rows
+                vbr_raw_census(layers[ikv].k, pool.wm_cells, pool.be, pool.device, hdr); // OLD watermark rows
                 break;
             }
         }
@@ -2270,7 +2306,7 @@ void llama_kv_cache::vbr_vmm_ensure_mapped() {
                 const size_t row_b = ggml_row_size(t->type, t->ne[0]); // n_stream == 1 (gated at construction)
                 const size_t start = row_b * pool.wm_cells;
                 const size_t need  = row_b * wm;
-                if (!ggml_backend_cuda_vmm_pool_map(pool.vmm, e.byte_off + start, need - start)) {
+                if (!pool.be->vmm_pool_map(pool.vmm, e.byte_off + start, need - start)) {
                     // Physical exhaustion here is usually the FIRST big degrade wave's transient:
                     // the wave's old-tier tail pages are still mapped (their unmap is deferred to
                     // the next decode boundary) while this growth maps the new watermark. Reclaim
@@ -2281,7 +2317,7 @@ void llama_kv_cache::vbr_vmm_ensure_mapped() {
                             "flushing deferred unmaps and retrying\n",
                             __func__, need - start, e.byte_off + start, wm);
                     vbr_flush_deferred_unmaps();
-                    if (!ggml_backend_cuda_vmm_pool_map(pool.vmm, e.byte_off + start, need - start)) {
+                    if (!pool.be->vmm_pool_map(pool.vmm, e.byte_off + start, need - start)) {
                         GGML_ABORT("VBR VMM: out of physical memory mapping %zu bytes at pool offset %zu (watermark %u cells)",
                                 need - start, e.byte_off + start, wm);
                     }
@@ -2322,7 +2358,7 @@ void llama_kv_cache::vbr_flush_deferred_unmaps() {
         GGML_ASSERT(p.backend != nullptr); // entries are only queued after async work on it
         ggml_backend_synchronize(p.backend);
         for (const auto & [off, len] : p.unmap_deferred) {
-            ggml_backend_cuda_vmm_pool_unmap(p.vmm, off, len);
+            p.be->vmm_pool_unmap(p.vmm, off, len);
         }
         p.unmap_deferred.clear();
     }
@@ -2607,7 +2643,7 @@ void llama_kv_cache::vbr_full_reset() {
         if (pool.backend != nullptr) {
             ggml_backend_synchronize(pool.backend);
         }
-        ggml_backend_cuda_sync_device(pool.device);
+        pool.be->sync_device(pool.device);
 
         for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
             for (int side = 0; side < 2; ++side) {
@@ -2623,11 +2659,11 @@ void llama_kv_cache::vbr_full_reset() {
                 }
                 e.stash_valid = 0;
                 const size_t slot = (size_t) ggml_row_size(GGML_TYPE_F16, t->ne[0]) * t->ne[1] * t->ne[2];
-                ggml_backend_cuda_vmm_pool_unmap(pool.vmm, e.byte_off, slot);
+                pool.be->vmm_pool_unmap(pool.vmm, e.byte_off, slot);
             }
         }
         pool.wm_cells = 0;
-        mapped += ggml_backend_cuda_vmm_pool_mapped(pool.vmm);
+        mapped += pool.be->vmm_pool_mapped(pool.vmm);
     }
     vbr_degrade_cursor_  = 0;
     vbr_budget_warned_   = false;
@@ -2653,7 +2689,7 @@ void llama_kv_cache::vbr_shrink_watermark() {
         if (pool.backend != nullptr) {
             ggml_backend_synchronize(pool.backend);
         }
-        ggml_backend_cuda_sync_device(pool.device);
+        pool.be->sync_device(pool.device);
         for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
             for (int side = 0; side < 2; ++side) {
                 const vbr_extent  & e = side ? pool.v[ikv]   : pool.k[ikv];
@@ -2663,12 +2699,12 @@ void llama_kv_cache::vbr_shrink_watermark() {
                 }
                 const size_t keep = ggml_row_size(t->type, t->ne[0]) * (size_t) wm_now;
                 const size_t slot = (size_t) ggml_row_size(GGML_TYPE_F16, t->ne[0]) * t->ne[1] * t->ne[2];
-                ggml_backend_cuda_vmm_pool_unmap(pool.vmm, e.byte_off + keep, slot - keep);
+                pool.be->vmm_pool_unmap(pool.vmm, e.byte_off + keep, slot - keep);
             }
         }
         LLAMA_LOG_INFO("%s: VBR watermark shrink (device %d): %u -> %u cells (%.2f MiB mapped)\n",
                 __func__, pool.device, pool.wm_cells, wm_now,
-                ggml_backend_cuda_vmm_pool_mapped(pool.vmm)/1024.0/1024.0);
+                pool.be->vmm_pool_mapped(pool.vmm)/1024.0/1024.0);
         pool.wm_cells = wm_now;
     }
 }
@@ -2736,17 +2772,17 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
         const size_t keep_pad  = std::min(slot, (size_t) GGML_PAD(keep_live, pp->gran));
         // the footprint GROWS: back it before the transcode writes into it (new pages zero-fill,
         // so [keep, keep_pad) only needs the scrub for previously-mapped stale tier-A bytes)
-        if (!ggml_backend_cuda_vmm_pool_map(pp->vmm, e.byte_off, keep_pad)) {
+        if (!pp->be->vmm_pool_map(pp->vmm, e.byte_off, keep_pad)) {
             return false; // physical memory tight — promotion is optional, just stop
         }
 
         if (n_cells > 0) {
             if (pp->backend == nullptr) {
-                pp->backend = ggml_backend_cuda_init(pp->device);
+                pp->backend = pp->be->backend_init(pp->device);
                 GGML_ASSERT(pp->backend != nullptr);
             }
             if (!pp->wave_pending) {
-                ggml_backend_cuda_sync_device(pp->device);
+                pp->be->sync_device(pp->device);
             }
             // reuse an existing sink stash (captured pristine at the first degrade) so the sink
             // recovers toward single-hop error; do NOT capture here — a promote-time snapshot
@@ -2757,7 +2793,7 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
                 stash_ptr  = (char *) ggml_backend_buffer_get_base(pp->stash_buf) + e.stash_off;
                 stash_rows = e.stash_valid;
             }
-            const ggml_backend_cuda_kv_transcode_params tp = {
+            const ggml_vbr_transcode_params tp = {
                 /*.src         =*/ t,
                 /*.type_B      =*/ type_B,
                 /*.dst         =*/ t->data,
@@ -2768,7 +2804,7 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
                 /*.stash_rows  =*/ stash_rows,
                 /*.scrub_bytes =*/ keep_pad - keep,
             };
-            ggml_backend_cuda_kv_transcode(pp->backend, &tp);
+            pp->be->kv_transcode(pp->backend, &tp);
             pp->wave_pending = true;
         }
         vbr_set_tensor_type(t, st.is_v ? layers[ikv].v_stream : layers[ikv].k_stream, type_B);
@@ -2778,7 +2814,7 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
         LLAMA_LOG_INFO("%s: VBR promote #%zu: %s L%d -> %s (%lld cells re-encoded on side stream, "
                 "device %d mapped %.2f MiB)\n",
                 __func__, vbr_degrade_cursor_, t->name, (int) st.il, ggml_type_name(type_B),
-                (long long) n_cells, pp->device, ggml_backend_cuda_vmm_pool_mapped(pp->vmm)/1024.0/1024.0);
+                (long long) n_cells, pp->device, pp->be->vmm_pool_mapped(pp->vmm)/1024.0/1024.0);
         return true;
     }
     return false;
@@ -2817,7 +2853,7 @@ bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
         // VBR_DEGRADE_RAWSCAN=1 debug: raw nonzero-byte census of the SOURCE before the transcode —
         // separates "cache rows truly zero" from "transcode dequant misreads them"
         if (getenv("VBR_DEGRADE_RAWSCAN")) {
-            vbr_raw_census(t, n_cells, pp->device, "VBR RAWSCAN");
+            vbr_raw_census(t, n_cells, pp->be, pp->device, "VBR RAWSCAN");
         }
 
         // footprint bookkeeping (byte offsets within this tensor's fixed VA slot):
@@ -2834,14 +2870,14 @@ bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
 
         if (n_cells > 0) {
             if (pp->backend == nullptr) {
-                pp->backend = ggml_backend_cuda_init(pp->device); // the dedicated per-device side stream
+                pp->backend = pp->be->backend_init(pp->device); // the dedicated per-device side stream
                 GGML_ASSERT(pp->backend != nullptr);
             }
             // first transcode of this wave on this device: make the previous graph's KV writes
             // visible to the side stream — ONE host round-trip per (wave, device); later degrades
             // queue behind it stream-ordered
             if (!pp->wave_pending) {
-                ggml_backend_cuda_sync_device(pp->device);
+                pp->be->sync_device(pp->device);
             }
 
             // f16 sink-stash: capture rows [0, stash_rows) from the tier-A recon at the FIRST
@@ -2853,7 +2889,7 @@ bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
                 char * sbase = vbr_stash_ensure(*pp);
                 if (e.stash_valid == 0) {
                     e.stash_valid = (uint32_t) std::min<int64_t>(vbr_stash_rows_, n_cells);
-                    ggml_backend_cuda_kv_stash_capture(pp->backend, t, sbase + e.stash_off,
+                    pp->be->kv_stash_capture(pp->backend, t, sbase + e.stash_off,
                                                        e.stash_valid, st.is_v != 0);
                 }
                 stash_ptr  = sbase + e.stash_off;
@@ -2866,7 +2902,7 @@ bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
             // 256 rows past the used cells BEFORE those rows are rewritten, and old bytes read as
             // tier B can carry NaN f16 block scales that poison V sums (0*NaN=NaN survives the
             // softmax mask). Zero rows decode benign, matching a static cache.
-            const ggml_backend_cuda_kv_transcode_params tp = {
+            const ggml_vbr_transcode_params tp = {
                 /*.src         =*/ t,
                 /*.type_B      =*/ type_B,
                 /*.dst         =*/ t->data,
@@ -2877,7 +2913,7 @@ bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
                 /*.stash_rows  =*/ stash_rows,
                 /*.scrub_bytes =*/ scrub_end - keep,
             };
-            ggml_backend_cuda_kv_transcode(pp->backend, &tp);
+            pp->be->kv_transcode(pp->backend, &tp);
             pp->wave_pending = true;
         }
         // flip metadata now (host state, consumed at graph BUILD time); data ptr = fixed VA. The
@@ -2893,7 +2929,7 @@ bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
         LLAMA_LOG_INFO("%s: VBR degrade #%zu: %s L%d -> %s (%lld cells transcoding on side stream, "
                 "device %d mapped %.2f MiB pre-release)\n",
                 __func__, vbr_degrade_cursor_, t->name, (int) st.il, ggml_type_name(type_B),
-                (long long) n_cells, pp->device, ggml_backend_cuda_vmm_pool_mapped(pp->vmm)/1024.0/1024.0);
+                (long long) n_cells, pp->device, pp->be->vmm_pool_mapped(pp->vmm)/1024.0/1024.0);
         return true;
     }
     return false;
@@ -2912,18 +2948,22 @@ void llama_kv_cache::vbr_transcode_anchor_test() {
         return;
     }
     // run once per distinct pool device (multi-GPU: exercise every device's transcode path)
-    std::vector<int> devices;
+    std::vector<std::pair<int, const ggml_vbr_backend_iface *>> devices;
     for (const auto & p : vbr_pools_) {
+        if (p.be == nullptr) {
+            continue; // bookkeeping-only pool (static allocation), no backend vtable
+        }
         const int dev = p.device >= 0 ? p.device : 0;
-        if (std::find(devices.begin(), devices.end(), dev) == devices.end()) {
-            devices.push_back(dev);
+        if (std::find_if(devices.begin(), devices.end(),
+                [dev](const auto & d) { return d.first == dev; }) == devices.end()) {
+            devices.push_back({ dev, p.be });
         }
     }
-    for (const int dev : devices) {
+    for (const auto & [dev, be] : devices) {
     fprintf(stderr, "VBR anchor: device %d\n", dev);
-    ggml_backend_t bk = ggml_backend_cuda_init(dev);
+    ggml_backend_t bk = be->backend_init(dev);
     if (!bk) {
-        fprintf(stderr, "VBR anchor: ggml_backend_cuda_init failed\n");
+        fprintf(stderr, "VBR anchor: backend_init failed\n");
         continue;
     }
     {
@@ -2960,10 +3000,10 @@ void llama_kv_cache::vbr_transcode_anchor_test() {
         const size_t bytes = (size_t) N * r8;
         ggml_backend_buffer_t dbuf = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(bk), bytes);
         void * dst_dev = ggml_backend_buffer_get_base(dbuf);
-        const ggml_backend_cuda_kv_transcode_params tp_aa = {
+        const ggml_vbr_transcode_params tp_aa = {
             tq, t8, dst_dev, dbuf, N, /*is_v=*/false, nullptr, 0, /*scrub_bytes=*/0,
         };
-        ggml_backend_cuda_kv_transcode(bk, &tp_aa);
+        be->kv_transcode(bk, &tp_aa);
         ggml_backend_synchronize(bk);
 
         std::vector<uint8_t> a(bytes), b(bytes);
@@ -2981,10 +3021,10 @@ void llama_kv_cache::vbr_transcode_anchor_test() {
             const size_t bytesB = (size_t) N * ggml_row_size(t4, ne0);
             ggml_backend_buffer_t sepbuf = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(bk), bytesB);
             void * sep = ggml_backend_buffer_get_base(sepbuf);
-            const ggml_backend_cuda_kv_transcode_params tp_sep = {
+            const ggml_vbr_transcode_params tp_sep = {
                 tq, t4, sep, sepbuf, N, /*is_v=*/false, nullptr, 0, /*scrub_bytes=*/0,
             };
-            ggml_backend_cuda_kv_transcode(bk, &tp_sep);
+            be->kv_transcode(bk, &tp_sep);
             ggml_backend_synchronize(bk);
 
             ggml_init_params ipw = { 2*ggml_tensor_overhead(), nullptr, true };
@@ -2992,10 +3032,10 @@ void llama_kv_cache::vbr_transcode_anchor_test() {
             ggml_tensor * work = ggml_new_tensor_2d(wc, t8, ne0, N); ggml_set_name(work, "cache_k_l3");
             ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors(wc, bk);
             ggml_backend_tensor_set(work, a.data(), 0, bytes);  // work := copy of tq (turbo8)
-            const ggml_backend_cuda_kv_transcode_params tp_inp = {
+            const ggml_vbr_transcode_params tp_inp = {
                 work, t4, work->data, wbuf, N, /*is_v=*/false, nullptr, 0, /*scrub_bytes=*/0,
             };
-            ggml_backend_cuda_kv_transcode(bk, &tp_inp); // in-place
+            be->kv_transcode(bk, &tp_inp); // in-place
             ggml_backend_synchronize(bk);
 
             std::vector<uint8_t> sb(bytesB), wb(bytesB);

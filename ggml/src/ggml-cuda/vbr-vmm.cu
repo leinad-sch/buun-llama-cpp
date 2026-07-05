@@ -17,7 +17,7 @@
 
 #if defined(GGML_USE_VMM)
 
-struct ggml_cuda_vmm_pool {
+struct ggml_vbr_vmm_pool {
     int         device;
     CUdeviceptr base    = 0;
     size_t      va_size = 0;
@@ -33,11 +33,11 @@ size_t ggml_backend_cuda_vmm_granularity(int device) {
     return ggml_backend_cuda_vmm_available(device) ? ggml_cuda_info().devices[device].vmm_granularity : 0;
 }
 
-ggml_cuda_vmm_pool * ggml_backend_cuda_vmm_pool_init(int device, size_t va_size) {
+ggml_vbr_vmm_pool * ggml_backend_cuda_vmm_pool_init(int device, size_t va_size) {
     if (!ggml_backend_cuda_vmm_available(device) || va_size == 0) {
         return nullptr;
     }
-    auto * pool = new ggml_cuda_vmm_pool;
+    auto * pool = new ggml_vbr_vmm_pool;
     pool->device = device;
     pool->gran   = ggml_cuda_info().devices[device].vmm_granularity;
     pool->va_size = GGML_PAD(va_size, pool->gran);
@@ -50,15 +50,15 @@ ggml_cuda_vmm_pool * ggml_backend_cuda_vmm_pool_init(int device, size_t va_size)
     return pool;
 }
 
-void * ggml_backend_cuda_vmm_pool_base(ggml_cuda_vmm_pool * pool) {
+void * ggml_backend_cuda_vmm_pool_base(ggml_vbr_vmm_pool * pool) {
     return (void *) pool->base;
 }
 
-size_t ggml_backend_cuda_vmm_pool_mapped(ggml_cuda_vmm_pool * pool) {
+size_t ggml_backend_cuda_vmm_pool_mapped(ggml_vbr_vmm_pool * pool) {
     return pool->chunks.size() * pool->gran;
 }
 
-bool ggml_backend_cuda_vmm_pool_map(ggml_cuda_vmm_pool * pool, size_t off, size_t len) {
+bool ggml_backend_cuda_vmm_pool_map(ggml_vbr_vmm_pool * pool, size_t off, size_t len) {
     if (len == 0) {
         return true;
     }
@@ -94,7 +94,7 @@ bool ggml_backend_cuda_vmm_pool_map(ggml_cuda_vmm_pool * pool, size_t off, size_
     return true;
 }
 
-bool ggml_backend_cuda_vmm_pool_unmap(ggml_cuda_vmm_pool * pool, size_t off, size_t len) {
+bool ggml_backend_cuda_vmm_pool_unmap(ggml_vbr_vmm_pool * pool, size_t off, size_t len) {
     // unmap only chunks FULLY inside [off, off+len) — partial chunks stay mapped
     ggml_cuda_set_device(pool->device);
     const size_t g  = pool->gran;
@@ -111,14 +111,14 @@ bool ggml_backend_cuda_vmm_pool_unmap(ggml_cuda_vmm_pool * pool, size_t off, siz
     return true;
 }
 
-void ggml_backend_cuda_vmm_pool_clear(ggml_cuda_vmm_pool * pool) {
+void ggml_backend_cuda_vmm_pool_clear(ggml_vbr_vmm_pool * pool) {
     ggml_cuda_set_device(pool->device);
     for (size_t c : pool->chunks) {
         CUDA_CHECK(cudaMemset((void *)((char *) pool->base + c), 0, pool->gran));
     }
 }
 
-void ggml_backend_cuda_vmm_pool_free(ggml_cuda_vmm_pool * pool) {
+void ggml_backend_cuda_vmm_pool_free(ggml_vbr_vmm_pool * pool) {
     if (!pool) {
         return;
     }
@@ -134,12 +134,12 @@ void ggml_backend_cuda_vmm_pool_free(ggml_cuda_vmm_pool * pool) {
 
 bool   ggml_backend_cuda_vmm_available(int)                                  { return false;   }
 size_t ggml_backend_cuda_vmm_granularity(int)                                { return 0;       }
-ggml_cuda_vmm_pool * ggml_backend_cuda_vmm_pool_init(int, size_t)            { return nullptr; }
-void * ggml_backend_cuda_vmm_pool_base(ggml_cuda_vmm_pool *)                 { return nullptr; }
-size_t ggml_backend_cuda_vmm_pool_mapped(ggml_cuda_vmm_pool *)               { return 0;       }
-bool   ggml_backend_cuda_vmm_pool_map(ggml_cuda_vmm_pool *, size_t, size_t)  { return false;   }
-bool   ggml_backend_cuda_vmm_pool_unmap(ggml_cuda_vmm_pool *, size_t, size_t){ return false;   }
-void   ggml_backend_cuda_vmm_pool_clear(ggml_cuda_vmm_pool *)                {                 }
-void   ggml_backend_cuda_vmm_pool_free(ggml_cuda_vmm_pool *)                 {                 }
+ggml_vbr_vmm_pool * ggml_backend_cuda_vmm_pool_init(int, size_t)            { return nullptr; }
+void * ggml_backend_cuda_vmm_pool_base(ggml_vbr_vmm_pool *)                 { return nullptr; }
+size_t ggml_backend_cuda_vmm_pool_mapped(ggml_vbr_vmm_pool *)               { return 0;       }
+bool   ggml_backend_cuda_vmm_pool_map(ggml_vbr_vmm_pool *, size_t, size_t)  { return false;   }
+bool   ggml_backend_cuda_vmm_pool_unmap(ggml_vbr_vmm_pool *, size_t, size_t){ return false;   }
+void   ggml_backend_cuda_vmm_pool_clear(ggml_vbr_vmm_pool *)                {                 }
+void   ggml_backend_cuda_vmm_pool_free(ggml_vbr_vmm_pool *)                 {                 }
 
 #endif // GGML_USE_VMM

@@ -5,6 +5,8 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include "ggml-vbr.h" // backend interface for turbo KV / dynamic VBR (resolved at init, never linked)
+
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -267,17 +269,20 @@ private:
         size_t                budget  = 0;         // per-pool share of vbr_budget_bytes_ (VA-size proportional)
         std::vector<vbr_extent> k;                // indexed by kv-cache layer id (ikv)
         std::vector<vbr_extent> v;
+        // backend VBR vtable that owns this pool's device (resolved from the buffer type's
+        // registry at init; a pool only exists if the backend exports it)
+        const ggml_vbr_backend_iface * be = nullptr;
         // S2 (option C): VMM-backed pool — per-tensor fixed VA slots, physical pages mapped on
         // demand. When set, `size` is the VA reservation (not physical); each extent's byte_off is
         // page-aligned so tensor-tail unmaps never straddle a neighbor's pages.
-        struct ggml_cuda_vmm_pool * vmm = nullptr;
+        struct ggml_vbr_vmm_pool * vmm = nullptr;
         uint32_t wm_cells    = 0;                 // cells already backed for every extent
-        int      device      = -1;                // CUDA device backing the pool
+        int      device      = -1;                // backend device ordinal backing the pool
         size_t   gran        = 0;                 // page granularity
         size_t   mapped_base = 0;                 // bytes mapped up front (rotation matrices)
         // per-device transcode side stream (lazy) + S5 overlap state: transcodes run async on
         // backend's stream; the next decode graph GPU-waits via the armed per-device fence
-        // (ggml_backend_cuda_vbr_fence_arm). Tail pages a transcode may still READ (rA extent >
+        // (be->fence_arm). Tail pages a transcode may still READ (rA extent >
         // kept rB extent) can only be unmapped once it finishes — queue them and flush at the
         // next decode boundary, when the wave is long done.
         ggml_backend_t backend      = nullptr;

@@ -5663,8 +5663,37 @@ extern "C" void   dflash_cross_ring_gpu_write(void *, int, int, const float *, i
 extern "C" const float * dflash_cross_ring_gpu_interleave(void *, int, int, int);
 extern "C" void   dflash_cross_ring_gpu_set_tensor(void *, const void *, size_t, size_t);
 
+// TurboQuant/VBR KV-cache backend interface (ggml-vbr.h): every slot filled — libllama
+// resolves this vtable via GGML_VBR_BACKEND_IFACE_PROC instead of linking CUDA symbols.
+const ggml_vbr_backend_iface * ggml_backend_cuda_vbr_iface(void) {
+    static const ggml_vbr_backend_iface iface = {
+        /* .get_device_count  = */ ggml_backend_cuda_get_device_count,
+        /* .buffer_type       = */ ggml_backend_cuda_buffer_type,
+        /* .get_device_memory = */ ggml_backend_cuda_get_device_memory,
+        /* .backend_init      = */ ggml_backend_cuda_init,
+        /* .sync_device       = */ ggml_backend_cuda_sync_device,
+        /* .vmm_available     = */ ggml_backend_cuda_vmm_available,
+        /* .vmm_granularity   = */ ggml_backend_cuda_vmm_granularity,
+        /* .vmm_pool_init     = */ ggml_backend_cuda_vmm_pool_init,
+        /* .vmm_pool_free     = */ ggml_backend_cuda_vmm_pool_free,
+        /* .vmm_pool_base     = */ ggml_backend_cuda_vmm_pool_base,
+        /* .vmm_pool_mapped   = */ ggml_backend_cuda_vmm_pool_mapped,
+        /* .vmm_pool_map      = */ ggml_backend_cuda_vmm_pool_map,
+        /* .vmm_pool_unmap    = */ ggml_backend_cuda_vmm_pool_unmap,
+        /* .vmm_pool_clear    = */ ggml_backend_cuda_vmm_pool_clear,
+        /* .buffer_from_ptr   = */ ggml_backend_cuda_buffer_from_ptr,
+        /* .kv_transcode      = */ ggml_backend_cuda_kv_transcode,
+        /* .kv_stash_capture  = */ ggml_backend_cuda_kv_stash_capture,
+        /* .fence_arm         = */ ggml_backend_cuda_vbr_fence_arm,
+    };
+    return &iface;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, GGML_VBR_BACKEND_IFACE_PROC) == 0) {
+        return (void *)ggml_backend_cuda_vbr_iface;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

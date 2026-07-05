@@ -112,7 +112,7 @@ static void vbr_fidelity_report(const char * name, ggml_type tA, ggml_type tB,
 // NOTE: assumes decode-side InnerQ (d_innerq_channel_scale_inv_fattn) is already identity/calibrated
 // from prior decode (true in the live decode-time path).
 void ggml_cuda_vbr_kv_transcode(ggml_backend_cuda_context & ctx,
-                                const ggml_backend_cuda_kv_transcode_params * p) {
+                                const ggml_vbr_transcode_params * p) {
     cudaStream_t stream = ctx.stream();
     const ggml_tensor * src_A      = p->src;
     const ggml_type     type_B     = p->type_B;
@@ -260,7 +260,7 @@ extern "C" void ggml_backend_cuda_kv_stash_capture(ggml_backend_t backend, const
 // Host-facing wrapper (callable from llama-kv-cache under GGML_USE_CUDA). extern "C" to match the
 // ggml-cuda.h declaration (C linkage).
 extern "C" void ggml_backend_cuda_kv_transcode(ggml_backend_t backend,
-                                               const struct ggml_backend_cuda_kv_transcode_params * params) {
+                                               const struct ggml_vbr_transcode_params * params) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_cuda_vbr_kv_transcode(*cuda_ctx, params);
 }
