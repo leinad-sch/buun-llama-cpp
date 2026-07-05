@@ -2205,8 +2205,28 @@ const llama_kv_cache::vbr_pool * llama_kv_cache::vbr_pool_of(const ggml_tensor *
 }
 
 bool llama_kv_cache::vbr_over_budget(uint32_t wm_cells) const {
+    // The configured budget bounds the POOL, but the card bounds reality: weights + compute
+    // buffers leave whatever they leave, and the floor-cost fallback budget never consulted free
+    // VRAM at all. Clamp each pool's target by what its device can actually map right now
+    // (mapped + free − headroom) so tiers demote EARLY at the decode boundary instead of
+    // ensure_mapped hitting the hard wall mid-batch (seen: first f16→t8 wave on a 24GB card).
+    static const size_t headroom = [] {
+        const char * e = getenv("VBR_VRAM_HEADROOM_MIB");
+        return (size_t) (e ? strtoull(e, nullptr, 10) : 192) * 1024 * 1024;
+    }();
     for (const auto & p : vbr_pools_) {
-        if (p.vmm != nullptr && vbr_vmm_projected_bytes(p, wm_cells) > p.budget) {
+        if (p.vmm == nullptr) {
+            continue;
+        }
+        size_t budget_eff = p.budget;
+        size_t free_b = 0, total_b = 0;
+        ggml_backend_cuda_get_device_memory(p.device, &free_b, &total_b);
+        const size_t mapped_now = ggml_backend_cuda_vmm_pool_mapped(p.vmm);
+        const size_t cap = mapped_now + (free_b > headroom ? free_b - headroom : 0);
+        if (cap < budget_eff) {
+            budget_eff = cap;
+        }
+        if (vbr_vmm_projected_bytes(p, wm_cells) > budget_eff) {
             return true;
         }
     }
@@ -2249,8 +2269,20 @@ void llama_kv_cache::vbr_vmm_ensure_mapped() {
                 const size_t start = row_b * pool.wm_cells;
                 const size_t need  = row_b * wm;
                 if (!ggml_backend_cuda_vmm_pool_map(pool.vmm, e.byte_off + start, need - start)) {
-                    GGML_ABORT("VBR VMM: out of physical memory mapping %zu bytes at pool offset %zu (watermark %u cells)",
-                            need - start, e.byte_off + start, wm);
+                    // Physical exhaustion here is usually the FIRST big degrade wave's transient:
+                    // the wave's old-tier tail pages are still mapped (their unmap is deferred to
+                    // the next decode boundary) while this growth maps the new watermark. Reclaim
+                    // them now and retry once before giving up — safe: this batch's graphs are not
+                    // built yet, and the flush synchronizes the side stream, so nothing can still
+                    // read those pages.
+                    LLAMA_LOG_WARN("%s: physical map of %zu bytes failed at offset %zu (watermark %u) — "
+                            "flushing deferred unmaps and retrying\n",
+                            __func__, need - start, e.byte_off + start, wm);
+                    vbr_flush_deferred_unmaps();
+                    if (!ggml_backend_cuda_vmm_pool_map(pool.vmm, e.byte_off + start, need - start)) {
+                        GGML_ABORT("VBR VMM: out of physical memory mapping %zu bytes at pool offset %zu (watermark %u cells)",
+                                need - start, e.byte_off + start, wm);
+                    }
                 }
             }
         }

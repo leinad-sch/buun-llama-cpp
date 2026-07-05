@@ -105,7 +105,10 @@ static const std::vector<float> * turbo_vmean_table(const llama_hparams & hparam
                     const int64_t nh  = hparams.n_head(il);
                     const int64_t nkv = hparams.n_head_kv(il);
                     if (hd <= 0 || nh <= 0 || nkv <= 0) continue;
-                    if ((int64_t) max_c < nkv * hd || GGML_PAD(hd, 128) * nh != w) continue;
+                    // Narrower layers (e.g. gemma4 SWA vs global widths) occupy a prefix of the
+                    // pdim-wide row; requiring == w armed ZERO layers on heterogeneous geometry
+                    // while the encode side still subtracted -> V shifted by -mu, never restored.
+                    if ((int64_t) max_c < nkv * hd || GGML_PAD(hd, 128) * nh > w) continue;
                     bool any = false;   // skip dead (all-zero) layers
                     for (int64_t j = 0; j < nkv * hd && !any; j++) {
                         if (mu[(size_t) il * max_c + j] != 0.0f) any = true;
@@ -2556,9 +2559,11 @@ ggml_tensor * llm_graph_context::build_attn(
         if (cur->ne[0] % 128 == 0) {
             cur = ggml_cont(ctx0, cur);  // force copy to break potential aliasing
             cur = ggml_turbo_wht(ctx0, cur, 1);  // 1 = inverse
-            // V-mean tap: restore mu_V once (weights sum to 1 -> mean re-enters as a constant)
-            if (inp->self_vmean && inp->self_vmean->ne[0] == cur->ne[0]) {
-                ggml_tensor * mu = ggml_view_2d(ctx0, inp->self_vmean, inp->self_vmean->ne[0], 1,
+            // V-mean tap: restore mu_V once (weights sum to 1 -> mean re-enters as a constant).
+            // View this layer's prefix of the pdim-wide mu row: narrower layers (gemma4 SWA vs
+            // global) must still restore or encode-side subtraction leaves V shifted by -mu.
+            if (inp->self_vmean && inp->self_vmean->ne[0] >= cur->ne[0]) {
+                ggml_tensor * mu = ggml_view_2d(ctx0, inp->self_vmean, cur->ne[0], 1,
                         inp->self_vmean->nb[1], (size_t) il * inp->self_vmean->nb[1]);
                 cur = ggml_add(ctx0, cur, mu);
             }
@@ -2839,9 +2844,10 @@ ggml_tensor * llm_graph_context::build_attn(
         if (cur->ne[0] % 128 == 0) {
             cur = ggml_cont(ctx0, cur);
             cur = ggml_turbo_wht(ctx0, cur, 1);  // 1 = inverse
-            // V-mean tap: restore mu_V once (weights sum to 1 -> mean re-enters as a constant)
-            if (inp->self_vmean && inp->self_vmean->ne[0] == cur->ne[0]) {
-                ggml_tensor * mu = ggml_view_2d(ctx0, inp->self_vmean, inp->self_vmean->ne[0], 1,
+            // V-mean tap: restore mu_V once (weights sum to 1 -> mean re-enters as a constant).
+            // Prefix view per layer — see the primary attention site for why >= / cur->ne[0].
+            if (inp->self_vmean && inp->self_vmean->ne[0] >= cur->ne[0]) {
+                ggml_tensor * mu = ggml_view_2d(ctx0, inp->self_vmean, cur->ne[0], 1,
                         inp->self_vmean->nb[1], (size_t) il * inp->self_vmean->nb[1]);
                 cur = ggml_add(ctx0, cur, mu);
             }
