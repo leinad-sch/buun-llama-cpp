@@ -126,7 +126,7 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
         } else if constexpr (type_V == GGML_TYPE_TURBO2_TCQ) {
             alpha_v = 1.06f;  // flat optimum for the coord-descent codebook (K=iter195/V=iter208)
         } else if constexpr (type_V == GGML_TYPE_TURBO1_TCQ) {
-            alpha_v = 1.22f;  // rotated-V re-tune 2026-07-02; MUST match tcq_compute_alpha_v (fattn.cu).
+            alpha_v = 1.26f;  // KLD-panel re-tune 2026-07-05; MUST match tcq_compute_alpha_v (fattn.cu).
         }
         CUDA_CHECK(cudaMemcpyToSymbol(d_tcq_decode_alpha_v_fattn, &alpha_v, sizeof(float)));
 

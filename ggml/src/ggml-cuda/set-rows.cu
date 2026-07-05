@@ -805,14 +805,14 @@ static void ensure_ragged_tmp(int device, void ** ptr, int64_t * cap, int64_t by
 }
 
 // V decode alpha per TCQ tier. Defaults MUST stay in sync with tcq_compute_alpha_v in
-// fattn.cu (the native decode path): t3=1.02, t2=1.06, t1=1.22. Per-tier env overrides
+// fattn.cu (the native decode path): t3=1.02, t2=1.06, t1=1.26. Per-tier env overrides
 // (TURBO_TCQ_DECODE_ALPHA_V1/V2/V3) allow mixed-tier ragged schedules to pin one tier's
 // alpha without the global TURBO_TCQ_DECODE_ALPHA_V contaminating the other tiers.
 static float ragged_tcq_decode_alpha(int tier, int is_k) {
     static bool loaded = false;
     static float alpha_k = 1.0f;
     static float alpha_v_override = 0.0f;
-    static float alpha_v_tier[3] = { 1.22f, 1.06f, 1.02f }; // t1tcq, t2tcq, t3tcq
+    static float alpha_v_tier[3] = { 1.26f, 1.06f, 1.02f }; // t1tcq, t2tcq, t3tcq
     if (!loaded) {
         loaded = true;
         if (const char * s = getenv("TURBO_TCQ_DECODE_ALPHA_K")) {

@@ -449,12 +449,13 @@ static inline float tcq_compute_alpha_v(ggml_type v_type, int64_t n_kv) {
         return 1.06f;
     } else if (v_type == GGML_TYPE_TURBO1_TCQ) {
         // 1-bit wants a higher decode alpha than 2/3-bit (monotone in bits: t3=1.02, t2=1.06).
-        // 1.14 was the optimum on the OLD per-row V decode path (median KLD 0.0452 @8192/24ch).
-        // Under ROTATED-domain V (2026-07-02) the optimum shifted up: batch-1 PPL 4k-token sweep
-        // has every point in [1.18, 1.35] beating 1.14; 1.22 is the conservative end of the
-        // smooth region (6.875 vs 6.926 at 1.14). ⚠ Pending KLD-panel confirmation before ship;
+        // KLD-panel confirmed 2026-07-05 (native-path sweep, q27, 8k/16k/32k x {builtin,
+        // finalist s11/s5} x alpha 1.06-1.30): every completed series has an INTERIOR minimum
+        // at 1.26 (1.30 turns up), same-top flips agree; ~2% median better than the old 1.22.
+        // The earlier ragged-harness ladder said <=1.14 — instrument != deployment; only the
+        // native fattn path is authoritative for this constant.
         // MUST stay in sync with the fused launcher constexpr in fattn-mma-turbo.cuh.
-        return 1.22f;
+        return 1.26f;
     }
     return 1.0f;
 }
