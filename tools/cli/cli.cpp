@@ -356,10 +356,13 @@ int llama_cli(int argc, char ** argv) {
         return 1;
     }
 
-    // TODO: maybe support it later?
+    // -no-cnv/--no-conversation: run the -p prompt as ONE templated turn and exit.
+    // (Raw un-templated completion = llama-completion.) Previously this printed
+    // "not supported" and then ran conversation mode anyway — combined with the
+    // EOF behavior below, a scripted `llama-cli -p ... < /dev/null` would spin
+    // printing "> " forever.
     if (params.conversation_mode == COMMON_CONVERSATION_MODE_DISABLED) {
-        console::error("--no-conversation is not supported by llama-cli\n");
-        console::error("please use llama-completion instead\n");
+        params.single_turn = true;
     }
 
     // struct that contains llama context and inference
@@ -512,8 +515,12 @@ int llama_cli(int argc, char ** argv) {
             buffer.pop_back();
         }
 
-        // skip empty messages
+        // skip empty messages; on stdin EOF (scripted/redirected use) exit instead of
+        // re-prompting forever
         if (buffer.empty()) {
+            if (feof(stdin)) {
+                break;
+            }
             continue;
         }
 
