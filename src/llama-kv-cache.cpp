@@ -1657,14 +1657,19 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             const char * e = getenv("VBR_PROMOTE"); // kill switch for experiments; default ON
             return e == nullptr || atoi(e) != 0;
         }();
-        if (vbr_promote_on) {
-            while (vbr_degrade_cursor_ > 0 && vbr_promote_next(wm_next)) {
-            }
+        // promote pacing: ONE step per boundary, and only after a quiet window (no degrade in
+        // the last 4 boundaries). Promotes re-encode aged rows from degraded recon — error
+        // compounds per hop — so waves spread out and a clamp-driven degrade vetoes the
+        // immediate bounce-back. Boundary counting keeps the cooldown deterministic.
+        vbr_quiet_boundaries_++;
+        if (vbr_promote_on && vbr_degrade_cursor_ > 0 && vbr_quiet_boundaries_ >= 4) {
+            vbr_promote_next(wm_next);
         }
         // budget trigger: degrade while ANY pool exceeds its share. A step only shrinks the pool
         // that owns its tensor, but the cursor is a global price order — advancing it while any
         // pool is over budget is the simplest rule that terminates and preserves the price order.
         while (vbr_over_budget(wm_next)) {
+            vbr_quiet_boundaries_ = 0; // degrade pressure this boundary — cool the promote path
             if (!vbr_degrade_next(wm_next)) {
                 if (!vbr_budget_warned_) { // terminal state — one warning, not one per batch
                     vbr_budget_warned_ = true;
@@ -2180,29 +2185,36 @@ const llama_kv_cache::vbr_pool * llama_kv_cache::vbr_pool_of(const ggml_tensor *
     return const_cast<llama_kv_cache *>(this)->vbr_pool_of(t);
 }
 
-bool llama_kv_cache::vbr_over_budget(uint32_t wm_cells) const {
-    // The configured budget bounds the POOL, but the card bounds reality: weights + compute
-    // buffers leave whatever they leave, and the floor-cost fallback budget never consulted free
-    // VRAM at all. Clamp each pool's target by what its device can actually map right now
-    // (mapped + free − headroom) so tiers demote EARLY at the decode boundary instead of
-    // ensure_mapped hitting the hard wall mid-batch (seen: first f16→t8 wave on a 24GB card).
+// The configured budget bounds the POOL, but the card bounds reality: weights + compute
+// buffers leave whatever they leave, and the floor-cost fallback budget never consulted free
+// VRAM at all. Clamp each pool's target by what its device can actually map right now
+// (mapped + free − headroom) so tiers demote EARLY at the decode boundary instead of
+// ensure_mapped hitting the hard wall mid-batch (seen: first f16→t8 wave on a 24GB card).
+// Shared by the degrade trigger AND the promote hysteresis: gating the two on different
+// references (raw budget vs clamped) made every boundary under a co-tenant clamp promote
+// then re-degrade — two transcodes plus one extra quantization hop on aged rows per flap.
+size_t llama_kv_cache::vbr_budget_eff(const vbr_pool & p) const {
     static const size_t headroom = [] {
         const char * e = getenv("VBR_VRAM_HEADROOM_MIB");
         return (size_t) (e ? strtoull(e, nullptr, 10) : 192) * 1024 * 1024;
     }();
+    size_t budget_eff = p.budget;
+    size_t free_b = 0, total_b = 0;
+    p.be->get_device_memory(p.device, &free_b, &total_b);
+    const size_t mapped_now = p.be->vmm_pool_mapped(p.vmm);
+    const size_t cap = mapped_now + (free_b > headroom ? free_b - headroom : 0);
+    if (cap < budget_eff) {
+        budget_eff = cap;
+    }
+    return budget_eff;
+}
+
+bool llama_kv_cache::vbr_over_budget(uint32_t wm_cells) const {
     for (const auto & p : vbr_pools_) {
         if (p.vmm == nullptr) {
             continue;
         }
-        size_t budget_eff = p.budget;
-        size_t free_b = 0, total_b = 0;
-        p.be->get_device_memory(p.device, &free_b, &total_b);
-        const size_t mapped_now = p.be->vmm_pool_mapped(p.vmm);
-        const size_t cap = mapped_now + (free_b > headroom ? free_b - headroom : 0);
-        if (cap < budget_eff) {
-            budget_eff = cap;
-        }
-        if (vbr_vmm_projected_bytes(p, wm_cells) > budget_eff) {
+        if (vbr_vmm_projected_bytes(p, wm_cells) > vbr_budget_eff(p)) {
             return true;
         }
     }
@@ -2641,7 +2653,8 @@ void llama_kv_cache::vbr_full_reset() {
                     e.byte_len = ggml_nbytes(t);
                     undone++;
                 }
-                e.stash_valid = 0;
+                e.stash_valid  = 0;
+                e.promote_hops = 0; // fresh hop budget — the reset epoch starts clean
                 const size_t slot = (size_t) ggml_row_size(GGML_TYPE_F16, t->ne[0]) * t->ne[1] * t->ne[2];
                 pool.be->vmm_pool_unmap(pool.vmm, e.byte_off, slot);
             }
@@ -2649,9 +2662,10 @@ void llama_kv_cache::vbr_full_reset() {
         pool.wm_cells = 0;
         mapped += pool.be->vmm_pool_mapped(pool.vmm);
     }
-    vbr_degrade_cursor_  = 0;
-    vbr_budget_warned_   = false;
-    vbr_stash_dirty_     = false;
+    vbr_degrade_cursor_    = 0;
+    vbr_budget_warned_     = false;
+    vbr_stash_dirty_       = false;
+    vbr_quiet_boundaries_  = 0;
     LLAMA_LOG_INFO("%s: VBR full reset: cache empty — %zu tensors back at their entry tier, pools released "
             "(%.2f MiB mapped)\n", __func__, undone, mapped/1024.0/1024.0);
 }
@@ -2736,6 +2750,14 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
             // tiers (t4 <-> t3 <-> t2 <-> t1); the f16 entry returns losslessly at full reset.
             return false;
         }
+        if (e.promote_hops >= 2) {
+            // hop cap: each promote with live rows re-encodes the aged rows from their degraded
+            // recon — error compounds per hop, and only FUTURE rows gain. Capping per extent
+            // between resets bounds the damage; stopping the walk here is required anyway
+            // (promotion is LIFO along the price order — skipping past a capped top entry
+            // would re-order the ladder).
+            return false;
+        }
         const int64_t ne0 = t->ne[0];
         const size_t rA = ggml_row_size(t->type, ne0);
         const size_t rB = ggml_row_size(type_B,  ne0);
@@ -2745,15 +2767,17 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
         }
 
         // hysteresis: promote only while the promoted layout keeps ~15% headroom of the OWNING
-        // pool's budget — churn costs a transcode each way AND an extra quantization hop on the
-        // aged rows. Basis = max(projected watermark, mapped watermark): the transcode re-encodes
-        // and maps wm_cells rows, so the check must price what will actually be mapped (wm_cells
-        // normally tracks wm_next closely after vbr_shrink_watermark).
+        // pool's LIVE-CLAMPED budget — churn costs a transcode each way AND an extra quantization
+        // hop on the aged rows, and clamping only the degrade side made co-tenant boundaries flap
+        // (promote on raw budget, re-degrade on the clamp). Basis = max(projected watermark,
+        // mapped watermark): the transcode re-encodes and maps wm_cells rows, so the check must
+        // price what will actually be mapped.
         const uint32_t wm_eff = std::max(wm_next, pp->wm_cells);
         const size_t projected = vbr_vmm_projected_bytes(*pp, wm_eff)
                                + GGML_PAD(rB * (size_t) wm_eff, pp->gran)
                                - GGML_PAD(rA * (size_t) wm_eff, pp->gran);
-        if (projected > pp->budget - pp->budget / 7) {
+        const size_t budget_eff = vbr_budget_eff(*pp);
+        if (projected > budget_eff - budget_eff / 7) {
             return false;
         }
 
@@ -2798,6 +2822,7 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
             };
             pp->be->kv_transcode(pp->backend, &tp);
             pp->wave_pending = true;
+            e.promote_hops++; // only live-row re-encodes count — a 0-cell flip is free re-typing
         }
         vbr_set_tensor_type(t, st.is_v ? layers[ikv].v_stream : layers[ikv].k_stream, type_B);
         vbr_tier_epoch_++; // fence graph reuse off the old views (type/strides changed in place)

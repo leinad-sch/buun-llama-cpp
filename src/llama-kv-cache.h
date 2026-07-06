@@ -264,6 +264,9 @@ private:
         ggml_type type0    = GGML_TYPE_COUNT;   // ENTRY tier (immutable; full-clear reset target)
         size_t    stash_off   = 0;              // offset into the f16 sink-stash buffer
         uint32_t  stash_valid = 0;              // rows captured (0 = not yet)
+        // promote transcodes with live rows since the last full reset: each one re-encodes the
+        // aged rows from their degraded recon, so error compounds per hop — cap bounds the damage
+        uint8_t   promote_hops = 0;
     };
     // Multi-GPU (-sm layer): the KV cache spans one buffer per device — one vbr_pool per buffer.
     // Extent vectors stay indexed by ikv in EVERY pool; only entries whose tensor lives in that
@@ -320,6 +323,9 @@ private:
     size_t vbr_floor_cost_bytes_ = 0;                 // page-exact cost of the floor layout at full
                                                       // kv_size (fallback budget in dynamic mode)
     bool   vbr_budget_warned_ = false;                // budget-unmeetable warning fired (terminal)
+    // prepare() boundaries since the last applied degrade step — promote cooldown basis
+    // (deterministic, unlike wall time); promotes wait for a quiet window after any degrade
+    uint32_t vbr_quiet_boundaries_ = 0;
     // sink-stash staleness guard: set when any cell below stash_rows is freed (its content can be
     // rewritten by another request; injecting the old snapshot would corrupt the new rows)
     bool   vbr_stash_dirty_   = false;
@@ -332,6 +338,7 @@ private:
     void     vbr_load_degrade_order();                // baked table, VBR_DEGRADE_ORDER=<file>, or generic fallback
     void     vbr_synth_generic_order();               // cross-model curves for unsupported archs (VBR_FORCE_GENERIC=1 to force)
     size_t   vbr_vmm_projected_bytes(const vbr_pool & p, uint32_t wm_cells) const;
+    size_t   vbr_budget_eff(const vbr_pool & p) const; // live-clamped per-pool budget (shared basis)
     bool     vbr_vmm_active() const;                  // any pool is VMM-backed
     bool     vbr_over_budget(uint32_t wm_cells) const; // any VMM pool projected past its budget
     vbr_pool *       vbr_pool_of(const ggml_tensor * t);       // pool owning the tensor (by buffer)
