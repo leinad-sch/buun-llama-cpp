@@ -306,6 +306,7 @@ private:
         ggml_backend_buffer_t stash_buf = nullptr;
     };
     void vbr_vmm_ensure_mapped(); // grow physical backing to the current cell watermark
+    bool vbr_vmm_try_map(uint32_t wm); // same, recoverable: false on physical exhaustion
 
     // S3/S4: decode-time degrade controller (VMM mode only). The price order and its cursor stay
     // GLOBAL (layer-global price order); each step resolves the pool that owns its tensor.

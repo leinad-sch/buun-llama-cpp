@@ -1704,6 +1704,18 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
                 p.wave_pending = false;
             }
         }
+        // Eager physical backing to the predicted watermark: map failures surface HERE, where no
+        // graphs exist and init_batch can fail RECOVERABLY (llama_decode returns an error; the
+        // server's decode-failure ladder — idle purge, batch halving — finally works under VBR
+        // instead of a process abort killing every client). Runs after the fence arm so an
+        // already-queued transcode wave stays fenced for the NEXT batch's graph either way.
+        // apply_ubatch's ensure_mapped remains as the mid-batch backstop for placements past
+        // the prediction.
+        if (!vbr_vmm_try_map(wm_next)) {
+            LLAMA_LOG_ERROR("%s: VBR VMM: physical map to %u cells failed (device memory exhausted) — "
+                    "failing this batch recoverably\n", __func__, wm_next);
+            return {};
+        }
     }
 
     llama_kv_cache::slot_info_vec_t res;
@@ -2221,16 +2233,16 @@ bool llama_kv_cache::vbr_over_budget(uint32_t wm_cells) const {
     return false;
 }
 
-void llama_kv_cache::vbr_vmm_ensure_mapped() {
-    // the coming graph's writes land on positioned cells below the watermark; reads pad up to it
-    const uint32_t wm = vbr_watermark_cells(0);
+// grow every pool's physical backing to `wm` cells. Returns false on physical exhaustion
+// (after reclaiming the previous wave's deferred tail unmaps and retrying once) WITHOUT
+// aborting — the caller decides whether its position in the batch lifecycle is recoverable.
+// On failure pool.wm_cells stays at its old value; already-mapped delta pages are harmless
+// (maps are idempotent, a later retry re-walks them for free).
+bool llama_kv_cache::vbr_vmm_try_map(uint32_t wm) {
     for (auto & pool : vbr_pools_) {
         if (pool.vmm == nullptr || wm <= pool.wm_cells) {
             continue;
         }
-        // NOTE: the S4 degrade trigger deliberately does NOT live here — apply_ubatch runs mid-batch
-        // where positioned cells outrun the graph writes (see prepare()). This function only grows
-        // the physical backing; the predictive prepare() check guarantees the budget already fits.
         // Map only the DELTA [wm_cells, wm): rows below the old watermark stay mapped through degrades
         // (the tail unmap keeps [0, keep)), so re-walking their chunks every growth is pure waste.
         for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
@@ -2247,21 +2259,33 @@ void llama_kv_cache::vbr_vmm_ensure_mapped() {
                     // Physical exhaustion here is usually the FIRST big degrade wave's transient:
                     // the wave's old-tier tail pages are still mapped (their unmap is deferred to
                     // the next decode boundary) while this growth maps the new watermark. Reclaim
-                    // them now and retry once before giving up — safe: this batch's graphs are not
-                    // built yet, and the flush synchronizes the side stream, so nothing can still
-                    // read those pages.
+                    // them now and retry once before giving up — the flush synchronizes the side
+                    // stream, so nothing can still read those pages.
                     LLAMA_LOG_WARN("%s: physical map of %zu bytes failed at offset %zu (watermark %u) — "
                             "flushing deferred unmaps and retrying\n",
                             __func__, need - start, e.byte_off + start, wm);
                     vbr_flush_deferred_unmaps();
                     if (!pool.be->vmm_pool_map(pool.vmm, e.byte_off + start, need - start)) {
-                        GGML_ABORT("VBR VMM: out of physical memory mapping %zu bytes at pool offset %zu (watermark %u cells)",
-                                need - start, e.byte_off + start, wm);
+                        return false;
                     }
                 }
             }
         }
         pool.wm_cells = wm;
+    }
+    return true;
+}
+
+void llama_kv_cache::vbr_vmm_ensure_mapped() {
+    // the coming graph's writes land on positioned cells below the watermark; reads pad up to it.
+    // NOTE: the S4 degrade trigger deliberately does NOT live here — apply_ubatch runs mid-batch
+    // where positioned cells outrun the graph writes (see prepare()). prepare() already mapped to
+    // its predicted watermark recoverably, so this fires only when placement outran the
+    // prediction (freed low cells + a head above used_max_p1) — with graphs already built,
+    // aborting is all that is left. Kept as the backstop, expected unreachable.
+    const uint32_t wm = vbr_watermark_cells(0);
+    if (!vbr_vmm_try_map(wm)) {
+        GGML_ABORT("VBR VMM: out of physical memory mapping to watermark %u cells mid-batch", wm);
     }
 }
 

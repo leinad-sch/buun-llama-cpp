@@ -218,6 +218,20 @@ static void common_params_fit_impl(
         return result;
     };
 
+    // context bytes that scale with n_ctx (KV only): byte->token capacity math and floor-cost
+    // comparisons must exclude the n_seq_max-sized recurrent state or a constant term skews them
+    auto sum_context_kv_bytes = [&](const dmds_t & dmds) {
+        int64_t result = 0;
+        if (nd == 0) {
+            result += dmds.back().mb.context - dmds.back().mb.context_fixed;
+        } else {
+            for (size_t id = 0; id < nd; id++) {
+                result += dmds[id].mb.context - dmds[id].mb.context_fixed;
+            }
+        }
+        return result;
+    };
+
     auto round_ctx_down = [](uint64_t n_ctx) {
         n_ctx -= n_ctx % 256;
         n_ctx = std::max<uint64_t>(n_ctx, 256);
@@ -241,6 +255,44 @@ static void common_params_fit_impl(
         // every VBR-derived advert (explicit -c bypasses the estimators for power users)
         est = std::min<uint64_t>(est, hp_nct);
         return round_ctx_down(est);
+    };
+    // Advert-honesty cap for dynamic auto mode: the floor capacity of the GROWTH-REACHABLE
+    // budget (device total - model - compute - fixed context - margin). Deliberately NOT the
+    // armed snapshot: kv_size bakes at construction, so a co-tenant present at startup must not
+    // permanently shrink the context ceiling the runtime budget can later grow back into.
+    // Returns 0 when no cap is needed (the full trained context is servable at the floor).
+    auto vbr_growth_reachable_ctx_cap = [&](const dmds_t & dmds_full) -> uint32_t {
+        if (nd == 0 || hp_nct == 0) {
+            return 0;
+        }
+        int64_t budget_gr = 0;
+        int64_t ctx_kv    = 0; // floor-priced KV cost of the full context (RS excluded)
+        for (size_t id = 0; id < nd; id++) {
+            const llama_device_memory_data & dmd = dmds_full[id];
+            budget_gr += std::max<int64_t>(0, dmd.total - (int64_t) dmd.mb.model - (int64_t) dmd.mb.compute
+                                              - (int64_t) dmd.mb.context_fixed - margins[id]);
+            ctx_kv    += (int64_t) dmd.mb.context - (int64_t) dmd.mb.context_fixed;
+        }
+        if (ctx_kv <= 0 || budget_gr <= 0) {
+            return 0;
+        }
+        const uint64_t cap_tokens = (uint64_t) budget_gr * hp_nct / (uint64_t) ctx_kv;
+        if (cap_tokens >= hp_nct) {
+            return 0;
+        }
+        return vbr_scale_est(cap_tokens);
+    };
+    // min-cap an auto-derived advert (never an explicit -c) + the honesty log
+    auto vbr_cap_advert = [&](const dmds_t & dmds_full) {
+        if (!cparams->vbr_dynamic || cparams->n_ctx == 0) {
+            return;
+        }
+        const uint32_t cap = vbr_growth_reachable_ctx_cap(dmds_full);
+        if (cap != 0 && cap < cparams->n_ctx) {
+            LOG_INF("%s: VBR dynamic: advertised n_ctx capped %u -> %u = growth-reachable budget capacity at the quality floor\n",
+                    __func__, cparams->n_ctx, cap);
+            cparams->n_ctx = cap;
+        }
     };
     // captured BEFORE any mutation: vbr_dynamic_arm_budget writes the resolved auto budget back
     // into cparams->vbr_vram_budget_bytes, so explicit-vs-auto checks must use this snapshot
@@ -292,9 +344,11 @@ static void common_params_fit_impl(
         const double floor_bpv = cparams->vbr_min_bits > 0.0 ? cparams->vbr_min_bits
                                                              : vbr_type_bits(GGML_TYPE_TURBO1_TCQ);
         const double price_bpv = vbr_type_bits(common_vbr_floor_price_tier(cparams->vbr_min_bits));
-        const int64_t ctx_priced = sum_context_bytes(dmds_full);
-        if (floor_bpv > price_bpv && ctx_priced > 0 &&
-            (double) budget < (double) ctx_priced * (floor_bpv / price_bpv)) {
+        const int64_t ctx_priced = sum_context_kv_bytes(dmds_full);
+        // fire for the tier-exact default floor too (ratio 1): a budget below the floor-priced
+        // full-context cost is the only startup signal for the runtime's warn-once-exceed state
+        if (ctx_priced > 0 &&
+            (double) budget < (double) ctx_priced * std::max(1.0, floor_bpv / price_bpv)) {
             LOG_WRN("%s: VBR dynamic: the KV budget (%" PRIu64 " MiB) is below the full-context cost "
                     "at the %.4g bits/value floor (~%.0f MiB) — the deepest fills will hit the floor "
                     "clamp early\n", __func__, budget / MiB,
@@ -311,7 +365,7 @@ static void common_params_fit_impl(
         // cap at the trained context (beyond it rope is invalid and compute growth unaccounted)
 
 
-        const int64_t ctx_full = sum_context_bytes(dmds_full);
+        const int64_t ctx_full = sum_context_kv_bytes(dmds_full);
         if (ctx_full <= 0) {
             return uint32_t(0);
         }
@@ -325,7 +379,7 @@ static void common_params_fit_impl(
         const dmds_t dmds_probe = common_get_device_memory_data(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
         cparams->n_ctx = 0;
 
-        const int64_t ctx_probe = sum_context_bytes(dmds_probe);
+        const int64_t ctx_probe = sum_context_kv_bytes(dmds_probe);
         if (ctx_probe <= 0 || ctx_full <= ctx_probe) {
             return vbr_scale_est((uint64_t) budget_bytes * hp_nct / (uint64_t) ctx_full);
         }
@@ -344,11 +398,11 @@ static void common_params_fit_impl(
         if (!vbr_selected || cparams->n_ctx != 0 || vbr_budget_explicit != 0 || hp_nct == 0) {
             return uint32_t(0);
         }
-        // dynamic mode with an auto budget: this path only ever GROWS n_ctx past the model
-        // default, and the dynamic advert is capped at the trained context anyway. Keep the
-        // model default; the budget was already armed by vbr_dynamic_arm_budget.
+        // dynamic mode with an auto budget: keep the model default UNLESS even the
+        // growth-reachable budget cannot serve it at the quality floor — advertising cells the
+        // box can never hold at the floor tier ends in the warn-once-then-exceed state at depth
         if (cparams->vbr_dynamic) {
-            return uint32_t(0);
+            return vbr_growth_reachable_ctx_cap(dmds_full);
         }
 
         const uint32_t n_ctx_probe = std::min<uint32_t>(hp_nct, std::max<uint32_t>(256, std::min<uint32_t>(n_ctx_min, hp_nct)));
@@ -565,6 +619,7 @@ static void common_params_fit_impl(
                         const int64_t memory_reduction = (hp_nct - cparams->n_ctx) * bytes_per_ctx;
                         LOG_TRC("%s: context size reduced from %" PRIu32 " to %" PRIu32 " -> need %" PRId64 " MiB less memory in total\n",
                             __func__, hp_nct, cparams->n_ctx, memory_reduction/MiB);
+                        vbr_cap_advert(dmds_full); // shrunk advert must still be floor-servable
                         if (nd <= 1) {
                             LOG_TRC("%s: entire model can be fit by reducing context\n", __func__);
                             return;
@@ -574,6 +629,7 @@ static void common_params_fit_impl(
                         const int64_t memory_reduction = sum_projected_used - sum_projected_used_min_ctx;
                         LOG_TRC("%s: context size reduced from %" PRIu32 " to %" PRIu32 " -> need %" PRId64 " MiB less memory in total\n",
                             __func__, hp_nct, cparams->n_ctx, memory_reduction/MiB);
+                        vbr_cap_advert(dmds_full);
                     }
                 } else {
                     if (n_ctx_min == UINT32_MAX) {
