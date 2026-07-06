@@ -8988,10 +8988,6 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 void ggml_compute_forward_flash_attn_ext(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
-    if (dst->src[5] || dst->src[6]) {
-        GGML_ABORT("VBR segmented-K flash attention is not implemented on CPU");
-    }
-
     switch (dst->op_params[3]) {
         case GGML_PREC_DEFAULT:
         case GGML_PREC_F32:

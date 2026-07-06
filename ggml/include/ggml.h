@@ -2453,26 +2453,6 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
-    // Optional segmented-K source for exact row-band VBR policies.
-    // k_promoted: promoted-tier K storage for selected row bands. It may have
-    //             either the same logical row count as K or a compact physical
-    //             row count described by k_row_bands.
-    // k_row_bands: I32 [4, n_bands], each column is
-    //              [logical_row0, logical_row1, physical_row0, physical_row1);
-    //              [2, n_bands] legacy descriptors use logical rows as physical
-    //              rows. Unused bands are encoded as negative row bounds.
-    GGML_API void ggml_flash_attn_ext_add_vbr_k(
-            struct ggml_tensor * a,
-            struct ggml_tensor * k_promoted,
-            struct ggml_tensor * k_row_bands);
-
-    // Optional segmented-V source for exact row-band VBR policies.
-    // v_promoted and v_row_bands follow the same row-band contract as K.
-    GGML_API void ggml_flash_attn_ext_add_vbr_v(
-            struct ggml_tensor * a,
-            struct ggml_tensor * v_promoted,
-            struct ggml_tensor * v_row_bands);
-
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,

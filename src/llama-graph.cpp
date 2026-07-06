@@ -2236,11 +2236,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
                float   kq_scale,
-                 int   il,
-         ggml_tensor * k_promoted,
-         ggml_tensor * k_row_bands,
-         ggml_tensor * v_promoted,
-         ggml_tensor * v_row_bands) const {
+                 int   il) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2251,12 +2247,6 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     q = ggml_permute(ctx0, q, 0, 2, 1, 3);
     k = ggml_permute(ctx0, k, 0, 2, 1, 3);
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
-    if (k_promoted) {
-        k_promoted = ggml_permute(ctx0, k_promoted, 0, 2, 1, 3);
-    }
-    if (v_promoted) {
-        v_promoted = ggml_permute(ctx0, v_promoted, 0, 2, 1, 3);
-    }
 
     // TODO: TurboQuant pre-rotate-queries optimization (WIP — PPL 23.5 vs 6.19 target)
     // The graph-side rotation approach works mechanically (ggml_mul_mat rotates correctly)
@@ -2267,8 +2257,6 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     ggml_tensor * cur;
 
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
-    GGML_ASSERT((!k_promoted && !k_row_bands) || use_flash_attn);
-    GGML_ASSERT((!v_promoted && !v_row_bands) || use_flash_attn);
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
@@ -2290,8 +2278,6 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         cb(cur, LLAMA_TENSOR_NAME_FATTN, il);
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
-        ggml_flash_attn_ext_add_vbr_k(cur, k_promoted, k_row_bands);
-        ggml_flash_attn_ext_add_vbr_v(cur, v_promoted, v_row_bands);
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
 
         if (v_mla) {
@@ -2551,10 +2537,6 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
-    ggml_tensor * k_promoted = nullptr;
-    ggml_tensor * k_row_bands = nullptr;
-    ggml_tensor * v_promoted = nullptr;
-    ggml_tensor * v_row_bands = nullptr;
 
     // TurboQuant Q pre-rotation is handled inline in CUDA FA kernels:
     // - Vec kernel: shared memory FWHT (fattn-vec.cuh)
@@ -2567,7 +2549,7 @@ ggml_tensor * llm_graph_context::build_attn(
         q = ggml_pad(ctx0, q, k->ne[0] - q->ne[0], 0, 0, 0);
     }
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, k_promoted, k_row_bands, v_promoted, v_row_bands);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     // TurboQuant V un-rotation at graph level (CUDA graph compatible).

@@ -265,11 +265,10 @@ private:
     // pool's buffer are populated (byte_len == 0 elsewhere). With a single GPU there is exactly
     // one pool and all logic reduces to the previous single-pool controller bit-for-bit.
     struct vbr_pool {
-        bool                  enabled = false;
         ggml_backend_buffer_t buf     = nullptr; // non-owning (lives in ctxs_bufs); one KV buffer
         char *                base    = nullptr; // ggml_backend_buffer_get_base(buf)
         size_t                size    = 0;        // total pool bytes
-        size_t                used    = 0;        // high-water of placed extents
+        size_t                used    = 0;        // high-water of placed extents (log-only)
         size_t                budget  = 0;         // per-pool share of vbr_budget_bytes_ (VA-size proportional)
         std::vector<vbr_extent> k;                // indexed by kv-cache layer id (ikv)
         std::vector<vbr_extent> v;

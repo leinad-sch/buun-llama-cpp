@@ -5548,66 +5548,6 @@ void ggml_flash_attn_ext_add_sinks(
     a->src[4] = sinks;
 }
 
-void ggml_flash_attn_ext_add_vbr_k(
-        struct ggml_tensor * a,
-        struct ggml_tensor * k_promoted,
-        struct ggml_tensor * k_row_bands) {
-    if (!k_promoted && !k_row_bands) {
-        a->src[5] = NULL;
-        a->src[6] = NULL;
-        return;
-    }
-
-    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
-    GGML_ASSERT(a->src[5] == NULL);
-    GGML_ASSERT(a->src[6] == NULL);
-    GGML_ASSERT(k_promoted);
-    GGML_ASSERT(k_row_bands);
-    GGML_ASSERT(a->src[1]);
-
-    GGML_ASSERT(k_promoted->ne[0] == a->src[1]->ne[0]);
-    GGML_ASSERT(k_promoted->ne[2] == a->src[1]->ne[2]);
-    GGML_ASSERT(k_promoted->ne[3] == a->src[1]->ne[3]);
-    GGML_ASSERT(k_promoted->ne[1] > 0);
-
-    GGML_ASSERT(k_row_bands->type == GGML_TYPE_I32);
-    GGML_ASSERT(k_row_bands->ne[0] == 2 || k_row_bands->ne[0] >= 4);
-    GGML_ASSERT(ggml_is_contiguous(k_row_bands));
-
-    a->src[5] = k_promoted;
-    a->src[6] = k_row_bands;
-}
-
-void ggml_flash_attn_ext_add_vbr_v(
-        struct ggml_tensor * a,
-        struct ggml_tensor * v_promoted,
-        struct ggml_tensor * v_row_bands) {
-    if (!v_promoted && !v_row_bands) {
-        a->src[7] = NULL;
-        a->src[8] = NULL;
-        return;
-    }
-
-    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
-    GGML_ASSERT(a->src[7] == NULL);
-    GGML_ASSERT(a->src[8] == NULL);
-    GGML_ASSERT(v_promoted);
-    GGML_ASSERT(v_row_bands);
-    GGML_ASSERT(a->src[2]);
-
-    GGML_ASSERT(v_promoted->ne[0] == a->src[2]->ne[0]);
-    GGML_ASSERT(v_promoted->ne[2] == a->src[2]->ne[2]);
-    GGML_ASSERT(v_promoted->ne[3] == a->src[2]->ne[3]);
-    GGML_ASSERT(v_promoted->ne[1] > 0);
-
-    GGML_ASSERT(v_row_bands->type == GGML_TYPE_I32);
-    GGML_ASSERT(v_row_bands->ne[0] == 2 || v_row_bands->ne[0] >= 4);
-    GGML_ASSERT(ggml_is_contiguous(v_row_bands));
-
-    a->src[7] = v_promoted;
-    a->src[8] = v_row_bands;
-}
-
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(

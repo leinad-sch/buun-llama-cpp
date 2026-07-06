@@ -200,7 +200,6 @@ struct turbo_vbr_layer_policy {
     int ignored_bands = 0;
     int segmented_row_bands = 0;
     int segmented_coord_bands = 0;
-    int segmented_generic_bands = 0;
     int segmented_layer_specific_bands = 0;
     int segmented_k_bands = 0;
     int segmented_v_bands = 0;
@@ -213,9 +212,6 @@ static std::string turbo_vbr_segmented_reject_reason(const turbo_vbr_layer_polic
     if (policy.segmented_coord_bands > 0) {
         reasons.push_back(format("%d coord/head segmented bands", policy.segmented_coord_bands));
     }
-    if (policy.segmented_generic_bands > 0) {
-        reasons.push_back(format("%d generic segmented bands", policy.segmented_generic_bands));
-    }
     if (policy.segmented_v_bands > 0) {
         reasons.push_back(format("%d V-side segmented bands (positional/row VBR not supported)", policy.segmented_v_bands));
     }
@@ -223,7 +219,7 @@ static std::string turbo_vbr_segmented_reject_reason(const turbo_vbr_layer_polic
         reasons.push_back(format("%d K-side segmented bands (positional/row VBR not supported)", policy.segmented_k_bands));
     }
     if (reasons.empty()) {
-        return "segmented schedule requires generic ragged VBR runtime support";
+        return "schedule contains malformed or unsupported bands";
     }
 
     std::ostringstream ss;
@@ -312,23 +308,10 @@ static turbo_vbr_layer_policy turbo_vbr_layer_policy_from_env(
     }
 
     policy.enabled = true;
+    // schedule_ctx = the discovery window the schedule's row coordinates refer to (VBR_SCHEDULE_CTX,
+    // default 8192). Only whole-window bands are supported — see covers_whole_active_cache below.
     const int schedule_ctx = turbo_vbr_schedule_ctx();
-    const uint32_t runtime_ctx = kv_size > 0 ? kv_size : (uint32_t) schedule_ctx;
-    if (runtime_ctx != (uint32_t) schedule_ctx) {
-        LLAMA_LOG_INFO("llama_kv_cache: VBR schedule row bands scaled from schedule_ctx=%d to kv_size=%u\n",
-                schedule_ctx, runtime_ctx);
-    }
-
-    auto scale_schedule_row = [&](int row, bool upper) {
-        const uint32_t clamped = (uint32_t) std::max(0, std::min(row, schedule_ctx));
-        if (runtime_ctx == (uint32_t) schedule_ctx) {
-            return clamped;
-        }
-        const uint64_t num = (uint64_t) clamped * (uint64_t) runtime_ctx;
-        return (uint32_t) (upper ?
-            (num + (uint64_t) schedule_ctx - 1) / (uint64_t) schedule_ctx :
-            num / (uint64_t) schedule_ctx);
-    };
+    GGML_UNUSED(kv_size);
 
     for (const std::string & item_raw : turbo_vbr_split(schedule, ';')) {
         if (item_raw.empty()) {
@@ -408,14 +391,10 @@ static turbo_vbr_layer_policy turbo_vbr_layer_policy_from_env(
         // future non-8k schedule artifacts.
         const bool covers_whole_active_cache = row0 == 0 && row1 >= schedule_ctx;
         if (!covers_whole_active_cache || has_coord) {
-            const uint32_t scaled_row0 = scale_schedule_row(row0, false);
-            const uint32_t scaled_row1 = scale_schedule_row(row1, true);
             if (has_coord) {
                 policy.segmented_coord_bands++;
-            } else if (apply_k || apply_v) {
-                policy.segmented_row_bands++;
             } else {
-                policy.segmented_generic_bands++;
+                policy.segmented_row_bands++; // apply_k/apply_v forced true above
             }
             if (saw_layer) {
                 policy.segmented_layer_specific_bands++;
@@ -428,9 +407,7 @@ static turbo_vbr_layer_policy turbo_vbr_layer_policy_from_env(
             }
             // Per-side static VBR allocator: only full-cache layer-side tiers are
             // supported. Partial-row / coordinate (Stage2A) bands are no longer
-            // implemented — ignore them. (void the scaled rows to silence unused-warnings)
-            (void) scaled_row0;
-            (void) scaled_row1;
+            // implemented — ignore them.
             policy.ignored_bands++;
             continue;
         }
@@ -465,14 +442,13 @@ static turbo_vbr_layer_policy turbo_vbr_layer_policy_from_env(
     policy.has_turbo = policy.has_turbo_k || policy.has_turbo_v;
 
 
-    LLAMA_LOG_INFO("llama_kv_cache: VBR layer schedule enabled from %s: schedule_ctx=%d, applied %d layer-side entries, ignored %d segmented bands, segmented_axes={row:%d, coord:%d, generic:%d, layer_specific:%d, k:%d, v:%d}\n",
+    LLAMA_LOG_INFO("llama_kv_cache: VBR layer schedule enabled from %s: schedule_ctx=%d, applied %d layer-side entries, ignored %d segmented bands, segmented_axes={row:%d, coord:%d, layer_specific:%d, k:%d, v:%d}\n",
             src.c_str(),
             schedule_ctx,
             policy.layer_side_bands,
             policy.ignored_bands,
             policy.segmented_row_bands,
             policy.segmented_coord_bands,
-            policy.segmented_generic_bands,
             policy.segmented_layer_specific_bands,
             policy.segmented_k_bands,
             policy.segmented_v_bands);
@@ -684,64 +660,12 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        // Layer-adaptive: use higher precision for quality-sensitive layers
-        // Config: TURBO_LAYER_ADAPTIVE env var controls the strategy
-        //   0 = uniform (default)
-        //   1 = q8_0 for first 4 + last 4
-        //   2 = q8_0 for last 8
-        //   3 = q8_0 for last 4 only
-        //   4 = q8_0 for first 4 only
-        //   5 = q8_0 for first 2 + last 2
-        //   6 = V-only q8_0 for last 8 (asymmetric: values need more precision)
-        //   7 = K-only q8_0 for last 8 (asymmetric: control experiment)
-        //   8 = V-only q8_0 for first 2 + last 2
-        //   9 = q8_0 for last 2 only
-        //  10 = K-only q8_0 for last 4
-        //  11 = q8_0 for last 6
+        // per-layer types: uniform (-ctk/-ctv) unless a VBR layer schedule overrides.
+        // (the pre-VBR TURBO_LAYER_ADAPTIVE 18-mode experiment matrix was retired 2026-07-05 —
+        // VBR_LAYER_SCHEDULE expresses all of it and more)
         ggml_type layer_type_k = type_k;
         ggml_type layer_type_v = type_v;
         {
-            // Thread-safe one-time init via C++ static local
-            static const int adaptive_mode = []() {
-                const char * env = getenv("TURBO_LAYER_ADAPTIVE");
-                int mode = env ? atoi(env) : 0;
-                if (mode > 0) {
-                    LLAMA_LOG_INFO("llama_kv_cache: layer-adaptive mode %d enabled\n", mode);
-                }
-                return mode;
-            }();
-            const bool is_turbo = ggml_type_is_turbo(type_k) || ggml_type_is_turbo(type_v);
-            const uint32_t n_layer = hparams.n_layer;
-            bool promote_k = false;
-            bool promote_v = false;
-            if (is_turbo && n_layer >= 8) {
-                switch (adaptive_mode) {
-                    case 1: promote_k = promote_v = (il < 4 || il >= n_layer - 4); break;
-                    case 2: promote_k = promote_v = (il >= n_layer - 8); break;
-                    case 3: promote_k = promote_v = (il >= n_layer - 4); break;
-                    case 4: promote_k = promote_v = (il < 4); break;
-                    case 5: promote_k = promote_v = (il < 2 || il >= n_layer - 2); break;
-                    case 6: promote_v = (il >= n_layer - 8); break;
-                    case 7: promote_k = (il >= n_layer - 8); break;
-                    case 8: promote_v = (il < 2 || il >= n_layer - 2); break;
-                    case 9: promote_k = promote_v = (il >= n_layer - 2); break;
-                    case 10: promote_k = (il >= n_layer - 4); break;
-                    case 11: promote_k = promote_v = (il >= n_layer - 6); break;
-                    case 12: promote_k = promote_v = !hparams.is_swa(il); break;  // global layers only
-                    case 13: promote_v = !hparams.is_swa(il); break;              // global V only
-                    case 14: promote_k = promote_v = hparams.is_swa(il); break;   // SWA layers only
-                    case 15: promote_v = hparams.is_swa(il); break;               // SWA V only
-                    case 16: promote_k = promote_v = (il % 4 == 0); break;        // every 4th layer q8_0 (Qwen-like)
-                    case 17: promote_k = promote_v = (il % 3 == 0); break;        // every 3rd layer q8_0
-                    case 18: promote_k = promote_v = (il % 2 == 0); break;        // every 2nd layer q8_0
-                }
-            }
-            if (promote_k) {
-                layer_type_k = GGML_TYPE_Q8_0;
-            }
-            if (promote_v) {
-                layer_type_v = GGML_TYPE_Q8_0;
-            }
             if (vbr_layer_policy.enabled) {
                 layer_type_k = vbr_layer_policy.k[il];
                 layer_type_v = vbr_layer_policy.v[il];
@@ -837,7 +761,7 @@ llama_kv_cache::llama_kv_cache(
         if (turbo_rotation == nullptr &&
             (ggml_type_is_turbo(type_k) || ggml_type_is_turbo(type_v) || vbr_layer_policy.has_turbo)) {
             turbo_rotation = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128);
-            ggml_format_name(turbo_rotation, "turbo_rotation");  // R^T
+            ggml_format_name(turbo_rotation, "turbo_rotation");  // R (forward)
             turbo_rotation_inv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128);
             ggml_format_name(turbo_rotation_inv, "turbo_rotation_inv");  // R
         }
@@ -1029,12 +953,10 @@ llama_kv_cache::llama_kv_cache(
         // Fill turbo rotation matrices AFTER buffer clear (clear zeroes everything)
         if (turbo_rotation != nullptr && turbo_rotation->buffer != nullptr && !model.hparams.no_alloc) {
             #include "turbo-rotation-data.h"
-            // ggml is column-major; C arrays are row-major. Storing a row-major matrix
-            // into ggml implicitly transposes it. ggml_mul_mat(A, x) computes A^T @ x.
-            // To get R @ q: store R^T → ggml sees (R^T)^T_col = R → mul_mat gives R @ q. Wait no —
-            // store R so ggml col-major reads it as R^T, then mul_mat gives (R^T)^T = R. ✓
-            // Store R for Q forward rotation, R^T for V inverse rotation
-            // ggml_mul_mat(A,x) computes A@x for row-major stored A (verified by test)
+            // turbo_rotation holds R (Q forward rotation), turbo_rotation_inv holds R^T (V output
+            // un-rotation). The arrays are row-major; through ggml's column-major view plus
+            // ggml_mul_mat's transpose, mul_mat(A, x) computes A @ x for a row-major-stored A
+            // (verified by test) — so each tensor is stored exactly as named.
             ggml_backend_tensor_set(turbo_rotation, TURBO_ROTATION_R, 0, 128 * 128 * sizeof(float));
             ggml_backend_tensor_set(turbo_rotation_inv, TURBO_ROTATION_RT, 0, 128 * 128 * sizeof(float));
             LLAMA_LOG_INFO("%s: TurboQuant rotation matrices initialized (128x128)\n", __func__);
@@ -1094,7 +1016,6 @@ llama_kv_cache::llama_kv_cache(
         }
         for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
             auto & p = vbr_pools_[pi];
-            p.enabled = true;
             LLAMA_LOG_INFO("%s: VBR pool #%zu (device %d): %.2f MiB buffer, %.2f MiB used\n",
                     __func__, pi, p.device, p.size/1024.0/1024.0, p.used/1024.0/1024.0);
         }
@@ -1604,7 +1525,15 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() 
             ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
         } else {
             // GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) != nullptr); // multi_buffer does not have a defined base
-            ret[buft] += ggml_backend_buffer_get_size(buf.get());
+            size_t sz = ggml_backend_buffer_get_size(buf.get());
+            for (const auto & p : vbr_pools_) {
+                if (p.vmm != nullptr && p.buf == buf.get()) {
+                    // VMM pool: the buffer size is the VA reservation; report mapped-physical
+                    sz = p.be->vmm_pool_mapped(p.vmm);
+                    break;
+                }
+            }
+            ret[buft] += sz;
         }
     }
 
@@ -2181,8 +2110,9 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
         static bool vbr_test_armed = false;
         static bool vbr_test_done  = false;
         // apply_ubatch only POSITIONS cells; the K/V write happens in the following graph compute.
-        // So arm when >=8 cells are occupied, then fire on the NEXT call (by which point the prior
-        // ubatch's cells are written, and a prior attention has identity-init'd the decode InnerQ).
+        // So arm once >=512 cells are occupied, then fire on the NEXT call (by which point the
+        // prior ubatch's cells are written and a prior attention has identity-init'd the decode
+        // InnerQ scales).
         if (!vbr_test_done) {
             if (vbr_test_armed) {
                 vbr_test_done = true;
@@ -2192,30 +2122,6 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             }
         }
     }
-}
-
-// debug census (VBR_MAP_RAWSCAN / VBR_DEGRADE_RAWSCAN): raw nonzero-byte census of the first
-// `rows` rows per 512-row band — separates "cache rows truly zero" from "dequant misreads them".
-// Device-syncs so in-flight writes are visible before the host read (debug path; blocking is fine).
-static void vbr_raw_census(const ggml_tensor * t, int64_t rows, const ggml_vbr_backend_iface * be, int device, const char * hdr) {
-    if (rows <= 0 || be == nullptr) {
-        return;
-    }
-    be->sync_device(device);
-    const size_t rbytes = t->nb[1];
-    std::vector<uint8_t> raw((size_t) rows * rbytes);
-    ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
-    fprintf(stderr, "%s %s (%s) rows=%lld rowbytes=%zu:", hdr, t->name, ggml_type_name(t->type),
-            (long long) rows, rbytes);
-    for (int64_t b = 0; b < rows; b += 512) {
-        const int64_t be = std::min<int64_t>(b + 512, rows);
-        size_t nz = 0;
-        for (size_t i = (size_t) b * rbytes; i < (size_t) be * rbytes; ++i) {
-            nz += raw[i] != 0;
-        }
-        fprintf(stderr, " [%lld:%.0f%%]", (long long) b, 100.0 * (double) nz / ((double)(be - b) * rbytes));
-    }
-    fprintf(stderr, "\n");
 }
 
 // padded cell watermark: the extent get_n_kv derives read views from (256 = the fattn padding
@@ -2293,19 +2199,6 @@ void llama_kv_cache::vbr_vmm_ensure_mapped() {
     for (auto & pool : vbr_pools_) {
         if (pool.vmm == nullptr || wm <= pool.wm_cells) {
             continue;
-        }
-        // VBR_MAP_RAWSCAN=1 debug: at every watermark growth, census the first turbo K tensor's raw
-        // bytes per 512-row band — measures how far the graph writes LAG the cell positioning
-        if (getenv("VBR_MAP_RAWSCAN")) {
-            for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
-                if (!layers[ikv].k || pool.k[ikv].byte_len == 0 || layers[ikv].il != 43) {
-                    continue;
-                }
-                char hdr[64];
-                snprintf(hdr, sizeof(hdr), "VBR MAPSCAN wm %u->%u", pool.wm_cells, wm);
-                vbr_raw_census(layers[ikv].k, pool.wm_cells, pool.be, pool.device, hdr); // OLD watermark rows
-                break;
-            }
         }
         // NOTE: the S4 degrade trigger deliberately does NOT live here — apply_ubatch runs mid-batch
         // where positioned cells outrun the graph writes (see prepare()). This function only grows
@@ -2438,13 +2331,31 @@ void llama_kv_cache::vbr_load_degrade_order() {
                 {"t2", VBR_TIER_T2_TCQ}, {"t1", VBR_TIER_T1_TCQ},
             };
             const auto it = tiers.find(tier);
-            ok = (side == 'k' || side == 'v') && it != tiers.end();
+            // the layer id must be the ENTIRE prefix and a valid layer (atoi silently accepted
+            // garbage as layer 0 and >255 truncated through the uint8 cast)
+            char * endp = nullptr;
+            const std::string il_str = tok.substr(0, colon - 1);
+            const long il = strtol(il_str.c_str(), &endp, 10);
+            ok = (side == 'k' || side == 'v') && it != tiers.end() &&
+                 endp != nullptr && *endp == '\0' && !il_str.empty() &&
+                 il >= 0 && il < (long) hparams.n_layer;
             if (ok) {
-                vbr_degrade_order_.push_back({ (uint8_t) atoi(tok.substr(0, colon - 1).c_str()),
-                                               (uint8_t) (side == 'v'), it->second });
+                vbr_degrade_order_.push_back({ (uint8_t) il, (uint8_t) (side == 'v'), it->second });
             }
         }
         if (ok && !vbr_degrade_order_.empty()) {
+            size_t n_unmatched = 0;
+            for (const auto & st : vbr_degrade_order_) {
+                n_unmatched += map_layer_ids.find(st.il) == map_layer_ids.end();
+            }
+            if (n_unmatched > 0) {
+                // valid layer ids that hold no KV in THIS cache (e.g. recurrent layers of a
+                // hybrid model, or the wrong cache of an iSWA pair) — they no-op at runtime,
+                // which silently hides typos
+                LLAMA_LOG_WARN("%s: VBR degrade order: %zu of %zu steps reference layers with no KV "
+                        "in this cache (they will be skipped)\n",
+                        __func__, n_unmatched, vbr_degrade_order_.size());
+            }
             LLAMA_LOG_INFO("%s: VBR degrade order: %zu steps from %s\n", __func__, vbr_degrade_order_.size(), path);
             return;
         }
@@ -2868,11 +2779,6 @@ bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
         // stale tier-A bytes reinterpreted as B can carry NaN f16 block scales that poison V sums
         const int64_t n_cells = pp->wm_cells;
 
-        // VBR_DEGRADE_RAWSCAN=1 debug: raw nonzero-byte census of the SOURCE before the transcode —
-        // separates "cache rows truly zero" from "transcode dequant misreads them"
-        if (getenv("VBR_DEGRADE_RAWSCAN")) {
-            vbr_raw_census(t, n_cells, pp->be, pp->device, "VBR RAWSCAN");
-        }
 
         // footprint bookkeeping (byte offsets within this tensor's fixed VA slot):
         //   keep      — valid tier-B rows the transcode writes
@@ -2962,8 +2868,8 @@ bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
 // clean tap-off comparison; VBR_TRANSCODE_TEST_N scales the row count (issues past row 4096 only
 // reproduce at scale). fprintf(stderr) so results show regardless of log verbosity.
 void llama_kv_cache::vbr_transcode_anchor_test() {
-    if (vbr_pools_.empty() || !vbr_pools_[0].enabled) {
-        fprintf(stderr, "VBR anchor: pool not enabled, skipping\n");
+    if (vbr_pools_.empty()) {
+        fprintf(stderr, "VBR anchor: no VBR pools, skipping\n");
         return;
     }
     // run once per distinct pool device (multi-GPU: exercise every device's transcode path)
