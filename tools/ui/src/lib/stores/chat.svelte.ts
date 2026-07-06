@@ -719,6 +719,7 @@ class ChatStore {
 						predicted_n: timings?.predicted_n || 0,
 						predicted_per_second: tokensPerSecond,
 						cache_n: timings?.cache_n || 0,
+						kv_bpv: timings?.kv_bpv,
 						prompt_progress: promptProgress
 					},
 					convId
@@ -1395,6 +1396,7 @@ class ChatStore {
 								predicted_n: timings?.predicted_n || 0,
 								predicted_per_second: tokensPerSecond,
 								cache_n: timings?.cache_n || 0,
+								kv_bpv: timings?.kv_bpv,
 								prompt_progress: promptProgress
 							},
 							msg.convId
