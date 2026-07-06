@@ -15,6 +15,8 @@
 #include <string>
 #include <vector>
 
+static ggml_type common_vbr_floor_price_tier(double floor_bpv); // defined near the bottom
+
 // this enum is only used in llama_params_fit_impl but needs to be defined outside of it to fix a Windows compilation issue
 // enum to identify part of a layer for distributing its tensors:
 enum common_layer_fraction_t {
@@ -231,6 +233,7 @@ static void common_params_fit_impl(
     auto vbr_type_bits = [](enum ggml_type t) {
         return 8.0 * ggml_type_size(t) / ggml_blck_size(t);
     };
+
     // captured BEFORE any mutation: vbr_dynamic_arm_budget writes the resolved auto budget back
     // into cparams->vbr_vram_budget_bytes, so explicit-vs-auto checks must use this snapshot
     const uint64_t vbr_budget_explicit = cparams->vbr_vram_budget_bytes;
@@ -266,6 +269,20 @@ static void common_params_fit_impl(
         LOG_INF("%s: VBR dynamic: KV VRAM budget %" PRIu64 " MiB (%s) — decode-time degrade controller armed\n",
                 __func__, std::max<uint64_t>(1, budget / MiB),
                 vbr_budget_explicit != 0 ? "explicit" : "auto, from remaining memory");
+        // the fit prices KV at the largest tier <= the floor; the runtime clamp keeps the
+        // aggregate >= the LITERAL floor, so the full context really costs ctx_priced*floor/price.
+        // Warn up front when the budget cannot deliver it (the runtime will also warn, at fill).
+        const double floor_bpv = cparams->vbr_min_bits > 0.0 ? cparams->vbr_min_bits
+                                                             : vbr_type_bits(GGML_TYPE_TURBO1_TCQ);
+        const double price_bpv = vbr_type_bits(common_vbr_floor_price_tier(cparams->vbr_min_bits));
+        const int64_t ctx_priced = sum_context_bytes(dmds_full);
+        if (floor_bpv > price_bpv && ctx_priced > 0 &&
+            (double) budget < (double) ctx_priced * (floor_bpv / price_bpv)) {
+            LOG_WRN("%s: VBR dynamic: the KV budget (%" PRIu64 " MiB) is below the full-context cost "
+                    "at the %.4g bits/value floor (~%.0f MiB) — the deepest fills will hit the floor "
+                    "clamp early\n", __func__, budget / MiB,
+                    floor_bpv, (double) ctx_priced * (floor_bpv / price_bpv) / (double) MiB);
+        }
     };
 
     auto vbr_estimate_ctx_from_total_budget = [&](uint64_t budget_bytes, const dmds_t & dmds_full) {
@@ -276,9 +293,9 @@ static void common_params_fit_impl(
         // common_fit_params), so these byte->token estimates ARE floor capacities already; just
         // cap at the trained context (beyond it rope is invalid and compute growth unaccounted)
         auto vbr_scale_est = [&](uint64_t est) {
-            if (cparams->vbr_dynamic) {
-                est = std::min<uint64_t>(est, hp_nct);
-            }
+            // beyond the trained context rope is invalid and compute growth unaccounted — cap
+            // every VBR-derived advert (explicit -c bypasses the estimators for power users)
+            est = std::min<uint64_t>(est, hp_nct);
             return round_ctx_down(est);
         };
 
@@ -1004,6 +1021,7 @@ enum common_params_fit_status common_fit_params(
     // load — the cache still STARTS at turbo8 and degrades toward the floor as it fills.
     const ggml_type type_k_entry = cparams->type_k;
     const ggml_type type_v_entry = cparams->type_v;
+    const uint32_t  n_ctx_entry  = cparams->n_ctx;
     if (cparams->vbr_dynamic) {
         const ggml_type price_t = common_vbr_floor_price_tier(cparams->vbr_min_bits);
         cparams->type_k = price_t;
@@ -1025,6 +1043,25 @@ enum common_params_fit_status common_fit_params(
 
     cparams->type_k = type_k_entry;
     cparams->type_v = type_v_entry;
+
+    // the fit priced KV at the largest tier <= the floor; the runtime floor clamp keeps the
+    // aggregate at >= the LITERAL floor, so a fit-chosen n_ctx overstates capacity by
+    // floor/price — scale the advert down (tier-exact floors: factor 1, no change)
+    if (cparams->vbr_dynamic && n_ctx_entry == 0 && cparams->n_ctx != 0) {
+        const double floor_bpv = cparams->vbr_min_bits > 0.0
+            ? cparams->vbr_min_bits
+            : 8.0 * ggml_type_size(GGML_TYPE_TURBO1_TCQ) / ggml_blck_size(GGML_TYPE_TURBO1_TCQ);
+        const ggml_type price_t  = common_vbr_floor_price_tier(cparams->vbr_min_bits);
+        const double price_bpv = 8.0 * ggml_type_size(price_t) / ggml_blck_size(price_t);
+        if (floor_bpv > price_bpv + 1e-9) {
+            uint32_t adjusted = (uint32_t) ((double) cparams->n_ctx * (price_bpv / floor_bpv));
+            adjusted = std::max<uint32_t>(256, adjusted - adjusted % 256);
+            LOG_INF("%s: VBR dynamic: advertised n_ctx %" PRIu32 " -> %" PRIu32 " (literal floor %.4g "
+                    "bits/value costs more than the %s pricing tier)\n",
+                    __func__, cparams->n_ctx, adjusted, floor_bpv, ggml_type_name(price_t));
+            cparams->n_ctx = adjusted;
+        }
+    }
 
     const int64_t t1_us = llama_time_us();
     LOG_TRC("%s: fitting params to free memory took %.2f seconds\n", __func__, (t1_us - t0_us) * 1e-6);

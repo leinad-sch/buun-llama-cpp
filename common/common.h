@@ -634,6 +634,14 @@ struct common_params {
     bool vbr_policy_explicit = false;   // whether --vbr-policy was provided
     bool vbr_cache_type_k = false;      // whether K was selected via the VBR cache-type alias
     bool vbr_cache_type_v = false;      // whether V was selected via the VBR cache-type alias
+    // canonical predicates — use these instead of re-deriving the flag combinations
+    bool vbr_enabled() const {
+        return vbr_cache_type_k || vbr_cache_type_v || vbr_budget_explicit ||
+               vbr_min_bits_explicit || vbr_vram_budget_explicit || vbr_policy_explicit;
+    }
+    bool vbr_dynamic() const {
+        return vbr_enabled() && (vbr_budget == "dynamic" || vbr_budget == "auto" || vbr_budget.empty());
+    }
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

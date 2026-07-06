@@ -503,6 +503,21 @@ static std::string common_vbr_format_bits(double value) {
     return ss.str();
 }
 
+// bits/value of a turbo tier, derived from the ggml block layout — no hardcoded bpv anywhere
+// on the common side (the kv-cache derives its own from ggml_row_size)
+static double common_vbr_type_bits(ggml_type t) {
+    return 8.0 * ggml_type_size(t) / ggml_blck_size(t);
+}
+
+// the turbo tier ladder, descending (used for capacity surrogates and schedule-name pricing)
+static const std::pair<const char *, ggml_type> COMMON_VBR_TIERS[] = {
+    { "t8",    GGML_TYPE_TURBO8_0   },
+    { "t4",    GGML_TYPE_TURBO4_0   },
+    { "t3tcq", GGML_TYPE_TURBO3_TCQ },
+    { "t2tcq", GGML_TYPE_TURBO2_TCQ },
+    { "t1tcq", GGML_TYPE_TURBO1_TCQ },
+};
+
 static bool common_vbr_floor_to_bits(const std::string & raw, std::string & out, double & bits) {
     const std::string s = common_vbr_lower(raw);
     if (s.empty() || s == "auto" || s == "none") {
@@ -515,28 +530,20 @@ static bool common_vbr_floor_to_bits(const std::string & raw, std::string & out,
         out = common_vbr_format_bits(bits);
         return true;
     }
+    ggml_type alias_type = GGML_TYPE_COUNT;
     if (s == "t8" || s == "turbo8" || s == "turbo8_0") {
-        bits = 8.125;
-        out = common_vbr_format_bits(bits);
-        return true;
+        alias_type = GGML_TYPE_TURBO8_0;
+    } else if (s == "t4" || s == "turbo4" || s == "turbo4_0") {
+        alias_type = GGML_TYPE_TURBO4_0;
+    } else if (s == "t3" || s == "t3tcq" || s == "turbo3tcq" || s == "turbo3_tcq") {
+        alias_type = GGML_TYPE_TURBO3_TCQ;
+    } else if (s == "t2" || s == "t2tcq" || s == "turbo2tcq" || s == "turbo2_tcq") {
+        alias_type = GGML_TYPE_TURBO2_TCQ;
+    } else if (s == "t1" || s == "t1tcq" || s == "turbo1tcq" || s == "turbo1_tcq") {
+        alias_type = GGML_TYPE_TURBO1_TCQ;
     }
-    if (s == "t4" || s == "turbo4" || s == "turbo4_0") {
-        bits = 4.125;
-        out = common_vbr_format_bits(bits);
-        return true;
-    }
-    if (s == "t3" || s == "t3tcq" || s == "turbo3tcq" || s == "turbo3_tcq") {
-        bits = 3.25;
-        out = common_vbr_format_bits(bits);
-        return true;
-    }
-    if (s == "t2" || s == "t2tcq" || s == "turbo2tcq" || s == "turbo2_tcq") {
-        bits = 2.25;
-        out = common_vbr_format_bits(bits);
-        return true;
-    }
-    if (s == "t1" || s == "t1tcq" || s == "turbo1tcq" || s == "turbo1_tcq") {
-        bits = 1.25;
+    if (alias_type != GGML_TYPE_COUNT) {
+        bits = common_vbr_type_bits(alias_type);
         out = common_vbr_format_bits(bits);
         return true;
     }
@@ -551,45 +558,26 @@ static bool common_vbr_floor_to_bits(const std::string & raw, std::string & out,
     return true;
 }
 
+// smallest tier whose bits/value covers `bits` (ceil onto the ladder); F16 above t8
 static ggml_type common_vbr_capacity_surrogate_type(double bits) {
-    if (bits > 0.0 && bits <= 1.25) {
-        return GGML_TYPE_TURBO1_TCQ;
+    if (bits <= 0.0) {
+        return GGML_TYPE_F16;
     }
-    if (bits > 0.0 && bits <= 2.25) {
-        return GGML_TYPE_TURBO2_TCQ;
+    ggml_type best = GGML_TYPE_F16;
+    for (const auto & [name, t] : COMMON_VBR_TIERS) {
+        if (common_vbr_type_bits(t) + 1e-9 >= bits) {
+            best = t; // tiers are descending; the last one that still covers is the smallest
+        }
     }
-    if (bits > 0.0 && bits <= 3.25) {
-        return GGML_TYPE_TURBO3_TCQ;
-    }
-    if (bits > 0.0 && bits <= 4.125) {
-        return GGML_TYPE_TURBO4_0;
-    }
-    if (bits > 0.0 && bits <= 8.125) {
-        return GGML_TYPE_TURBO8_0;
-    }
-    return GGML_TYPE_F16;
+    return best;
 }
 
 static double common_vbr_capacity_surrogate_bits(double bits) {
     if (bits <= 0.0) {
         return 0.0;
     }
-    if (bits <= 1.25) {
-        return 1.25;
-    }
-    if (bits <= 2.25) {
-        return 2.25;
-    }
-    if (bits <= 3.25) {
-        return 3.25;
-    }
-    if (bits <= 4.125) {
-        return 4.125;
-    }
-    if (bits <= 8.125) {
-        return 8.125;
-    }
-    return 16.0;
+    const ggml_type t = common_vbr_capacity_surrogate_type(bits);
+    return t == GGML_TYPE_F16 ? 16.0 : common_vbr_type_bits(t);
 }
 
 static bool common_vbr_parse_vram_budget(const std::string & raw, std::string & out, uint64_t & bytes) {
@@ -665,20 +653,10 @@ static double common_vbr_tier_bits(const char * schedule_name) {
     if (s == "f16") {
         return 16.0;
     }
-    if (s == "t8") {
-        return 8.125;
-    }
-    if (s == "t4") {
-        return 4.125;
-    }
-    if (s == "t3tcq") {
-        return 3.25;
-    }
-    if (s == "t2tcq") {
-        return 2.25;
-    }
-    if (s == "t1tcq") {
-        return 1.25;
+    for (const auto & [name, t] : COMMON_VBR_TIERS) {
+        if (s == name) {
+            return common_vbr_type_bits(t);
+        }
     }
     return 0.0;
 }
@@ -902,8 +880,20 @@ static void common_params_postprocess_vbr(common_params & params) {
     }
 
     if (!params.vbr_cache_type_k && !params.vbr_cache_type_v) {
-        params.vbr_cache_type_k = true;
-        params.vbr_cache_type_v = true;
+        // --vbr-* without -ctk/-ctv vbr implies both sides — but never silently overwrite a cache
+        // type the user explicitly set to something else (f16 counts as unset: it is the default)
+        const bool k_free = params.cache_type_k == GGML_TYPE_F16;
+        const bool v_free = params.cache_type_v == GGML_TYPE_F16;
+        if (!k_free && !v_free) {
+            throw std::invalid_argument(
+                "--vbr-* flags need a VBR cache side: use -ctk vbr / -ctv vbr, or drop the explicit non-vbr cache types");
+        }
+        if (!k_free || !v_free) {
+            LOG_WRN("VBR: applying --vbr-* to the %s cache only (the %s cache was explicitly set to a non-vbr type)\n",
+                    k_free ? "K" : "V", k_free ? "V" : "K");
+        }
+        params.vbr_cache_type_k = k_free;
+        params.vbr_cache_type_v = v_free;
     }
 
     std::string floor_name;
@@ -937,6 +927,19 @@ static void common_params_postprocess_vbr(common_params & params) {
     }
     params.vbr_budget = budget;
     if (common_vbr_budget_is_dynamic(budget)) {
+        // the dynamic ladder spans t8 (entry) down to t1tcq: a floor above t8 means the cache
+        // starts below its own floor (never degrades), one below t1 is unreachable — clamp both
+        const double floor_lo = common_vbr_type_bits(GGML_TYPE_TURBO1_TCQ);
+        const double floor_hi = common_vbr_type_bits(GGML_TYPE_TURBO8_0);
+        if (floor_bits > 0.0 && (floor_bits < floor_lo - 1e-9 || floor_bits > floor_hi + 1e-9)) {
+            const double clamped = floor_bits < floor_lo ? floor_lo : floor_hi;
+            LOG_WRN("VBR dynamic: --vbr-floor %.4g is outside the degrade ladder [%.4g, %.4g] — clamping to %.4g\n",
+                    floor_bits, floor_lo, floor_hi, clamped);
+            floor_bits = clamped;
+            params.vbr_min_bits       = common_vbr_format_bits(floor_bits);
+            params.vbr_min_bits_value = floor_bits;
+            params.vbr_capacity_bits  = common_vbr_capacity_surrogate_bits(floor_bits);
+        }
         // Dynamic = the M3 runtime degrade controller (VMM-backed pool, price-ordered in-place
         // transcodes). The cache starts at the turbo8 entry tier (the baked degrade order's F16
         // band no-ops on a t8 start) and whole (layer,side) tensors degrade selectively as mapped
@@ -951,8 +954,9 @@ static void common_params_postprocess_vbr(common_params & params) {
         // t4 = 4.125 bpv means "t4 layout with a few units held one tier higher"), NOT a snap-up
         // to the next physical tier.
         if (params.vbr_policy_explicit) {
-            LOG_WRN("VBR dynamic: --vbr-policy is ignored in dynamic mode (the runtime controller "
-                    "uses the baked/override degrade order, not a policy ladder)\n");
+            throw std::invalid_argument(
+                "--vbr-policy needs a fixed budget (--vbr-bits <tier|number>); dynamic mode uses "
+                "the baked degrade order, not a policy ladder");
         }
         if (getenv("VBR_VMM") || getenv("VBR_MODE") || getenv("VBR_BUDGET_MIB") || getenv("VBR_MIN_BITS")) {
             LOG_WRN("VBR dynamic: VBR_VMM/VBR_MODE/VBR_BUDGET_MIB/VBR_MIN_BITS env is set — developer "
@@ -1022,9 +1026,14 @@ static void common_params_postprocess_vbr(common_params & params) {
         params.cache_type_v = fixed_type;
     }
 
+    if (floor_bits > 0.0 && fixed_budget_bits > 0.0 && floor_bits > fixed_budget_bits + 1e-9) {
+        throw std::invalid_argument("--vbr-floor (" + common_vbr_format_bits(floor_bits) +
+                ") is above the fixed --vbr-bits budget (" + common_vbr_format_bits(fixed_budget_bits) + ")");
+    }
+
     common_setenv_override("VBR_BUDGET", schedule_name);
     params.vbr_capacity_bits = fixed_budget_bits;
-    const double selected_bpv = common_vbr_apply_policy_ladder(params, fixed_budget_bits);
+    const double selected_bpv = common_vbr_apply_policy_ladder(params, fixed_budget_bits, floor_bits);
     if (selected_bpv > 0.0) {
         params.vbr_capacity_bits = selected_bpv;
     }
