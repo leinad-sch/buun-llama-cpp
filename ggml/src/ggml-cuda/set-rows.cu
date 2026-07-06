@@ -1,6 +1,7 @@
 #include "set-rows.cuh"
 #include "cpy-utils.cuh"
 #include "turbo-quant-cuda.cuh"
+#include "turbo-tcq-alpha.cuh"
 #include <cstring>
 #include <cerrno>
 #include <cctype>
@@ -10,6 +11,9 @@
 // Definition for the extern in turbo-quant-cuda.cuh. When true, the encode mean-sub tap is skipped
 // (VBR transcode re-encode: its input is already stored-domain V - mu_V).
 bool g_turbo_meansub_suppress = false;
+// set by the InnerQ calibration when non-identity scales arm: the fused turbo1_tcq decode is
+// not scale-aware, so the fattn dispatch routes t1 to the materialize path while calibrated
+bool g_turbo_innerq_calibrated = false;
 
 static void load_turbo4_alpha(int device) {
     static bool loaded[GGML_CUDA_MAX_DEVICES] = {};
@@ -804,15 +808,14 @@ static void ensure_ragged_tmp(int device, void ** ptr, int64_t * cap, int64_t by
     *cap = bytes_needed;
 }
 
-// V decode alpha per TCQ tier. Defaults MUST stay in sync with tcq_compute_alpha_v in
-// fattn.cu (the native decode path): t3=1.02, t2=1.06, t1=1.26. Per-tier env overrides
-// (TURBO_TCQ_DECODE_ALPHA_V1/V2/V3) allow mixed-tier ragged schedules to pin one tier's
-// alpha without the global TURBO_TCQ_DECODE_ALPHA_V contaminating the other tiers.
+// V decode alpha per TCQ tier (turbo-tcq-alpha.cuh = the single source). Per-tier env
+// overrides (TURBO_TCQ_DECODE_ALPHA_V1/V2/V3) allow mixed-tier ragged schedules to pin one
+// tier's alpha without the global TURBO_TCQ_DECODE_ALPHA_V contaminating the other tiers.
 static float ragged_tcq_decode_alpha(int tier, int is_k) {
     static bool loaded = false;
     static float alpha_k = 1.0f;
     static float alpha_v_override = 0.0f;
-    static float alpha_v_tier[3] = { 1.26f, 1.06f, 1.02f }; // t1tcq, t2tcq, t3tcq
+    static float alpha_v_tier[3] = { TURBO_TCQ_ALPHA_V_T1, TURBO_TCQ_ALPHA_V_T2, TURBO_TCQ_ALPHA_V_T3 }; // t1tcq, t2tcq, t3tcq
     if (!loaded) {
         loaded = true;
         if (const char * s = getenv("TURBO_TCQ_DECODE_ALPHA_K")) {

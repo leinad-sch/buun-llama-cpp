@@ -1,5 +1,7 @@
 #pragma once
 
+#include "turbo-tcq-alpha.cuh"
+
 // fattn-mma-f16.cuh must be included before this header (provides flash_attn_ext_f16,
 // launch_fattn, fattn_kernel_t, and the MMA helper functions).
 
@@ -122,11 +124,11 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
         if (alpha_v_static > 0.0f) {
             alpha_v = alpha_v_static;
         } else if constexpr (type_V == GGML_TYPE_TURBO3_TCQ) {
-            alpha_v = 1.02f;  // flat optimum for the coord-descent codebook (K=iter374/V=iter500)
+            alpha_v = TURBO_TCQ_ALPHA_V_T3;
         } else if constexpr (type_V == GGML_TYPE_TURBO2_TCQ) {
-            alpha_v = 1.06f;  // flat optimum for the coord-descent codebook (K=iter195/V=iter208)
+            alpha_v = TURBO_TCQ_ALPHA_V_T2;
         } else if constexpr (type_V == GGML_TYPE_TURBO1_TCQ) {
-            alpha_v = 1.26f;  // KLD-panel re-tune 2026-07-05; MUST match tcq_compute_alpha_v (fattn.cu).
+            alpha_v = TURBO_TCQ_ALPHA_V_T1;
         }
         CUDA_CHECK(cudaMemcpyToSymbol(d_tcq_decode_alpha_v_fattn, &alpha_v, sizeof(float)));
 

@@ -21,13 +21,6 @@ static __global__ void k_vbr_iota_i32(int32_t * __restrict__ dst, int64_t n) {
     }
 }
 
-static __global__ void k_vbr_scale_f32(float * __restrict__ x, int64_t n, float g) {
-    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        x[i] *= g;
-    }
-}
-
 // f16<->f32 plane moves use the stock convert helpers (ggml_get_to_fp16_cuda / ggml_get_to_fp32_cuda)
 
 // VBR_TRANSCODE_FIDELITY=1 debug: dequant every row of a tensor to host f32 (original domain).
@@ -113,6 +106,7 @@ static void vbr_fidelity_report(const char * name, ggml_type tA, ggml_type tB,
 // from prior decode (true in the live decode-time path).
 void ggml_cuda_vbr_kv_transcode(ggml_backend_cuda_context & ctx,
                                 const ggml_vbr_transcode_params * p) {
+    ggml_cuda_set_device(ctx.device); // multi-GPU waves interleave devices; never rely on the caller
     cudaStream_t stream = ctx.stream();
     const ggml_tensor * src_A      = p->src;
     const ggml_type     type_B     = p->type_B;
@@ -133,11 +127,6 @@ void ggml_cuda_vbr_kv_transcode(ggml_backend_cuda_context & ctx,
     if (fidelity) {
         vbr_fidelity_dequant_all(ctx, (const char *) src_A->data, src_A->type, rA, n_cells, ne0, is_v, stream, fidA);
     }
-    // VBR_TRANSCODE_GAIN=<g> debug: pre-scale the recon before re-encode — tests whether the
-    // requant's systematic norm shrink (fidelity slope < 1) is what damages generation
-    const char * genv = getenv("VBR_TRANSCODE_GAIN");
-    const float  gain = genv ? (float) atof(genv) : 1.0f;
-
     // One tile of cells in flight. f32 scratch = TILE*ne0*4 (~6 MB at ne0=6144, TILE=256), reused.
     // VBR_TRANSCODE_NOTILE (debug): one tile = whole tensor = the old non-tiled behavior, to isolate
     // tiling bugs from source-state issues in the anchor.
@@ -182,16 +171,13 @@ void ggml_cuda_vbr_kv_transcode(ggml_backend_cuda_context & ctx,
         vbr_dequant_turbo_to_f32((const char *) src_A->data + (size_t) c * rA, src_A->type, type_B,
                                  scratch_f16.get(), scratch_f32.get(),
                                  Te, ne0, rA, is_v, ctx.device, stream);
-        if (gain != 1.0f) {
-            const int64_t n_elem = Te * ne0;
-            k_vbr_scale_f32<<<(unsigned)((n_elem + 255)/256), 256, 0, stream>>>(scratch_f32.get(), n_elem, gain);
-        }
         // f16 sink-stash: rows below stash_rows re-encode from the pristine stash captured at the
         // tensor's FIRST degrade, not from the tier-A recon — sink rows are permanently hot AND
         // permanently old (they survive every wave), so this caps their error at single-hop forever.
         // VBR_STASH_CAPTURE_ONLY=1 (debug): keep the stash as the fidelity reference but skip the
         // injection — measures the UNstashed accumulation against the same pristine yardstick.
-        if (stash_f16 != nullptr && c < stash_rows && getenv("VBR_STASH_CAPTURE_ONLY") == nullptr) {
+        static const bool stash_capture_only = getenv("VBR_STASH_CAPTURE_ONLY") != nullptr;
+        if (stash_f16 != nullptr && c < stash_rows && !stash_capture_only) {
             const int64_t overlap = std::min<int64_t>(Te, stash_rows - c);
             ggml_get_to_fp32_cuda(GGML_TYPE_F16)(
                 (const half *) stash_f16 + (size_t) c * ne0, scratch_f32.get(), overlap * ne0, stream);
@@ -248,6 +234,7 @@ void ggml_cuda_vbr_kv_transcode(ggml_backend_cuda_context & ctx,
 extern "C" void ggml_backend_cuda_kv_stash_capture(ggml_backend_t backend, const struct ggml_tensor * src,
                                                    void * stash_f16, int64_t n_rows, bool is_v) {
     ggml_backend_cuda_context & ctx = *(ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx.device);
     cudaStream_t stream = ctx.stream();
     const int64_t ne0 = src->ne[0];
     ggml_cuda_pool_alloc<half>  s16(ctx.pool(), (size_t) n_rows * ne0);
@@ -269,36 +256,64 @@ extern "C" void ggml_backend_cuda_sync_device(int device) {
     if (device >= 0) {
         ggml_cuda_set_device(device);
     }
-    cudaDeviceSynchronize();
+    // this is the degrade wave's write-visibility barrier AND the pre-unmap barrier —
+    // a silently failed sync would transcode stale bytes or rip pages still in use
+    CUDA_CHECK(cudaDeviceSynchronize());
 }
 
-// S5 side-stream fence: one event per device. arm() records on the VBR side stream after a degrade
-// wave's async work; the next graph_compute on the device consumes it with a GPU-side stream wait,
-// so the decode graph runs after the transcodes without the host ever blocking. Re-arming before a
-// consume simply re-records the (same-stream) event — waiting on the newest record covers all
-// earlier wave work. Single-threaded by design (both sites run on the llama_decode thread).
-static cudaEvent_t g_vbr_fence_ev[GGML_CUDA_MAX_DEVICES]    = {};
-static bool        g_vbr_fence_armed[GGML_CUDA_MAX_DEVICES] = {};
+// S5 side-stream fence: one event per (device, arming stream). arm() records on the VBR side
+// stream after a degrade wave's async work; the next graph_compute on the device consumes ALL
+// armed fences for that device with GPU-side stream waits, so the decode graph runs after the
+// transcodes without the host ever blocking. Keyed by stream because one device can host several
+// VBR caches with their own side backends (iSWA base+SWA) — a single per-device event let the
+// second cache's arm re-record onto a different stream and drop the first cache's fence.
+// Re-arming the same stream's slot before a consume simply re-records its event — waiting on the
+// newest record covers all earlier wave work on that stream. Single-threaded by design (all
+// sites run on the llama_decode thread).
+struct ggml_cuda_vbr_fence {
+    int          device = -1;
+    cudaStream_t stream = nullptr;
+    cudaEvent_t  ev     = nullptr;
+    bool         armed  = false;
+};
+// 4 slots per device is generous: base + SWA side streams today, spares for future caches
+static ggml_cuda_vbr_fence g_vbr_fences[GGML_CUDA_MAX_DEVICES * 4] = {};
 
 extern "C" void ggml_backend_cuda_vbr_fence_arm(ggml_backend_t backend) {
     ggml_backend_cuda_context & ctx = *(ggml_backend_cuda_context *) backend->context;
     ggml_cuda_set_device(ctx.device);
-    if (g_vbr_fence_ev[ctx.device] == nullptr) {
-        CUDA_CHECK(cudaEventCreateWithFlags(&g_vbr_fence_ev[ctx.device], cudaEventDisableTiming));
+    ggml_cuda_vbr_fence * slot = nullptr;
+    for (auto & f : g_vbr_fences) {
+        if (f.device == ctx.device && f.stream == ctx.stream()) {
+            slot = &f;
+            break;
+        }
+        if (slot == nullptr && f.device < 0) {
+            slot = &f; // first free slot, claimed only if no exact match exists
+        }
     }
-    CUDA_CHECK(cudaEventRecord(g_vbr_fence_ev[ctx.device], ctx.stream()));
-    g_vbr_fence_armed[ctx.device] = true;
+    GGML_ASSERT(slot != nullptr && "VBR fence table full — more side streams than slots");
+    slot->device = ctx.device;
+    slot->stream = ctx.stream();
+    if (slot->ev == nullptr) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&slot->ev, cudaEventDisableTiming));
+    }
+    CUDA_CHECK(cudaEventRecord(slot->ev, ctx.stream()));
+    slot->armed = true;
 }
 
 void ggml_cuda_vbr_fence_consume(int device, cudaStream_t stream) {
-    if (g_vbr_fence_armed[device]) {
-        CUDA_CHECK(cudaStreamWaitEvent(stream, g_vbr_fence_ev[device], 0));
+    for (auto & f : g_vbr_fences) {
+        if (!f.armed || f.device != device) {
+            continue;
+        }
+        CUDA_CHECK(cudaStreamWaitEvent(stream, f.ev, 0));
         // disarm only once the wave has RETIRED: another graph_compute on this device (e.g. the
         // transcode oracle's throwaway backend) must not steal the decode graph's pending wait.
         // While in flight every graph waits (correct either way); after retirement the first
-        // consumer clears the flag and the fast path is a single branch again.
-        if (cudaEventQuery(g_vbr_fence_ev[device]) == cudaSuccess) {
-            g_vbr_fence_armed[device] = false;
+        // consumer clears the flag and the fast path is a per-slot branch again.
+        if (cudaEventQuery(f.ev) == cudaSuccess) {
+            f.armed = false;
         } else {
             (void) cudaGetLastError(); // absorb the benign cudaErrorNotReady from the query
         }

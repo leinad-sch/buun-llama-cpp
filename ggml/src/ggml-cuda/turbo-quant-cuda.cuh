@@ -514,9 +514,14 @@ static void turbo_innerq_finalize_calibration() {
     // calibration is ever revived" was never implemented. Until it is, armed non-identity scales
     // make fused turbo1_tcq decode silently wrong (identity inv-scale on scaled-domain K).
     if (max_ratio >= 1.2f) {
-        fprintf(stderr, "InnerQ WARNING: non-identity scales will arm, but the fused turbo1_tcq "
-                "decode path is NOT scale-aware (per-TU symbol never updated) — avoid turbo1_tcq "
-                "under calibrated InnerQ or implement the fused gate first.\n");
+        // (defined in set-rows.cu)
+        extern bool g_turbo_innerq_calibrated;
+        // the fused turbo1_tcq decode path is NOT scale-aware (per-TU symbol never updated);
+        // g_turbo_innerq_calibrated makes the fattn dispatch route turbo1_tcq off the fused
+        // path onto the materialize path (which uses the pushed scales) while calibrated
+        g_turbo_innerq_calibrated = true;
+        fprintf(stderr, "InnerQ: non-identity scales armed — turbo1_tcq decode will use the "
+                "materialize path instead of the fused kernel (fused is not scale-aware)\n");
     }
 
     // Auto-detect: if channels are already well-balanced, InnerQ won't help — skip.

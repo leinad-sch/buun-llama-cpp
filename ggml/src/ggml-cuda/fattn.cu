@@ -1,4 +1,5 @@
 #include "common.cuh"
+#include "turbo-tcq-alpha.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-mma-turbo.cuh"
@@ -438,15 +439,13 @@ static bool d_tcq_decode_alpha_loaded = false;
 static inline float tcq_compute_alpha_v(ggml_type v_type, int64_t n_kv) {
     if (d_tcq_decode_alpha_v_static > 0.0f) return d_tcq_decode_alpha_v_static;
     if (n_kv < 1) n_kv = 1;
-    const float ln_ctx = logf((float)n_kv);
-    (void) ln_ctx;
     if (v_type == GGML_TYPE_TURBO3_TCQ) {
         // Flat optimum for the coord-descent codebook (K=iter374/V=iter500). The retrained
         // codebook removed the depth-dependence — a flat alpha beats the old adaptive curve.
-        return 1.02f;
+        return TURBO_TCQ_ALPHA_V_T3;
     } else if (v_type == GGML_TYPE_TURBO2_TCQ) {
         // Flat optimum for the coord-descent codebook (K=iter195/V=iter208).
-        return 1.06f;
+        return TURBO_TCQ_ALPHA_V_T2;
     } else if (v_type == GGML_TYPE_TURBO1_TCQ) {
         // 1-bit wants a higher decode alpha than 2/3-bit (monotone in bits: t3=1.02, t2=1.06).
         // KLD-panel confirmed 2026-07-05 (native-path sweep, q27, 8k/16k/32k x {builtin,
@@ -454,8 +453,7 @@ static inline float tcq_compute_alpha_v(ggml_type v_type, int64_t n_kv) {
         // at 1.26 (1.30 turns up), same-top flips agree; ~2% median better than the old 1.22.
         // The earlier ragged-harness ladder said <=1.14 — instrument != deployment; only the
         // native fattn path is authoritative for this constant.
-        // MUST stay in sync with the fused launcher constexpr in fattn-mma-turbo.cuh.
-        return 1.26f;
+        return TURBO_TCQ_ALPHA_V_T1;
     }
     return 1.0f;
 }
@@ -1959,8 +1957,12 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     // turbo1_tcq handling below; removed 1-bit variants have no instances (dequant-to-f16 codec only); exclude it so it
     // does not enter the fused path and fall through with no kernel launched.
     const bool turbo_matched = K->type == V->type && turbo_kv && K->type != GGML_TYPE_TURBO1_TCQ;
+    // fused t1 decode is not InnerQ-scale-aware — under calibrated scales t1 must take the
+    // materialize path (which uses the pushed symbols); see turbo-quant-cuda.cuh calibration
+    extern bool g_turbo_innerq_calibrated;
+    const bool t1_fused_ok = !g_turbo_innerq_calibrated;
     const bool turbo1_tcq_matched = K->type == GGML_TYPE_TURBO1_TCQ && V->type == GGML_TYPE_TURBO1_TCQ &&
-                                    (Q->ne[0] == 128 || Q->ne[0] == 256);
+                                    (Q->ne[0] == 128 || Q->ne[0] == 256) && t1_fused_ok;
     // Asymmetric fused pairs, D=256 only (dense Qwen geometry). Both sides stay WHT-rotated like
     // the matched path (Q pre-rotated below, V un-rotated at graph level). The set = the q6 sweet
     // spot (t8k/t4v) + every ADJACENT-TIER pair the dynamic VBR degrade ladder can create: the
@@ -1977,7 +1979,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                (k == GGML_TYPE_TURBO2_TCQ && v == GGML_TYPE_TURBO1_TCQ) ||
                (k == GGML_TYPE_TURBO1_TCQ && v == GGML_TYPE_TURBO2_TCQ);
     };
-    const bool turbo_fused_asym = turbo_fused_asym_pair(K->type, V->type) && Q->ne[0] == 256;
+    const bool turbo_fused_asym = turbo_fused_asym_pair(K->type, V->type) && Q->ne[0] == 256 &&
+        (t1_fused_ok || (K->type != GGML_TYPE_TURBO1_TCQ && V->type != GGML_TYPE_TURBO1_TCQ));
     // TURBO_FUSED_PREFILL=1 (experiment knob): route BATCHED attention through the fused MMA path
     // (ncols1 instances up to 64 exist). ⚠ MEASURED A LOSS (2026-07-03, 27B/3090, pp512): ~neutral
     // at d0 but −6% (t8/t4) to −11% (t3/t1_tcq) at d8192 — re-decoding the K/V tile once per

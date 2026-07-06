@@ -64,6 +64,7 @@ bool ggml_backend_cuda_vmm_pool_map(ggml_vbr_vmm_pool * pool, size_t off, size_t
     }
     GGML_ASSERT(off + len <= pool->va_size);
     ggml_cuda_set_device(pool->device);
+    bool zeroed = false;
     const size_t g  = pool->gran;
     const size_t c0 = (off / g) * g;
     const size_t c1 = GGML_PAD(off + len, g);
@@ -90,6 +91,13 @@ bool ggml_backend_cuda_vmm_pool_map(ggml_vbr_vmm_pool * pool, size_t off, size_t
         // fresh pages start zeroed: same NaN-in-padding guarantee the eager buffer clear gave
         CUDA_CHECK(cudaMemset((void *) ptr, 0, g));
         pool->chunks.insert(c);
+        zeroed = true;
+    }
+    if (zeroed) {
+        // the memsets ran on the legacy stream; ggml streams are non-blocking, so nothing orders
+        // them against the compute/side streams that write these pages next — settle them here
+        // (rare: only on watermark growth, and the pages are new)
+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
     }
     return true;
 }
@@ -115,6 +123,10 @@ void ggml_backend_cuda_vmm_pool_clear(ggml_vbr_vmm_pool * pool) {
     ggml_cuda_set_device(pool->device);
     for (size_t c : pool->chunks) {
         CUDA_CHECK(cudaMemset((void *)((char *) pool->base + c), 0, pool->gran));
+    }
+    if (!pool->chunks.empty()) {
+        // order the legacy-stream memsets against the non-blocking ggml streams (see pool_map)
+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
     }
 }
 
