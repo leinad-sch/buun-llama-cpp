@@ -163,10 +163,26 @@ common_chat_msg task_result_state::update_chat_msg(
     generated_text += text_added;
     auto msg_prv_copy = chat_msg;
     //SRV_DBG("Parsing chat message: %s\n", generated_text.c_str());
-    auto new_msg = common_chat_parse(
-        generated_text,
-        is_partial,
-        chat_parser_params);
+    common_chat_msg new_msg;
+    try {
+        new_msg = common_chat_parse(
+            generated_text,
+            is_partial,
+            chat_parser_params);
+    } catch (const std::exception & e) {
+        // A parse failure of a malformed generation must never take down the caller: the PEG
+        // parser throws on a FINAL parse it cannot match (and on a partial parse that fails at
+        // position 0), which aborted llama-cli on an uncaught exception and would fail a fully
+        // generated server request. Degrade to the raw text as plain content — and skip the
+        // incremental diff machinery entirely: the raw fallback is not prefix-consistent with
+        // the earlier partial parses, and string_diff throws (by design) on non-prefix updates.
+        SRV_WRN("chat parse failed (%s) — falling back to raw content\n", e.what());
+        chat_msg         = {};
+        chat_msg.role    = "assistant";
+        chat_msg.content = generated_text;
+        chat_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
+        return chat_msg;
+    }
     if (!new_msg.empty()) {
         new_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
         chat_msg = new_msg;
