@@ -1243,9 +1243,11 @@ void vbr_dequant_turbo_to_f32(const char * src, ggml_type src_type, ggml_type ty
     turbo_vanilla_cb_load_fattn();  // vanilla-book override for the transcode dequant kernels
     const dim3 grid((unsigned) n_cells, 1, 1);
     const int iv = is_v ? 1 : 0;
-    // V-mean affine tap: this dequant emits stored-domain (V - mu_V) — the graph restores mu_V at
-    // decode. The transcode re-encode (vbr-transcode.cu) suppresses the encode tap so it does NOT
-    // re-subtract mu, keeping the stored domain intact (no double-subtract). See g_turbo_meansub_suppress.
+    // V-mean affine tap: this dequant emits the source's STORED domain — V - mu_V for the
+    // tapped tiers (t4 and TCQ), FULL-domain for t8 (tap-gated at encode) and F16. The
+    // transcode re-encode (vbr-transcode.cu) suppresses the encode tap exactly when the source
+    // was tapped, so the destination tier always receives its expected domain. See
+    // g_turbo_meansub_suppress.
     // load_tcq_decode_alpha + the natural decode alpha are shared by the TCQ cases (one-shot loader,
     // harmless for non-TCQ; alpha is unused by the turbo4/8 kernels which take no alpha arg).
     load_tcq_decode_alpha(device);

@@ -2728,11 +2728,12 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
                 break;
             }
         }
-        if (type_B == GGML_TYPE_F16) {
-            // promotion CAPS at t8: the transcode dequant emits stored-domain rows (V - mu_V,
-            // K-mean-subtracted) and the f16 decode path never restores the means — promoting
-            // into f16 would serve mean-shifted values. The f16 entry tier returns losslessly
-            // at full reset (metadata-only on an empty cache).
+        if (type_B == GGML_TYPE_F16 || type_B == GGML_TYPE_TURBO8_0) {
+            // promotion CAPS below the tap boundary: sources under t8 store mean-subtracted
+            // rows (V - mu_V), and neither t8 nor f16 decode restores the means (turbo_tap_mu
+            // gates t8 out of the tap; f16 has no add-back) — promoting across the boundary
+            // would serve mean-shifted values. Promotion still operates within the tapped
+            // tiers (t4 <-> t3 <-> t2 <-> t1); the f16 entry returns losslessly at full reset.
             return false;
         }
         const int64_t ne0 = t->ne[0];
@@ -2877,10 +2878,12 @@ bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
             int64_t      stash_rows = 0;
             if (vbr_stash_rows_ > 0) {
                 char * sbase = vbr_stash_ensure(*pp);
-                // capture only from a TURBO recon (stored-domain, taps already applied); an f16
-                // source holds full-domain rows — defer capture to the first turbo hop, which
-                // matches the previous t8-entry fidelity exactly
-                if (e.stash_valid == 0 && ggml_is_turbo_kv_type(t->type)) {
+                // the stash is injected into TAPPED-tier encodes with the tap suppressed, so it
+                // must hold tapped-domain rows (V - mu_V). t8 and f16 store FULL-domain — defer
+                // capture until the source is a tapped tier (t4 or lower); the first tapped hop's
+                // recon is the earliest domain-correct snapshot.
+                if (e.stash_valid == 0 && ggml_is_turbo_kv_type(t->type) &&
+                    t->type != GGML_TYPE_TURBO8_0) {
                     e.stash_valid = (uint32_t) std::min<int64_t>(vbr_stash_rows_, n_cells);
                     pp->be->kv_stash_capture(pp->backend, t, sbase + e.stash_off,
                                                        e.stash_valid, st.is_v != 0);

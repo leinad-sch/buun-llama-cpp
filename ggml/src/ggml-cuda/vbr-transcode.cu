@@ -190,11 +190,15 @@ void ggml_cuda_vbr_kv_transcode(ggml_backend_cuda_context & ctx,
         }
         dstB->data = (char *) dst_B_data + (size_t) c * rB;
 
-        // Encode-tap suppression is SOURCE-dependent: a turbo source's dequant already emits
-        // stored-domain rows (V - mu_V, K-mean-subtracted) so re-applying the tap would double
-        // it; an F16 source (the dynamic entry tier) holds full-domain rows, so the tap must
-        // run. Read on the host during dispatch, so set/reset here is safe.
-        g_turbo_meansub_suppress = ggml_is_turbo_kv_type(src_A->type);
+        // Encode-tap suppression is SOURCE-dependent, keyed on the source's STORED domain:
+        //   tapped tiers (t4 and every TCQ tier) store mean-subtracted rows -> their dequant
+        //     emits V - mu_V / K - mu_K, so the encode tap must NOT re-subtract (suppress);
+        //   t8 (turbo_tap_mu gates it out of the tap; the graph V-restore has the matching
+        //     exclusion) and F16 (the dynamic entry) store FULL-domain rows -> the tap must
+        //     RUN when the destination tier expects mean-subtracted storage.
+        // Read on the host during dispatch, so set/reset here is safe.
+        g_turbo_meansub_suppress = ggml_is_turbo_kv_type(src_A->type) &&
+                                   src_A->type != GGML_TYPE_TURBO8_0;
         ggml_cuda_op_set_rows(ctx, dstB);
         g_turbo_meansub_suppress = false;
     }
