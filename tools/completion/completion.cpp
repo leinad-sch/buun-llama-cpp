@@ -249,8 +249,20 @@ int llama_completion(int argc, char ** argv) {
         LOG_INF("\n");
     }
 
+    if (params.ctx_shift && !llama_memory_can_shift(llama_get_memory(ctx))) {
+        LOG_WRN("%s: context shift is not supported by this KV cache configuration (e.g. dynamic VBR) — disabling; generation stops when the context fills\n", __func__);
+        params.ctx_shift = false;
+    }
+
     std::string path_session = params.path_prompt_cache;
     std::vector<llama_token> session_tokens;
+
+    if (!path_session.empty() && params.vbr_dynamic()) {
+        // session files carry tier-typed attention KV: saves after any degrade are refused at
+        // the lib level and entry-tier saves stop restoring once the cache has degraded
+        LOG_WRN("%s: --prompt-cache is not supported by dynamic VBR (KV tiers change at runtime) — disabling\n", __func__);
+        path_session.clear();
+    }
 
     if (!path_session.empty()) {
         LOG_INF("%s: attempting to load saved session from '%s'\n", __func__, path_session.c_str());

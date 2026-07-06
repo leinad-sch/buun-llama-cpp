@@ -18,7 +18,6 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
-#include <cctype>
 #include <cstddef>
 #include <cstring>
 #include <cinttypes>
@@ -47,17 +46,11 @@ constexpr int HTTP_POLLING_SECONDS = 1;
 // restore/reuse bytes under the wrong tier. Gate them off whenever the controller can arm.
 // (This replaces the old VBR_STAGE2A env gate — Stage2A itself is gone.)
 static bool server_vbr_dynamic_active(const common_params & params) {
-    const bool vbr_enabled =
-        params.vbr_cache_type_k ||
-        params.vbr_cache_type_v ||
-        params.vbr_budget_explicit ||
-        params.vbr_min_bits_explicit ||
-        params.vbr_vram_budget_explicit ||
-        params.vbr_policy_explicit;
-
-    // common_params_postprocess_vbr normalizes vbr_budget (empty -> "dynamic") when VBR is selected
-    return vbr_enabled && (params.vbr_budget == "dynamic" || params.vbr_budget == "auto");
+    return params.vbr_dynamic();
 }
+
+// defined near get_model_info(); shared by the /props and /models responses
+static json server_vbr_meta_json(const server_context_meta * meta);
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
@@ -1319,18 +1312,8 @@ private:
 
         int n_ctx_slot = llama_n_ctx_seq(ctx_tgt);
         if (n_ctx_slot > n_ctx_train) {
-            const bool vbr_enabled =
-                params_base.vbr_cache_type_k ||
-                params_base.vbr_cache_type_v ||
-                params_base.vbr_budget_explicit ||
-                params_base.vbr_min_bits_explicit ||
-                params_base.vbr_vram_budget_explicit;
-            if (vbr_enabled) {
-                SRV_WRN("the VBR slot context (%d) exceeds the training context of the model (%d) - keeping VBR capacity\n", n_ctx_slot, n_ctx_train);
-            } else {
-                SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - capping\n", n_ctx_slot, n_ctx_train);
-                n_ctx_slot = n_ctx_train;
-            }
+            SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - capping\n", n_ctx_slot, n_ctx_train);
+            n_ctx_slot = n_ctx_train;
         }
 
         slots.clear();
@@ -1471,14 +1454,10 @@ private:
         }
 
         if (server_vbr_dynamic_active(params_base)) {
-            // Disabled: both mechanisms serialize/shift the ATTENTION KV, whose tensor tiers flip
+            // Disabled: these mechanisms serialize/shift the ATTENTION KV, whose tensor tiers flip
             // in place at runtime under the dynamic VBR controller (a FLAGS_NONE state restore
             // would land bytes under the wrong tier or past the VMM watermark; cache_reuse needs
             // shifts, and get_can_shift() is false under VMM anyway).
-            // Context checkpoints stay ENABLED: they use LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY,
-            // which the hybrid memory routes to the recurrent state only (attention KV skipped,
-            // see llama_memory_hybrid::state_write) — tier-agnostic, and load-bearing for prompt
-            // caching on hybrid models (the recurrent state cannot rewind without them).
             if (params_base.cache_ram_mib != 0) {
                 params_base.cache_ram_mib = 0;
                 SRV_WRN("%s\n", "prompt cache state storage is not supported by dynamic VBR (KV tiers change at runtime), it will be disabled");
@@ -1486,6 +1465,25 @@ private:
             if (params_base.n_cache_reuse) {
                 params_base.n_cache_reuse = 0;
                 SRV_WRN("%s\n", "cache_reuse is not supported by dynamic VBR (KV tiers change at runtime), it will be disabled");
+            }
+            if (!params_base.slot_save_path.empty()) {
+                // llama_state_seq_save_file carries full tier-typed attention KV: a save taken
+                // after any degrade is refused at the lib level, and even entry-tier saves stop
+                // restoring once the target cache has degraded — predictably off beats flaky
+                params_base.slot_save_path.clear();
+                SRV_WRN("%s\n", "slot save/restore (--slot-save-path) is not supported by dynamic VBR (KV tiers change at runtime), it will be disabled");
+            }
+            // Context checkpoints (PARTIAL_ONLY):
+            //   hybrid models  — routed to the recurrent state only (attention KV skipped, see
+            //     llama_memory_hybrid::state_write): tier-agnostic and load-bearing for prompt
+            //     rewind, so they stay ENABLED;
+            //   iSWA models    — llama_kv_cache_iswa::state_write DOES serialize the SWA
+            //     attention KV under PARTIAL_ONLY; once a tier flips every restore would fail
+            //     (clean fallback, but the checkpoints are dead weight) — disable them.
+            if (params_base.n_ctx_checkpoints > 0 &&
+                llama_model_n_swa(model_tgt) > 0 && !llama_model_is_hybrid(model_tgt)) {
+                params_base.n_ctx_checkpoints = 0;
+                SRV_WRN("%s\n", "context checkpoints are not supported by dynamic VBR on SWA models (the SWA attention KV is part of the checkpoint), they will be disabled");
             }
         }
 
@@ -4668,8 +4666,8 @@ server_context_meta server_context::get_meta() const {
         /* json_ui_settings       */ impl->json_ui_settings,
         /* json_webui_settings    */ impl->json_webui_settings,  // Deprecated
         /* slot_n_ctx             */ impl->get_slot_n_ctx(),
-        /* vbr_enabled            */ impl->params_base.vbr_cache_type_k || impl->params_base.vbr_cache_type_v || impl->params_base.vbr_budget_explicit || impl->params_base.vbr_min_bits_explicit || impl->params_base.vbr_vram_budget_explicit,
-        /* vbr_dynamic            */ (impl->params_base.vbr_cache_type_k || impl->params_base.vbr_cache_type_v || impl->params_base.vbr_budget_explicit || impl->params_base.vbr_min_bits_explicit || impl->params_base.vbr_vram_budget_explicit) && (impl->params_base.vbr_budget == "dynamic" || impl->params_base.vbr_budget == "auto"),
+        /* vbr_enabled            */ impl->params_base.vbr_enabled(),
+        /* vbr_dynamic            */ impl->params_base.vbr_dynamic(),
         /* vbr_type_k             */ impl->params_base.vbr_cache_type_k,
         /* vbr_type_v             */ impl->params_base.vbr_cache_type_v,
         /* vbr_min_bits           */ impl->params_base.vbr_min_bits_value,
@@ -5251,24 +5249,7 @@ void server_routes::init_routes() {
             { "total_slots",                 params.n_parallel },
             { "model_alias",                 meta->model_name },
             { "model_path",                  meta->model_path },
-            { "vbr",                         json {
-                {"enabled",           meta->vbr_enabled},
-                {"dynamic",           meta->vbr_dynamic},
-                {"type_k",            meta->vbr_type_k},
-                {"type_v",            meta->vbr_type_v},
-                {"floor_bpv",         meta->vbr_min_bits},
-                {"requested_floor_bpv", meta->vbr_min_bits},
-                {"capacity_floor_bpv",  meta->vbr_capacity_bits},
-                // realized bits/value is a fixed number only for static schedules; under the
-                // dynamic runtime controller it varies with occupancy — null, not a fiction
-                {"realized_bpv",      meta->vbr_dynamic ? json() : json(meta->vbr_capacity_bits)},
-                {"selected_family",    meta->vbr_selected_family},
-                {"selected_policy",    meta->vbr_selected_policy},
-                {"selected_bpv",       meta->vbr_selected_bpv},
-                {"selected_kld",       meta->vbr_selected_kld},
-                {"selected_schedule",  meta->vbr_selected_schedule},
-                {"vram_budget_bytes", meta->vbr_vram_budget_bytes},
-            } },
+            { "vbr",                         server_vbr_meta_json(meta.get()) },
             { "modalities",                  json {
                 {"vision", meta->has_inp_image},
                 {"audio",  meta->has_inp_audio},
@@ -5771,6 +5752,28 @@ void server_routes::init_routes() {
     };
 }
 
+// the /props and /models "vbr" object — built in ONE place. selected_kld/schedule are
+// static-ladder measurements: null under the dynamic controller (like realized_bpv), not 0.
+static json server_vbr_meta_json(const server_context_meta * meta) {
+    return json {
+        {"enabled",           meta->vbr_enabled},
+        {"dynamic",           meta->vbr_dynamic},
+        {"type_k",            meta->vbr_type_k},
+        {"type_v",            meta->vbr_type_v},
+        {"floor_bpv",         meta->vbr_min_bits},
+        {"capacity_floor_bpv", meta->vbr_capacity_bits},
+        // realized bits/value is a fixed number only for static schedules; under the
+        // dynamic runtime controller it varies with occupancy — null, not a fiction
+        {"realized_bpv",      meta->vbr_dynamic ? json() : json(meta->vbr_capacity_bits)},
+        {"selected_family",   meta->vbr_selected_family},
+        {"selected_policy",   meta->vbr_selected_policy},
+        {"selected_bpv",      meta->vbr_dynamic ? json() : json(meta->vbr_selected_bpv)},
+        {"selected_kld",      meta->vbr_dynamic ? json() : json(meta->vbr_selected_kld)},
+        {"selected_schedule", meta->vbr_dynamic ? json() : json(meta->vbr_selected_schedule)},
+        {"vram_budget_bytes", meta->vbr_vram_budget_bytes},
+    };
+}
+
 json server_routes::get_model_info() const {
     return json {
         {"id",       meta->model_name},
@@ -5784,24 +5787,7 @@ json server_routes::get_model_info() const {
             {"n_vocab",     meta->model_vocab_n_tokens},
             {"n_ctx",       meta->slot_n_ctx},
             {"n_ctx_train", meta->model_n_ctx_train},
-            {"vbr",         {
-                {"enabled",           meta->vbr_enabled},
-                {"dynamic",           meta->vbr_dynamic},
-                {"type_k",            meta->vbr_type_k},
-                {"type_v",            meta->vbr_type_v},
-                {"floor_bpv",         meta->vbr_min_bits},
-                {"requested_floor_bpv", meta->vbr_min_bits},
-                {"capacity_floor_bpv",  meta->vbr_capacity_bits},
-                // realized bits/value is a fixed number only for static schedules; under the
-                // dynamic runtime controller it varies with occupancy — null, not a fiction
-                {"realized_bpv",      meta->vbr_dynamic ? json() : json(meta->vbr_capacity_bits)},
-                {"selected_family",    meta->vbr_selected_family},
-                {"selected_policy",    meta->vbr_selected_policy},
-                {"selected_bpv",       meta->vbr_selected_bpv},
-                {"selected_kld",       meta->vbr_selected_kld},
-                {"selected_schedule",  meta->vbr_selected_schedule},
-                {"vram_budget_bytes", meta->vbr_vram_budget_bytes},
-            }},
+            {"vbr",         server_vbr_meta_json(meta.get())},
             {"n_embd",      meta->model_n_embd_inp},
             {"n_params",    meta->model_n_params},
             {"size",        meta->model_size},
