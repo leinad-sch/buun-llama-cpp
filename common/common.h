@@ -639,6 +639,11 @@ struct common_params {
     // degrading beats destroying another client's re-prefillable cache); 0 = never reclaim;
     // >= 16 = reclaim before any degrade (single-user maximal-quality profile)
     float vbr_reclaim_floor_bpv = 8.125f;
+    // dynamic VBR server policy: when a DEGRADED conversation would keep less than this
+    // fraction of its prompt as reusable prefix anyway, drop the prefix entirely so the
+    // empty-cache lossless reset restores the entry tier (turn-N cache quality = turn-1).
+    // 0 disables the trade.
+    float vbr_reset_keep_frac = 0.25f;
     // canonical predicates — use these instead of re-deriving the flag combinations
     bool vbr_enabled() const {
         return vbr_cache_type_k || vbr_cache_type_v || vbr_budget_explicit ||

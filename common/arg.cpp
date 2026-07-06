@@ -2824,6 +2824,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_VBR_RECLAIM_FLOOR"));
     add_opt(common_arg(
+        {"--vbr-reset-keep-frac"}, "FRAC",
+        "dynamic VBR (server): when a degraded conversation would reuse less than FRAC of its prompt as cached prefix, drop the prefix so the lossless empty-cache reset restores the entry tier for the full re-prefill (default: 0.25; 0 disables)",
+        [](common_params & params, const std::string & value) {
+            params.vbr_reset_keep_frac = std::stof(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_VBR_RESET_KEEP_FRAC"));
+    add_opt(common_arg(
         {"--vbr-policy"}, "PATH",
         "VBR runtime policy ladder JSON or directory; selects the lowest-KLD measured schedule that fits the requested VBR budget/floor (default: auto via VBR_POLICY_LADDER)",
         [](common_params & params, const std::string & value) {

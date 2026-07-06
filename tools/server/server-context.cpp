@@ -962,6 +962,42 @@ private:
         }
     }
 
+    // reset-on-low-LCP (dynamic VBR): tiers are per-tensor and promotion cannot cross the tap
+    // boundary, so the ONLY full-quality recovery is the lossless empty-cache reset. When a
+    // DEGRADED conversation keeps a token-trivial prefix anyway (rolling-window agent
+    // harnesses rewrite mid-context every turn), trade the prefix for the reset: clear the
+    // idle slots (recovery reclaim — deliberately NOT deficit-gated: budget slack is exactly
+    // the state that starves the pressure path, and worthless idle caches are the only
+    // obstacle to recovery that benefits every stream), and if the pool then holds nothing
+    // but this slot's cells, drop n_past to 0 — the full re-prefill re-enters at the entry
+    // tier, so turn-N cache quality equals turn-1. Returns the (possibly zeroed) n_past.
+    int vbr_reset_on_low_lcp(server_slot & slot, int n_past) {
+        if (!server_vbr_dynamic_active(params_base) || params_base.vbr_reset_keep_frac <= 0.0f) {
+            return n_past;
+        }
+        const int n_prompt = slot.task->n_tokens();
+        if (n_prompt <= 0 || (float) n_past >= params_base.vbr_reset_keep_frac * (float) n_prompt) {
+            return n_past;
+        }
+        llama_memory_t mem = llama_get_memory(ctx_tgt);
+        auto st = llama_memory_vbr_state(mem, slot.id, 0);
+        if (st.cursor < 2) {
+            return n_past; // pristine or one transient step — a full re-prefill buys ~nothing
+        }
+        vbr_clear_idle_slots(slot.id, "reset-recovery");
+        st = llama_memory_vbr_state(mem, slot.id, 0);
+        if (st.used_cells_other > 0) {
+            SLT_INF(slot, "vbr reset blocked: %u used cells belong to other sequences (pinned or processing slots)\n",
+                    st.used_cells_other);
+            return n_past;
+        }
+        SLT_WRN(slot, "vbr reset: cursor %d and only %d/%d prompt tokens reusable (< %.2f) — dropping the prefix; "
+                "the full re-prefill re-enters at the entry tier\n",
+                st.cursor, n_past, n_prompt, (double) params_base.vbr_reset_keep_frac);
+        slot.prompt.checkpoints.clear(); // all invalidated by the full clear
+        return 0;
+    }
+
     void recurrent_shrink_for_prefill(const char * reason) {
         if (!recurrent_expanded || !needs_reeval || n_seq_max_full <= n_parallel_user) {
             return;
@@ -3533,6 +3569,11 @@ private:
                                 }
                             }
                         }
+
+                        // dynamic VBR: trade a token-trivial reusable prefix for the lossless
+                        // full reset (n_past -> 0 makes the seq_rm below a full clear; the
+                        // cache empties and the next prepare restores every entry tier)
+                        n_past = vbr_reset_on_low_lcp(slot, n_past);
 
                         // [TAG_PROMPT_LOGITS]
                         if (n_past == slot.task->n_tokens() && n_past > 0) {
