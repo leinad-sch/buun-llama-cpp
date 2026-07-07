@@ -104,6 +104,8 @@
 #define __shfl_up_sync(mask, var, ...)   __shfl_up((var), __VA_ARGS__)
 #define __shfl_down_sync(mask, var, ...) __shfl_down((var), __VA_ARGS__)
 #define __shfl_xor_sync(mask, var, ...)  __shfl_xor((var), __VA_ARGS__)
+#define cudaEventQuery hipEventQuery
+#define cudaMemcpy2D hipMemcpy2D
 #define cudaMemcpy2DAsync hipMemcpy2DAsync
 #define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
 #define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost

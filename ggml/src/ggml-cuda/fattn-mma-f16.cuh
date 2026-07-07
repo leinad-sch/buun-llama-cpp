@@ -2108,7 +2108,9 @@ static __global__ void flash_attn_ext_f16(
 #endif // __CUDA_ARCH__ == GGML_CUDA_CC_TURING
 
 #if defined(AMD_WMMA_AVAILABLE)
-    if (ncols1*ncols2 < 16 || ncols2 == 1 || DKQ > 128) {
+    // Upstream capped RDNA WMMA fattn at DKQ<=128 (PR #22880). Lifted here to try D=256 (gemma4)
+    // on the fused turbo path — the RDNA config table already has D=256 entries.
+    if (ncols1*ncols2 < 16 || ncols2 == 1) {
         NO_DEVICE_CODE;
         return;
     }

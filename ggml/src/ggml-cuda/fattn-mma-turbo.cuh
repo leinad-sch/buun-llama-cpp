@@ -58,24 +58,42 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
         constexpr bool use_logit_softcap = false;
         fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, type_K, type_V>;
 
-#if !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
+#if !defined(GGML_USE_MUSA)
         static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
         if (!shared_memory_limit_raised[id]) {
+#if defined(GGML_USE_HIP)
+            // RDNA/ROCm: a D=256 fused kernel needs >32KB dynamic LDS. It launches fine eagerly,
+            // but HIP graph CAPTURE rejects the launch unless the max-dynamic-shared attribute is
+            // raised first. The static guard runs this once, on the first (eager, pre-capture)
+            // launch. Non-fatal: clear any error if a given ROCm build rejects the attribute.
+            (void) cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total);
+            (void) cudaGetLastError();
+#else
             CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
+#endif
             shared_memory_limit_raised[id] = true;
         }
-#endif // !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
+#endif // !defined(GGML_USE_MUSA)
     } else {
         constexpr bool use_logit_softcap = true;
         fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, type_K, type_V>;
 
-#if !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
+#if !defined(GGML_USE_MUSA)
         static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
         if (!shared_memory_limit_raised[id]) {
+#if defined(GGML_USE_HIP)
+            // RDNA/ROCm: a D=256 fused kernel needs >32KB dynamic LDS. It launches fine eagerly,
+            // but HIP graph CAPTURE rejects the launch unless the max-dynamic-shared attribute is
+            // raised first. The static guard runs this once, on the first (eager, pre-capture)
+            // launch. Non-fatal: clear any error if a given ROCm build rejects the attribute.
+            (void) cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total);
+            (void) cudaGetLastError();
+#else
             CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
+#endif
             shared_memory_limit_raised[id] = true;
         }
-#endif // !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
+#endif // !defined(GGML_USE_MUSA)
     }
 
     // Set TCQ constants in THIS compilation unit's __constant__ memory before kernel launch.
@@ -130,7 +148,19 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
         } else if constexpr (type_V == GGML_TYPE_TURBO1_TCQ) {
             alpha_v = TURBO_TCQ_ALPHA_V_T1;
         }
-        CUDA_CHECK(cudaMemcpyToSymbol(d_tcq_decode_alpha_v_fattn, &alpha_v, sizeof(float)));
+        // Push alpha to this TU's __constant__ ONCE per device, skipping the memcpy on repeat
+        // launches. alpha_v is constant for this template instance, so re-pushing it every call is
+        // redundant — and a synchronous cudaMemcpyToSymbol during CUDA/HIP graph capture is illegal
+        // (ROCm: "operation would make the legacy stream depend on a capturing blocking stream").
+        // The first (eager, pre-capture) launch sets it; captured launches skip. Matches the
+        // static cbN_loaded codebook guards above.
+        static float alpha_v_pushed[GGML_CUDA_MAX_DEVICES];
+        static bool  alpha_v_have  [GGML_CUDA_MAX_DEVICES] = {};
+        if (!alpha_v_have[id] || alpha_v_pushed[id] != alpha_v) {
+            CUDA_CHECK(cudaMemcpyToSymbol(d_tcq_decode_alpha_v_fattn, &alpha_v, sizeof(float)));
+            alpha_v_pushed[id] = alpha_v;
+            alpha_v_have[id]   = true;
+        }
 
         // K alpha: static (default 1.0, env var override)
         static float alpha_k = -1.0f;
@@ -143,7 +173,13 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
                 if (end != s && a > 0.0f && a < 10.0f) alpha_k = a;
             }
         }
-        CUDA_CHECK(cudaMemcpyToSymbol(d_tcq_decode_alpha_k_fattn, &alpha_k, sizeof(float)));
+        static float alpha_k_pushed[GGML_CUDA_MAX_DEVICES];
+        static bool  alpha_k_have  [GGML_CUDA_MAX_DEVICES] = {};
+        if (!alpha_k_have[id] || alpha_k_pushed[id] != alpha_k) {
+            CUDA_CHECK(cudaMemcpyToSymbol(d_tcq_decode_alpha_k_fattn, &alpha_k, sizeof(float)));
+            alpha_k_pushed[id] = alpha_k;
+            alpha_k_have[id]   = true;
+        }
     }
 
     // need_f16_K=false, need_f16_V=false: raw turbo data passes through to kernel.

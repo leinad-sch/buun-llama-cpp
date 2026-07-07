@@ -2016,7 +2016,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     }();
     if (turbo_mma_fused && (turbo_matched || turbo_fused_asym || turbo1_tcq_matched) && (Q->ne[1] <= 4 || turbo_fused_prefill) &&
         (Q->ne[0] == 128 || Q->ne[0] == 256) &&
-        turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+        (turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) ||
+         // AMD RDNA WMMA: trying D=128 AND D=256 (gemma) after lifting the upstream DKQ<=128 cap.
+         amd_wmma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc))) {
         cudaStream_t stream = ctx.stream();
         int device;
         CUDA_CHECK(cudaGetDevice(&device));
@@ -2061,13 +2063,14 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             dst->src[0] = &Q_rot_fused;
         }
 
-        // TCQ decode alpha for V dequant
+        // TCQ decode alpha for V dequant: the FUSED kernel reads the alpha from its own template
+        // instance's __constant__ copy, which ggml_cuda_flash_attn_ext_mma_turbo_case sets (once
+        // per device, from the constant TURBO_TCQ_ALPHA_V_T*). The old per-launch context-adaptive
+        // cudaMemcpyToSymbol here targeted fattn.cu's SEPARATE TU copy — dead for the fused path,
+        // and an unchecked sync memcpy that is illegal during CUDA/HIP graph capture (ROCm latches
+        // it → "previous error during capture"). Keep only the once-guarded env/static setup.
         if (V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ || V->type == GGML_TYPE_TURBO1_TCQ) {
             load_tcq_decode_alpha(device);
-            if (d_tcq_decode_alpha_v_static == 0.0f) {
-                float alpha = tcq_compute_alpha_v(V->type, V->ne[1]);
-                cudaMemcpyToSymbol(d_tcq_decode_alpha_v_fattn, &alpha, sizeof(float));
-            }
         }
 
 #define TURBO_FUSED_DISPATCH(tK, tV) \
@@ -2105,18 +2108,30 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         return;
     }
 
-    if (turbo_kv && !turbo_prefill_vec && Q->ne[1] > 1 && Q->ne[0] <= 256 && turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+    if (turbo_kv && !turbo_prefill_vec && Q->ne[1] > 1 && Q->ne[0] <= 256 &&
+        (turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) ||
+         // AMD RDNA WMMA: trying D=256 prefill too after lifting the upstream DKQ<=128 cap.
+         amd_wmma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc))) {
         // Prefill path: turbo4 K uses inverse FWHT dequant (original domain, no Q rotation),
         // turbo2/3 K uses simple dequant (rotated domain, Q pre-rotated). V un-rotation at graph level.
         ggml_cuda_turbo_prefill_attend(ctx, dst);
     } else {
         load_tcq_decode_alpha(ctx.device);
 
-        // Update VEC __constant__ alpha for context-adaptive mode
-        if (d_tcq_decode_alpha_v_static == 0.0f &&
+        // Update VEC/materialize __constant__ alpha. Context-adaptive alpha would re-push every
+        // token, but a synchronous cudaMemcpyToSymbol during graph capture is illegal (ROCm:
+        // hipErrorStreamCaptureImplicit → the memcpy uses the legacy stream and invalidates the
+        // whole capture). Push ONCE per device on the first (eager, pre-capture) call and freeze —
+        // matching the fused path, which already uses a fixed per-instance alpha, and matching what
+        // graph capture does anyway (the captured graph freezes whatever alpha was set at capture
+        // time). gemma4 ISWA routes some D=256 layers through this branch during graph-captured
+        // decode, so this MUST be capture-safe. (On NVIDIA those layers fuse, so this never fired.)
+        static bool vec_alpha_pushed[GGML_CUDA_MAX_DEVICES] = {};
+        if (d_tcq_decode_alpha_v_static == 0.0f && !vec_alpha_pushed[ctx.device] &&
             (V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ)) {
             float alpha = tcq_compute_alpha_v(V->type, V->ne[1]);
             cudaMemcpyToSymbol(d_tcq_decode_alpha_v_fattn, &alpha, sizeof(float));
+            vec_alpha_pushed[ctx.device] = true;
         }
 
         // Load runtime codebooks for TCQ types (needed by both dequant and native VEC paths)
