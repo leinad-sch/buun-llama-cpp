@@ -551,7 +551,11 @@ void llama_context::sched_reserve() {
         bool have_cuda_gpu = false;
         for (auto & backend : backends) {
             auto * dev = ggml_backend_get_device(backend.get());
-            if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            // Accept integrated GPUs (IGPU) too: APUs like gfx1151 (Strix Halo) register as
+            // IGPU, not discrete GPU — the GPU-only check silently dropped them to the decomposed
+            // GDN path (~13% pp / ~6% tg slower on the qwen35/gemma linear-attn layers).
+            const int gdn_dt = dev ? (int) ggml_backend_dev_type(dev) : (int) GGML_BACKEND_DEVICE_TYPE_CPU;
+            if (dev && (gdn_dt == (int) GGML_BACKEND_DEVICE_TYPE_GPU || gdn_dt == (int) GGML_BACKEND_DEVICE_TYPE_IGPU)) {
                 ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
                 const char * reg_name = ggml_backend_reg_name(reg);
                 if (reg_name && (strncmp(reg_name, "CUDA", 4) == 0 || strncmp(reg_name, "ROCm", 4) == 0)) {
@@ -1439,7 +1443,7 @@ void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
     ggml_backend_t gpu_backend = nullptr;
     for (auto & backend : backends) {
         auto * dev = ggml_backend_get_device(backend.get());
-        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+        if (dev && (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU)) { // accept APU/IGPU (gfx1151 Strix Halo)
             gpu_backend = backend.get();
             break;
         }
@@ -1578,7 +1582,7 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
     ggml_backend_t gpu_backend = nullptr;
     for (auto & backend : backends) {
         auto * dev = ggml_backend_get_device(backend.get());
-        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+        if (dev && (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU)) { // accept APU/IGPU (gfx1151 Strix Halo)
             gpu_backend = backend.get();
             break;
         }
@@ -2273,7 +2277,7 @@ void llama_context::tree_rollback(int commit_n, const int32_t * parents) {
         ggml_backend_t gpu_backend = nullptr;
         for (auto & backend : backends) {
             auto * dev = ggml_backend_get_device(backend.get());
-            if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            if (dev && (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU)) { // accept APU/IGPU (gfx1151 Strix Halo)
                 gpu_backend = backend.get();
                 break;
             }
@@ -5297,7 +5301,7 @@ void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_siz
     ggml_backend_reg_t cuda_reg = nullptr;
     for (auto & backend : backends) {
         auto * dev = ggml_backend_get_device(backend.get());
-        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+        if (dev && (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU)) { // accept APU/IGPU (gfx1151 Strix Halo)
             cuda_reg = ggml_backend_dev_backend_reg(dev);
             break;
         }
