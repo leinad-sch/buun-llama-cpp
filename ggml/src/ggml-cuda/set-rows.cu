@@ -1166,6 +1166,84 @@ static __global__ void k_set_rows_turbo4_coop(
     }
 }
 
+// Cooperative turbo8 KV-write encode (mirror of k_set_rows_turbo4_coop). Same 1-thread-per-block
+// underutilization existed for turbo8 (8-bit VBR top tier / t8:t4 asymmetric). turbo8 has NO
+// affine tap (mean-sub gated off at 8-bit) and no pair-packing (one byte per element). Encode math
+// matches quantize_f32_turbo8_0_block: norm-normalize -> signs1 -> FWHT -> signs2 -> per-block
+// absmax scale -> 8-bit (companded override or uniform grid). The absmax reduction is exact (max is
+// associative); only the norm sum is tree-order (ULP). Falls back to generic when TURBO_EXTRACT armed.
+template<typename idx_t>
+static __global__ void k_set_rows_turbo8_coop(
+        const float * __restrict__ src0, const idx_t * __restrict__ src1,
+        block_turbo8_0 * __restrict__ dst,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02,
+        const int64_t ne11, const int64_t ne12,
+        const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t s10, const int64_t s11, const int64_t s12,
+        const int64_t s1,  const int64_t s2,  const int64_t s3) {
+    const int     tid   = threadIdx.x;
+    const int64_t nbpr  = ne00 / QK_TURBO8;
+    const int64_t g     = blockIdx.x;
+    const int64_t i_blk = g % nbpr;
+    int64_t       t     = g / nbpr;
+    const int64_t i01   = t % ne01; t /= ne01;
+    const int64_t i02   = t % ne02; const int64_t i03 = t / ne02;
+    const int64_t i12   = i03 % ne12;
+    const int64_t i11   = i02 % ne11;
+    const int64_t i10   = i01;
+
+    ggml_cuda_pdl_sync();
+    const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
+    if (dst_row < 0) return;
+
+    const float *    src_row = src0 + i01*s01 + i02*s02 + i03*s03;
+    block_turbo8_0 * blk     = (block_turbo8_0 *)((char *)dst + (dst_row*s1 + i02*s2 + i03*s3)) + i_blk;
+    const int64_t    ch      = i_blk * QK_TURBO8 + tid;
+
+    const float v = src_row[ch];   // no affine tap at 8-bit
+
+    // ||x|| via tree reduction (for normalize)
+    __shared__ float rsm[QK_TURBO8];
+    rsm[tid] = v * v; __syncthreads();
+    #pragma unroll
+    for (int s = QK_TURBO8/2; s > 0; s >>= 1) { if (tid < s) rsm[tid] += rsm[tid + s]; __syncthreads(); }
+    const float norm     = sqrtf(rsm[0]);
+    const float inv_norm = norm > 1e-10f ? 1.0f / norm : 0.0f;
+    __syncthreads();
+
+    // normalize -> signs1 -> FWHT -> inv_sqrt128 -> signs2
+    __shared__ float smem[QK_TURBO8];
+    float xr = ragged_fwht128_butterfly_inplace(v * inv_norm * d_turbo_wht_signs1[tid], smem);
+    xr = xr * 0.08838834764831845f * d_turbo_wht_signs2[tid];
+
+    // per-block absmax (exact: max is associative + commutative)
+    __syncthreads();
+    rsm[tid] = fabsf(xr); __syncthreads();
+    #pragma unroll
+    for (int s = QK_TURBO8/2; s > 0; s >>= 1) { if (tid < s) rsm[tid] = fmaxf(rsm[tid], rsm[tid + s]); __syncthreads(); }
+    const float scale     = rsm[0] > 1e-10f ? rsm[0] : 1e-10f;
+    const float inv_scale = 1.0f / scale;
+
+    // 8-bit quantize: companded book (TURBO_CB_T8) or the stock uniform 256-level grid
+    uint8_t q;
+    if (d_turbo8_cb_override) {
+        const float vv = xr * inv_scale;
+        int idx = 0;
+        #pragma unroll
+        for (int step = 128; step >= 1; step >>= 1) {
+            const int cand = idx + step;
+            if (cand <= 255 && d_turbo_mid_8bit[cand - 1] < vv) idx = cand;
+        }
+        q = (uint8_t)idx;
+    } else {
+        int idx = (int)lrintf(xr * inv_scale * 127.5f + 127.5f);
+        idx = idx < 0 ? 0 : (idx > 255 ? 255 : idx);
+        q = (uint8_t)idx;
+    }
+    blk->qs[tid] = q;
+    if (tid == 0) blk->norm = __float2half(norm * scale);
+}
+
 template<typename src_t, typename idx_t>
 static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const src_t * src0_d = (const src_t *)src0->data;
@@ -1474,10 +1552,23 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                 nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream, mu);
         }
     } else if (dst->type == GGML_TYPE_TURBO8_0) {
-        set_rows_cuda_quant<idx_t, block_turbo8_0, QK_TURBO8, quantize_f32_turbo8_0_block>(
-            src0_d, src1_d, (block_turbo8_0*)dst->data,
-            ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13,
-            nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream, turbo_tap_mu(ctx, dst, ne00));
+        // Fast path: cooperative 128-thread encode (see k_set_rows_turbo8_coop). Falls back to the
+        // generic 1-thread-per-block path when TURBO_EXTRACT post-rotation dumping is armed.
+        static const bool t8_extract = []() { const char * e = getenv("TURBO_EXTRACT"); return e && atoi(e) > 0; }();
+        const int64_t t8_total = (ne00 * ne01 * ne02 * ne03) / QK_TURBO8;
+        if (!t8_extract && (ne00 % QK_TURBO8) == 0 && t8_total > 0) {
+            k_set_rows_turbo8_coop<idx_t><<<(unsigned)t8_total, QK_TURBO8, 0, stream>>>(
+                src0_d, src1_d, (block_turbo8_0 *)dst->data,
+                ne00, ne01, ne02, ne11, ne12,
+                (int64_t)(nb01/sizeof(float)), (int64_t)(nb02/sizeof(float)), (int64_t)(nb03/sizeof(float)),
+                (int64_t)(nb10/sizeof(idx_t)), (int64_t)(nb11/sizeof(idx_t)), (int64_t)(nb12/sizeof(idx_t)),
+                (int64_t)nb1, (int64_t)nb2, (int64_t)nb3);
+        } else {
+            set_rows_cuda_quant<idx_t, block_turbo8_0, QK_TURBO8, quantize_f32_turbo8_0_block>(
+                src0_d, src1_d, (block_turbo8_0*)dst->data,
+                ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13,
+                nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream, turbo_tap_mu(ctx, dst, ne00));
+        }
     } else if (dst->type == GGML_TYPE_TURBO3_TCQ) {
         GGML_ASSERT(ne00 % QK_TURBO3_TCQ == 0);
         const int64_t ne_total_groups = (ne00 * ne01 * ne02 * ne03) / QK_TURBO3_TCQ;
