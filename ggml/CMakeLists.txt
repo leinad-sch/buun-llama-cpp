@@ -215,7 +215,11 @@ set_property(CACHE GGML_CUDA_COMPRESSION_MODE PROPERTY STRINGS "none;speed;balan
 option(GGML_HIP                             "ggml: use HIP"                                   OFF)
 option(GGML_HIP_GRAPHS                      "ggml: use HIP graph"                              ON)
 option(GGML_HIP_RCCL                        "ggml: use ROCm Collective Comm. Library"         OFF)
-option(GGML_HIP_NO_VMM                      "ggml: do not try to use HIP VMM"                 ON)
+# HIP VMM default-ON for our fork: dynamic VBR needs it, and it is validated coherent on the AMD
+# cards we target (gfx1201/RDNA4 9070XT, gfx1151/RDNA3.5) incl. the VMM-backed decode scratch.
+# Upstream defaults this ON (VMM off) for broad HW safety; flip OFF here so AMD gets VMM without
+# the -DGGML_HIP_NO_VMM=OFF flag. Set it ON again for any card where HIP VMM misbehaves.
+option(GGML_HIP_NO_VMM                      "ggml: do not try to use HIP VMM"                 OFF)
 option(GGML_HIP_ROCWMMA_FATTN               "ggml: enable rocWMMA for FlashAttention"         OFF)
 option(GGML_HIP_MMQ_MFMA                    "ggml: enable MFMA MMA for CDNA in MMQ"           ON)
 option(GGML_HIP_EXPORT_METRICS              "ggml: enable kernel perf metrics output"         OFF)

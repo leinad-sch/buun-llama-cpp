@@ -1454,7 +1454,22 @@ static inline void turbo_tcq_load_kv_encode() {
 template<typename idx_t>
 // minBlocks=2: the 128-step Viterbi is __syncthreads-latency-bound; a second resident block
 // per SM hides the sync stalls (pp512 tax vs turbo4 was ~4% with minBlocks=1).
-static __global__ void __launch_bounds__(512, 2) k_set_rows_turbo3_tcq(
+// Viterbi-encode block width. The kernel does 128 sequential s_barrier-synced ACS steps, so the
+// barrier cost scales with waves/block. AMD RDNA (wave32) is barrier-bound here: 512 thr = 16 waves
+// = expensive block barriers; 128 thr = 4 waves = cheap -> +24.5% prefill on gfx1151 (BIT-EXACT,
+// only argmin tie-break differs). NVIDIA is the opposite: the author tuned 512 on a 3090 and 128
+// regresses it (-3.3% pp / -1.7% tg on the Qwen D=128 boxmodel, same-tree A/B 2026-07-08).
+// TODO(gate-axis): the AMD branch is validated only on gfx1151/RDNA3.5. CDNA is wave64 (untested,
+// different barrier math) and discrete RDNA occupancy may differ -> A/B on the RDNA4 9070XT to decide
+// whether to narrow this to RDNA/wave32 (or a runtime warpSize check). See memory project_encode_remap_cuda_gate.
+#ifndef TCQ3_ENC_NT
+#if defined(__HIP_PLATFORM_AMD__) || defined(GGML_USE_HIP)
+#define TCQ3_ENC_NT 128   // AMD RDNA (gfx1151 validated): fewer wave32 waves -> cheaper block barriers
+#else
+#define TCQ3_ENC_NT 512   // NVIDIA: author-tuned optimum (128 regresses on the 3090)
+#endif
+#endif
+static __global__ void __launch_bounds__(TCQ3_ENC_NT) k_set_rows_turbo3_tcq(
         const float * __restrict__ src0, const idx_t * __restrict__ src1,
         block_turbo3_tcq * __restrict__ dst, const int64_t ne_total_groups,
         uint8_t * __restrict__ bt_buf,
@@ -1526,7 +1541,8 @@ static __global__ void __launch_bounds__(512, 2) k_set_rows_turbo3_tcq(
     // Norm reduction
     cost[sid] = (sid < 128) ? x[sid] * x[sid] : 0.0f;
     __syncthreads();
-    for (int stride = 256; stride >= 32; stride >>= 1) {
+    // 128-thread remap: only cost[0..127] hold real values; reduce 128 (start at 64, not 512/256)
+    for (int stride = 64; stride >= 32; stride >>= 1) {
         if (sid < stride) cost[sid] += cost[sid + stride];
         __syncthreads();
     }
@@ -1593,7 +1609,7 @@ static __global__ void __launch_bounds__(512, 2) k_set_rows_turbo3_tcq(
     //     -> 29.8 — the ~6-op shuffle chain sits on the step's critical path and costs more
     //     than the barrier it removes. 512 threads with a 2-warp min phase is the local optimum.
     uint8_t * bt = use_shared_bt ? bt_shared : bt_buf + (int64_t)blockIdx.x * (128 * 64);
-    cost[sid] = 0.0f;
+    for (int s = sid; s < 512; s += TCQ3_ENC_NT) cost[s] = 0.0f;  // 512 states, TCQ3_ENC_NT threads
     __syncthreads();
 
     for (int t = 0; t < 128; t++) {
@@ -1625,19 +1641,27 @@ static __global__ void __launch_bounds__(512, 2) k_set_rows_turbo3_tcq(
         }
         __syncthreads();
 
-        const int pred_idx = sid & 0x3F;
-        float dist = xt - (innerq_is_k ? d_turbo3_tcq_codebook : d_turbo3_tcq_codebook_v)[sid];
-        dist = dist * dist;
-
-        cost_wr[sid] = pred_min_cost[pred_idx] + dist;
+        // 128-thread remap: each thread writes its 512/TCQ3_ENC_NT states (states sharing low-6 bits
+        // = same predecessor min; only the codebook value differs). Bit-exact vs the 512-thread version.
+        const float * cb_enc = innerq_is_k ? d_turbo3_tcq_codebook : d_turbo3_tcq_codebook_v;
+        for (int s = sid; s < 512; s += TCQ3_ENC_NT) {
+            float dist = xt - cb_enc[s];
+            dist = dist * dist;
+            cost_wr[s] = pred_min_cost[s & 0x3F] + dist;
+        }
         __syncthreads();
     }
     // After 128 steps (even count): final costs are in cost[] (step 127 writes to cost)
 
-    // Warp argmin over 512 costs
+    // Warp argmin over 512 costs. 128-thread remap: each thread reduces its states first,
+    // then TCQ3_ENC_NT/32 warp-minima are block-reduced (was 16 warps for 512 threads).
     {
-        float my_cost = cost[sid];
-        int my_idx = sid;
+        float my_cost = 3.4028234663852886e38f;
+        int my_idx = 0;
+        for (int s = sid; s < 512; s += TCQ3_ENC_NT) {
+            float c = cost[s];
+            if (c < my_cost) { my_cost = c; my_idx = s; }
+        }
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
             float other_cost = __shfl_xor_sync(0xFFFFFFFFULL, my_cost, offset);
@@ -1651,8 +1675,9 @@ static __global__ void __launch_bounds__(512, 2) k_set_rows_turbo3_tcq(
     }
     __syncthreads();
     if (sid < 32) {
-        float best = (sid < 16) ? warp_min_cost[sid] : 3.4028234663852886e38f;
-        int best_idx = (sid < 16) ? warp_min_idx[sid] : 0;
+        constexpr int NWARPS = TCQ3_ENC_NT / 32;
+        float best = (sid < NWARPS) ? warp_min_cost[sid] : 3.4028234663852886e38f;
+        int best_idx = (sid < NWARPS) ? warp_min_idx[sid] : 0;
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
             float other_cost = __shfl_down_sync(0xFFFFFFFFULL, best, offset);
@@ -1707,7 +1732,8 @@ static __global__ void __launch_bounds__(512, 2) k_set_rows_turbo3_tcq(
     }
     cost[sid] = my_recon_sq;
     __syncthreads();
-    for (int stride = 256; stride >= 32; stride >>= 1) {
+    // 128-thread remap: reduce the 128 real recon values (start at 64)
+    for (int stride = 64; stride >= 32; stride >>= 1) {
         if (sid < stride) cost[sid] += cost[sid + stride];
         __syncthreads();
     }

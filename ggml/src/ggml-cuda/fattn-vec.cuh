@@ -17,7 +17,11 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
 template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
+#if defined(__HIP_PLATFORM_AMD__) || defined(GGML_USE_HIP)
+__launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 2)   // RDNA: 2nd resident block hides decode stalls (occupancy-bound); NVIDIA keeps 1 (TCQ codebook register pressure would spill at 2)
+#else
 __launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
+#endif
 static __global__ void flash_attn_ext_vec(
         const char * Q_ptr,
         const char * K_ptr,

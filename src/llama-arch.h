@@ -613,6 +613,10 @@ enum llm_tensor {
     LLM_TENSOR_NEXTN_HNORM,
     LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,
     LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,
+    LLM_TENSOR_NEXTN_PROJ_PRE,          // gemma4-assistant: pre_projection [2*backbone -> n_embd]
+    LLM_TENSOR_NEXTN_PROJ_POST,         // gemma4-assistant: post_projection [n_embd -> backbone] (h_next)
+    LLM_TENSOR_MASKED_EMBD_CENTROIDS,   // gemma4-assistant: optional centroid head (v1: not required)
+    LLM_TENSOR_MASKED_EMBD_ORDERING,    // gemma4-assistant: optional centroid ordering (v1: not required)
     LLM_TENSOR_DFLASH_FC,
     LLM_TENSOR_DFLASH_HIDDEN_NORM,
     LLM_TENSOR_MASKED_EMBD_CENTROIDS,

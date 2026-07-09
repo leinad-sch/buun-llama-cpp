@@ -1159,11 +1159,25 @@ static __global__ void k_bf16_to_f16_tkhe(
 static float * q_rot_buf[GGML_CUDA_MAX_DEVICES] = {};
 static size_t  q_rot_buf_size[GGML_CUDA_MAX_DEVICES] = {};
 
-// Persistent K/V fp16 dequant buffers per device (shared between prefill and decode paths)
+// Persistent K/V fp16 dequant buffers per device (shared between prefill and decode paths).
+// These are the cudaMalloc FALLBACK, used only when the device has no VMM support; the primary
+// path backs the scratch with a VMM pool (below) so its deep-context growth never needs a
+// contiguous block — see kv_dequant_scratch().
 static half * kv_dequant_k_buf[GGML_CUDA_MAX_DEVICES] = {};
 static size_t  kv_dequant_k_buf_size[GGML_CUDA_MAX_DEVICES] = {};
 static half * kv_dequant_v_buf[GGML_CUDA_MAX_DEVICES] = {};
 static size_t  kv_dequant_v_buf_size[GGML_CUDA_MAX_DEVICES] = {};
+
+// VMM pools backing the same scratch (primary path). One contiguous VA reservation per
+// (device,side); physical 2 MiB pages are mapped on demand as the attended range grows. Growth
+// needs free PAGES (fungible, non-contiguous), never a contiguous BLOCK, so it cannot fail on
+// fragmentation the way the cudaMalloc grow did (it OOM'd at the final 131072->262144 doubling
+// on a deep context, ~890 MiB fragmented-free but no 500 MiB contiguous span). vmm_va tracks the
+// current VA-reservation size so we only re-reserve (rare, O(log n)) when the need outgrows it.
+static ggml_vbr_vmm_pool * kv_dequant_k_vmm[GGML_CUDA_MAX_DEVICES] = {};
+static ggml_vbr_vmm_pool * kv_dequant_v_vmm[GGML_CUDA_MAX_DEVICES] = {};
+static size_t  kv_dequant_k_vmm_va[GGML_CUDA_MAX_DEVICES] = {};
+static size_t  kv_dequant_v_vmm_va[GGML_CUDA_MAX_DEVICES] = {};
 
 // === FWHT rotation kernels for pre-rotate-queries approach ===
 // Forward rotation on Q before attention (both prefill and decode paths).
@@ -1297,6 +1311,65 @@ void vbr_dequant_turbo_to_f32(const char * src, ggml_type src_type, ggml_type ty
     k_vbr_f16_to_f32_scaled<<<(unsigned) blocks, (unsigned) threads, 0, stream>>>(scratch_f16, dst_f32, n_elem, vscale);
 }
 
+// Round n_kv up so the materialize buffers below grow in O(log n) amortized steps instead of
+// reallocating every ubatch as a conversation's attended range creeps forward.
+static int64_t next_pow2_i64(int64_t x) {
+    int64_t n = 1;
+    while (n < x) {
+        n *= 2;
+    }
+    return n;
+}
+
+// Grow (or first-allocate) one side's f16 dequant scratch to hold >= need_bytes, and return its
+// base device pointer. Primary path: a VMM pool (contiguous VA reserved once, physical 2 MiB
+// pages mapped on demand) — fragmentation cannot fail its growth, and we map to the EXACT
+// attended width so the ~2x pow2 over-allocation the cudaMalloc path carried is handed back to
+// the VBR KV budget as free VRAM. Fallback (no VMM support): plain cudaMalloc, sized to next_pow2
+// to keep reallocs O(log n).
+//
+// Capture safety: this only ever *grows* (maps pages / reallocs) when need_bytes increases, which
+// requires the K/V view ne to change. A ggml CUDA-graph capture begins only after the ne has been
+// unchanged for two consecutive calls (warmup), so every growth lands in an eager (non-capture)
+// pass; during the capture pass need_bytes is stable and map() finds every chunk already mapped,
+// issuing no cuMem*/cudaMalloc under stream capture. This mirrors the invariant the prior
+// cudaMalloc-in-decode path relied on. A VA re-reservation changes the base pointer, but only on a
+// growth (eager) pass, and the graph's per-node src-ne memcmp independently forces a re-capture
+// that bakes in the new pointer, so a replayed graph can never point at a stale reservation.
+static half * kv_dequant_scratch(int device, size_t need_bytes,
+                                 ggml_vbr_vmm_pool ** vmm, size_t * vmm_va,
+                                 half ** cuda_buf, size_t * cuda_size) {
+    if (ggml_backend_cuda_vmm_available(device)) {
+        if (*vmm == nullptr || need_bytes > *vmm_va) {
+            if (*vmm) {
+                ggml_backend_cuda_vmm_pool_free(*vmm);
+                *vmm = nullptr;
+                *vmm_va = 0;
+            }
+            const size_t va = (size_t) next_pow2_i64((int64_t) need_bytes);
+            *vmm = ggml_backend_cuda_vmm_pool_init(device, va);
+            if (*vmm) {
+                *vmm_va = va;
+            }
+        }
+        if (*vmm) {
+            if (!ggml_backend_cuda_vmm_pool_map(*vmm, 0, need_bytes)) {
+                GGML_ABORT("VBR f16 dequant scratch: VMM physical exhausted mapping %.1f MiB on "
+                           "device %d (KV budget under-degraded)", need_bytes / 1048576.0, device);
+            }
+            return (half *) ggml_backend_cuda_vmm_pool_base(*vmm);
+        }
+        // VA reservation failed — fall through to the cudaMalloc path.
+    }
+    const size_t alloc = (size_t) next_pow2_i64((int64_t) need_bytes);
+    if (alloc > *cuda_size) {
+        if (*cuda_buf) CUDA_CHECK(cudaFree(*cuda_buf));
+        CUDA_CHECK(cudaMalloc(cuda_buf, alloc));
+        *cuda_size = alloc;
+    }
+    return *cuda_buf;
+}
+
 static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     load_tcq_decode_alpha(ctx.device);
     cudaStream_t stream = ctx.stream();
@@ -1321,16 +1394,15 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
 
     // Allocate and dequant K to fp16 (turbo2/3/4, q8_0, or bf16)
     if (turbo_k || q8_k || bf16_k) {
-        // Size for full cache (kv_size from root) so we never realloc mid-session.
-        const ggml_tensor * k_root = K;
-        while (k_root->view_src) k_root = k_root->view_src;
-        const size_t k_size = (size_t) ggml_nelements(k_root) * sizeof(half);
-        if (k_size > kv_dequant_k_buf_size[device]) {
-            if (kv_dequant_k_buf[device]) CUDA_CHECK(cudaFree(kv_dequant_k_buf[device]));
-            CUDA_CHECK(cudaMalloc(&kv_dequant_k_buf[device], k_size));
-            kv_dequant_k_buf_size[device] = k_size;
-        }
-        k_fp16 = kv_dequant_k_buf[device];
+        // Size for the CURRENT attended KV range (this call's view), not the full root/padded
+        // capacity: the dequant kernels below and the K_f16 strides further down both index
+        // densely from 0 over exactly K->ne[1]/ne[2]/ne[3] — nothing here depends on where in
+        // the root cache this view sits (front-loading a root-sized allocation starved the VBR
+        // VRAM budget early and used to OOM mid-prefill on deep contexts). The VMM-backed path
+        // maps to this exact width; the cudaMalloc fallback rounds up to next_pow2 internally.
+        const size_t k_size = (size_t) K->ne[0] * (size_t) K->ne[1] * (size_t) K->ne[2] * (size_t) K->ne[3] * sizeof(half);
+        k_fp16 = kv_dequant_scratch(device, k_size, &kv_dequant_k_vmm[device], &kv_dequant_k_vmm_va[device],
+                                    &kv_dequant_k_buf[device], &kv_dequant_k_buf_size[device]);
         dim3 grid_k(K->ne[1], K->ne[2], K->ne[3]);
         if (K->type == GGML_TYPE_TURBO2_0) {
             k_turbo2_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
@@ -1388,16 +1460,11 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
 
     // Allocate and dequant V to fp16 (turbo2/3/4, q8_0, or bf16)
     if (turbo_v || q8_v || bf16_v) {
-        // Size for full cache (kv_size from root) so we never realloc mid-session.
-        const ggml_tensor * v_root = V;
-        while (v_root->view_src) v_root = v_root->view_src;
-        const size_t v_size = (size_t) ggml_nelements(v_root) * sizeof(half);
-        if (v_size > kv_dequant_v_buf_size[device]) {
-            if (kv_dequant_v_buf[device]) CUDA_CHECK(cudaFree(kv_dequant_v_buf[device]));
-            CUDA_CHECK(cudaMalloc(&kv_dequant_v_buf[device], v_size));
-            kv_dequant_v_buf_size[device] = v_size;
-        }
-        v_fp16 = kv_dequant_v_buf[device];
+        // Size for the CURRENT attended KV range (this call's view) — see the matching comment
+        // on the K-side buffer above for why root-sizing was wrong and how the scratch is backed.
+        const size_t v_size = (size_t) V->ne[0] * (size_t) V->ne[1] * (size_t) V->ne[2] * (size_t) V->ne[3] * sizeof(half);
+        v_fp16 = kv_dequant_scratch(device, v_size, &kv_dequant_v_vmm[device], &kv_dequant_v_vmm_va[device],
+                                    &kv_dequant_v_buf[device], &kv_dequant_v_buf_size[device]);
         dim3 grid_v(V->ne[1], V->ne[2], V->ne[3]);
         if (V->type == GGML_TYPE_TURBO2_0) {
             k_turbo2_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
@@ -2238,21 +2305,23 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             const bool k_needs_dequant = turbo_k_only || ((K->type == GGML_TYPE_Q8_0 || K->type == GGML_TYPE_BF16) && (Q->ne[0] > 256 || turbo_v_only));
             const bool v_needs_dequant = turbo_v_only || ((V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_BF16) && (Q->ne[0] > 256 || turbo_k_only));
             if (k_needs_dequant) {
-                // Size the dequant buffer for the FULL cache (kv_size from the underlying root
-                // tensor), not just the current n_kv. This prevents per-token reallocations as
-                // the cache fills, which would invalidate any in-flight CUDA graph capture
-                // pointing at the old device pointer (defensive against PR #21635-class bugs).
-                // The first call sizes the buffer for the worst-case cache; subsequent calls
-                // (including layers with smaller caches) reuse the same allocation.
-                const ggml_tensor * k_root = K;
-                while (k_root->view_src) k_root = k_root->view_src;
-                const size_t k_max_bytes = (size_t) ggml_nelements(k_root) * sizeof(half);
-                if (k_max_bytes > kv_dequant_k_buf_size[device_dec]) {
-                    if (kv_dequant_k_buf[device_dec]) CUDA_CHECK(cudaFree(kv_dequant_k_buf[device_dec]));
-                    CUDA_CHECK(cudaMalloc(&kv_dequant_k_buf[device_dec], k_max_bytes));
-                    kv_dequant_k_buf_size[device_dec] = k_max_bytes;
-                }
-                k_fp16_dec = kv_dequant_k_buf[device_dec];
+                // Size for the CURRENT attended KV range (this call's view) — NOT the full
+                // root/kv_size capacity. The dequant kernel below writes exactly K->ne[1] rows and
+                // the K_f16_dec strides index densely over ne[1]/ne[2]/ne[3], so nothing here needs
+                // the root capacity. Root-sizing (the old behaviour) materialized the full advertised
+                // kv_size to f16 during decode, which under dynamic VBR starves the KV VRAM budget as
+                // layers degrade and n_kv grows.
+                //
+                // This is the OOM site the VMM-backed scratch fixes: the prior cudaMalloc grow needed
+                // a contiguous ~500 MiB block at the final 131072->262144 doubling, which fragmented
+                // free VRAM could not satisfy. kv_dequant_scratch() maps non-contiguous physical pages
+                // into a pre-reserved VA range instead, so growth can never fail on fragmentation, and
+                // it maps to this exact width (not next_pow2) so the slack returns to the KV budget.
+                // See kv_dequant_scratch() for the graph-capture-safety argument (growth only ever
+                // happens in an eager pass; the capture pass sees a stable, already-mapped size).
+                const size_t k_max_bytes = (size_t) K->ne[0] * (size_t) K->ne[1] * (size_t) K->ne[2] * (size_t) K->ne[3] * sizeof(half);
+                k_fp16_dec = kv_dequant_scratch(device_dec, k_max_bytes, &kv_dequant_k_vmm[device_dec], &kv_dequant_k_vmm_va[device_dec],
+                                                &kv_dequant_k_buf[device_dec], &kv_dequant_k_buf_size[device_dec]);
                 // K dequant to fp16 in ORIGINAL (unrotated) domain via inverse FWHT.
                 // All turbo K types use inv-FWHT kernels so K matches native f16/q8_0 layout
                 // and Q stays unrotated. This mirrors the prefill path's encode→decode chain
@@ -2320,16 +2389,13 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 dst->src[1] = &K_f16_dec;
             }
             if (v_needs_dequant) {
-                // Same kv_size-based sizing as K above — see comment there.
-                const ggml_tensor * v_root = V;
-                while (v_root->view_src) v_root = v_root->view_src;
-                const size_t v_max_bytes = (size_t) ggml_nelements(v_root) * sizeof(half);
-                if (v_max_bytes > kv_dequant_v_buf_size[device_dec]) {
-                    if (kv_dequant_v_buf[device_dec]) CUDA_CHECK(cudaFree(kv_dequant_v_buf[device_dec]));
-                    CUDA_CHECK(cudaMalloc(&kv_dequant_v_buf[device_dec], v_max_bytes));
-                    kv_dequant_v_buf_size[device_dec] = v_max_bytes;
-                }
-                v_fp16_dec = kv_dequant_v_buf[device_dec];
+                // Same exact-width, VMM-backed sizing as K above — see kv_dequant_scratch() for why
+                // root/kv_size sizing was wrong and why growth is fragmentation-proof and capture-safe.
+                // This V grow is the exact call (fattn.cu cudaMalloc of kv_dequant_v_buf) that OOM'd at
+                // the 131072->262144 doubling; it now maps pages into pre-reserved VA instead.
+                const size_t v_max_bytes = (size_t) V->ne[0] * (size_t) V->ne[1] * (size_t) V->ne[2] * (size_t) V->ne[3] * sizeof(half);
+                v_fp16_dec = kv_dequant_scratch(device_dec, v_max_bytes, &kv_dequant_v_vmm[device_dec], &kv_dequant_v_vmm_va[device_dec],
+                                                &kv_dequant_v_buf[device_dec], &kv_dequant_v_buf_size[device_dec]);
                 // V dequant to fp16. All turbo V stays in rotated domain — the graph-level
                 // ggml_turbo_wht inverse op (added in build_attn) un-rotates the attention output.
                 dim3 grid_v(V->ne[1], V->ne[2], V->ne[3]);
