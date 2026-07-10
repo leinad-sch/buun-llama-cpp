@@ -578,6 +578,17 @@ struct llama_model_dflash_draft : public llama_model_base {
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
+struct llm_build_gemma4_dflash_draft : public llm_graph_context {
+    llm_build_gemma4_dflash_draft(const llama_model & model, const llm_graph_params & params);
+};
+
+struct llama_model_gemma4_dflash_draft : public llama_model_base {
+    llama_model_gemma4_dflash_draft(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
 
 struct llama_model_qwen3vlmoe : public llama_model_base {
     llama_model_qwen3vlmoe(const struct llama_model_params & params) : llama_model_base(params) {}

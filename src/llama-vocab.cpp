@@ -1909,7 +1909,16 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
 
     // determine vocab type
     {
-        ml.get_key(LLM_KV_TOKENIZER_MODEL, tokenizer_model);
+        // DFlash drafters share the target model's vocab and ship without their own
+        // tokenizer. Tolerate a missing tokenizer.ggml.model for those archs — an
+        // empty model name falls through to the no_vocab path below (which reads
+        // vocab_size and installs dummy tokens). All other archs still require it.
+        const bool vocab_required = kv.arch != LLM_ARCH_DFLASH_DRAFT &&
+                                    kv.arch != LLM_ARCH_GEMMA4_DFLASH_DRAFT;
+        ml.get_key(LLM_KV_TOKENIZER_MODEL, tokenizer_model, vocab_required);
+        if (tokenizer_model.empty()) {
+            tokenizer_model = "none";
+        }
         ml.get_key(LLM_KV_TOKENIZER_PRE,   tokenizer_pre, false);
 
         ml.get_key(LLM_KV_TOKENIZER_TOKEN_TYPE_COUNT, n_token_types, false);

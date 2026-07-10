@@ -139,6 +139,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_MAINCODER,        "maincoder"        },
     { LLM_ARCH_KIMI_LINEAR,      "kimi-linear"      },
 	    { LLM_ARCH_DFLASH_DRAFT,     "dflash-draft"     },
+    { LLM_ARCH_GEMMA4_DFLASH_DRAFT, "gemma4-dflash-draft" },
     { LLM_ARCH_TALKIE,           "talkie"           },
     { LLM_ARCH_MELLUM,           "mellum"           },
     { LLM_ARCH_UNKNOWN,          "(unknown)"        },
@@ -505,6 +506,8 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,                 "blk.%d.nextn.shared_head_norm" },
     { LLM_TENSOR_DFLASH_FC,                              "dflash_fc" },
     { LLM_TENSOR_DFLASH_HIDDEN_NORM,                     "dflash_hidden_norm" },
+    { LLM_TENSOR_GEMMA4_DFLASH_FC,                       "dflash.fc" },
+    { LLM_TENSOR_GEMMA4_DFLASH_HIDDEN_NORM,              "dflash.hidden_norm" },
     { LLM_TENSOR_ATTN_SUB_NORM,                          "blk.%d.attn_sub_norm" },
     { LLM_TENSOR_FFN_SUB_NORM,                           "blk.%d.ffn_sub_norm" },
     { LLM_TENSOR_DEC_OUTPUT_NORM,                        "dec.output_norm" },
@@ -860,6 +863,8 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     // DFlash drafter
     {LLM_TENSOR_DFLASH_FC,                  {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL_MAT}},
     {LLM_TENSOR_DFLASH_HIDDEN_NORM,         {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL}},
+    {LLM_TENSOR_GEMMA4_DFLASH_FC,           {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_GEMMA4_DFLASH_HIDDEN_NORM,  {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL}},
     {LLM_TENSOR_MASKED_EMBD_CENTROIDS,      {LLM_TENSOR_LAYER_INPUT,     GGML_OP_NONE}},
     {LLM_TENSOR_MASKED_EMBD_ORDERING,       {LLM_TENSOR_LAYER_INPUT,     GGML_OP_NONE}},
     // eagle3

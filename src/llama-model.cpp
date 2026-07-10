@@ -305,6 +305,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_step35(params);
         case LLM_ARCH_DFLASH_DRAFT:
             return new llama_model_dflash_draft(params);
+        case LLM_ARCH_GEMMA4_DFLASH_DRAFT:
+            return new llama_model_gemma4_dflash_draft(params);
         default:
             throw std::runtime_error(std::string("unsupported model architecture: '") + llm_arch_name(arch) + "'");
     }
@@ -2085,6 +2087,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         case LLM_ARCH_LLADA_MOE:
         case LLM_ARCH_RND1:
         case LLM_ARCH_DFLASH_DRAFT:
+        case LLM_ARCH_GEMMA4_DFLASH_DRAFT:
             {
                 res = nullptr;
             } break;
@@ -2585,6 +2588,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_MIMO2:
         case LLM_ARCH_STEP35:
         case LLM_ARCH_DFLASH_DRAFT:
+        case LLM_ARCH_GEMMA4_DFLASH_DRAFT:
         case LLM_ARCH_TALKIE:
         case LLM_ARCH_MELLUM:
         case LLM_ARCH_DFLASH:
