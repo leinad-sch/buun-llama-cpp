@@ -6,16 +6,16 @@
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// gemma4-dflash-draft — a DFlash speculative-decoding drafter that mimics
-// Gemma 4. Structurally identical to the generic `dflash-draft` KV-injection
-// graph, but grafted with Gemma 4's numerical conventions:
-//   1. pre-FFN norm is `ffn_norm` (this draft has no attn_post_norm)
-//   2. BF16-rounded sqrt(n_embd) embedding scale
-//   3. attention softmax scale = 1.0 (hparams.f_attention_scale), not 1/sqrt(d)
-//   4. FFN activation = GELU (not SILU)
-//   5. final logit softcapping (tanh, cap = 30)
-//   6. QK-norm + RoPE (freq_base = 1e6) preserved
-// The tied token_embd / output are shared from the target model at runtime.
+// gemma4-dflash-draft — a DFlash speculative-decoding drafter for Gemma-4 TARGETS.
+// The drafter's OWN architecture is Qwen3, NOT Gemma-4: z-lab's DFlashDraftModel subclasses
+// Qwen3 (Qwen3RMSNorm, Qwen3MLP/SiLU, 1/sqrt(head_dim) attn scale, raw embeddings). "gemma-4"
+// refers only to the target it drafts FOR — it reads the gemma target's hidden states (fc
+// fusion), shares the target's tied token_embd/output at runtime, and applies the target's
+// final logit softcapping (tanh, cap = 30). Otherwise it is the generic `dflash-draft`
+// KV-injection graph. It carries only ONE gemma-specific graph graft:
+//   1. final logit softcapping (tanh, cap = 30) — from the drafter's config
+// (Qwen3 conventions kept: SiLU FFN, 1/sqrt(head_dim) attn scale, raw embed, QK-norm,
+// pre-FFN `ffn_norm`, RoPE freq_base=1e6.)
 // Tensor names use the dot form (`dflash.fc`, `dflash.hidden_norm`) and the
 // fusion width is derived from the #concatenated target layers × n_embd, since
 // the Lucebox GGUF omits `.dflash.n_target_features`.
@@ -50,18 +50,15 @@ void llama_model_gemma4_dflash_draft::load_arch_hparams(llama_model_loader & ml)
         hparams.dflash_n_target_features = (uint32_t) fc->ne[0];
     }
 
-    // Gemma 4 conventions.
-    hparams.f_attention_scale = 1.0f; // self.scaling = 1.0 (no 1/sqrt(d) softmax scale)
+    // Gemma-4 target: final logit softcapping (the drafter's one gemma-specific graft).
     ml.get_key(LLM_KV_FINAL_LOGIT_SOFTCAPPING, hparams.f_final_logit_softcapping, false);
 
-    // Sliding-window attention. Gemma uses a 6-layer (5 sliding : 1 full) pattern;
-    // with only 5 draft layers every layer is sliding. The GGUF carries the window
-    // but no per-layer pattern array, so emulate the Gemma pattern here.
-    ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false);
-    if (hparams.n_swa > 0) {
-        hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
-        hparams.set_swa_pattern(6);
-    }
+    // SWA disabled: the drafter's KV-injection SWA mask is buggy — enabling it drops draft
+    // acceptance even at short context, where a 2048 window should be a no-op. z-lab's drafter
+    // does declare a sliding window, so this is a validated workaround (+~7pp), not the final
+    // answer; the per-slot cross+noise SWA mask needs a proper fix before re-enabling.
+    hparams.n_swa = 0;
+    hparams.swa_type = LLAMA_SWA_TYPE_NONE;
 }
 
 void llama_model_gemma4_dflash_draft::load_arch_tensors(llama_model_loader & ml) {
@@ -417,17 +414,14 @@ llm_build_gemma4_dflash_draft::llm_build_gemma4_dflash_draft(
 
     res->add_input(std::move(inp_dflash));
 
-    // --- Embedding (Gemma 4: BF16-rounded sqrt(n_embd) scale) ---
+    // --- Embedding: raw, like Qwen3 / the generic dflash-draft graph (no gemma sqrt(n_embd)
+    //     scale, no bf16 round-trip — the drafter is Qwen3-arch). ---
     ggml_tensor * tok_embd_use = model.tok_embd;
     if (!tok_embd_use) {
         tok_embd_use = ggml_new_tensor_2d(ctx0, GGML_TYPE_Q4_0, n_embd, model.vocab.n_tokens());
     }
     ggml_tensor * inpL = build_inp_embd(tok_embd_use);
-
-    inpL = ggml_cast(ctx0, inpL, GGML_TYPE_BF16);
-    inpL = ggml_scale(ctx0, inpL, ubatch.token ? ggml_bf16_to_fp32(ggml_fp32_to_bf16(sqrtf(n_embd))) : 1.0f);
-    inpL = ggml_cast(ctx0, inpL, GGML_TYPE_F32);
-    cb(inpL, "inp_scaled", -1);
+    cb(inpL, "inp_embd", -1);
 
     ggml_tensor * inp_pos = build_inp_pos();
 
@@ -489,9 +483,9 @@ llm_build_gemma4_dflash_draft::llm_build_gemma4_dflash_draft(
             ggml_build_forward_expand(gf, Kcur);
             ggml_build_forward_expand(gf, Vcur);
 
-            // Gemma 4: softmax scale = 1.0 (hparams.f_attention_scale), not 1/sqrt(d)
+            // z-lab drafter is Qwen3-arch: standard softmax scale = 1/sqrt(head_dim), not gemma's 1.0
             cur = build_attn_mha(Qcur, Kcur, Vcur, nullptr, kq_mask, nullptr, nullptr,
-                                 hparams.f_attention_scale, il);
+                                 1.0f/sqrtf((float) hparams.n_embd_head_k(il)), il);
             cb(cur, "kqv_out", il);
 
             cur = build_lora_mm(model.layers[il].wo, cur);
@@ -506,12 +500,12 @@ llm_build_gemma4_dflash_draft::llm_build_gemma4_dflash_draft(
         cur = build_norm(cur, model.layers[il].ffn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
-        // Gemma 4 GELU FFN
+        // z-lab drafter uses Qwen3MLP -> SiLU (SwiGLU), not gemma's GELU
         cur = build_ffn(cur,
             model.layers[il].ffn_up,   nullptr, nullptr,
             model.layers[il].ffn_gate, nullptr, nullptr,
             model.layers[il].ffn_down, nullptr, nullptr,
-            nullptr, LLM_FFN_GELU, LLM_FFN_PAR, il);
+            nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
         cb(cur, "ffn_out", il);
 
         cur = ggml_add(ctx0, cur, ffn_residual);

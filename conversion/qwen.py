@@ -631,6 +631,19 @@ class Qwen3_5MoeTextModel(_Qwen35MtpMixin, _Qwen35MRopeMixin, _LinearAttentionVR
 class DFlashModel(Qwen3Model):
     model_arch = gguf.MODEL_ARCH.DFLASH
 
+    def __init__(self, *args, **kwargs):
+        # z-lab's gemma4 DFlash drafters reuse the "DFlashDraftModel" HF arch and
+        # qwen3 model_type, but ship final_logit_softcapping. That flips the export
+        # to the gemma4-dflash-draft arch (dot-form dflash tensors, ffn_norm pre-ffn,
+        # logit softcap) that the gemma4 drafter loader reads. Qwen DFlash stays `dflash`.
+        hparams = kwargs.get("hparams")
+        if hparams is None:
+            dir_model = args[0] if args else kwargs["dir_model"]
+            hparams = ModelBase.load_hparams(dir_model, False)
+        if hparams.get("final_logit_softcapping") is not None:
+            self.model_arch = gguf.MODEL_ARCH.GEMMA4_DFLASH_DRAFT
+        super().__init__(*args, **kwargs)
+
     def set_vocab(self):
         if self.target_model_dir is None:
             raise ValueError(
@@ -666,6 +679,27 @@ class DFlashModel(Qwen3Model):
             is_swa = [lt == "sliding_attention" for lt in layer_types]
             self.gguf_writer.add_sliding_window(sliding_window)
             self.gguf_writer.add_sliding_window_pattern(is_swa)
+
+        # gemma4 DFlash: the loader reads the drafter's dflash config under the
+        # arch-prefixed ".dflash." keys (block_size > 0 is what makes the runtime
+        # detect it as a DFlash drafter). The generic add_block_size/add_target_layers
+        # above write different key names, so emit the exact ones the loader reads.
+        # Plus final logit softcapping (tanh cap = 30), a gemma4 graph graft.
+        if self.model_arch == gguf.MODEL_ARCH.GEMMA4_DFLASH_DRAFT:
+            arch = self.gguf_writer.arch
+            self.gguf_writer.add_uint32(f"{arch}.dflash.block_size", block_size)
+            mask_token_id = dflash_config.get("mask_token_id")
+            if mask_token_id is not None:
+                self.gguf_writer.add_uint32(f"{arch}.dflash.mask_token_id", mask_token_id)
+            if target_layer_ids:
+                # gemma4 loader reads these RAW (z-lab config verbatim, as Lucebox's GGUF stores them),
+                # unlike the qwen `dflash-draft` loader which expects the +1 `extract_layer_ids`.
+                self.gguf_writer.add_key_value(
+                    f"{arch}.dflash.target_layer_ids", target_layer_ids,
+                    gguf.GGUFValueType.ARRAY, gguf.GGUFValueType.UINT32)
+            softcap = self.hparams.get("final_logit_softcapping")
+            if softcap is not None:
+                self.gguf_writer.add_final_logit_softcapping(softcap)
 
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:

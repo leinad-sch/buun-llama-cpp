@@ -538,6 +538,7 @@ class MODEL_ARCH(IntEnum):
     MAINCODER        = auto()
     KIMI_LINEAR      = auto()
     DFLASH_DRAFT     = auto()
+    GEMMA4_DFLASH_DRAFT = auto()
     TALKIE           = auto()
     MELLUM           = auto()
 
@@ -872,6 +873,8 @@ class MODEL_TENSOR(IntEnum):
     V_ENC_EMBD_VSEP      = auto() # Deepseek-OCR
     DFLASH_FC            = auto() # DFlash drafter fusion
     DFLASH_HIDDEN_NORM   = auto() # DFlash drafter fusion norm
+    GEMMA4_DFLASH_FC          = auto() # gemma4 DFlash drafter fusion (dot-form name)
+    GEMMA4_DFLASH_HIDDEN_NORM = auto() # gemma4 DFlash drafter fusion norm (dot-form name)
     V_RESMPL_QUERY_768   = auto() # Deepseek-OCR-2
     V_RESMPL_QUERY_1024  = auto() # Deepseek-OCR-2
 
@@ -1122,6 +1125,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.MAINCODER:        "maincoder",
     MODEL_ARCH.KIMI_LINEAR:      "kimi-linear",
   MODEL_ARCH.DFLASH_DRAFT:     "dflash-draft",
+  MODEL_ARCH.GEMMA4_DFLASH_DRAFT: "gemma4-dflash-draft",
     MODEL_ARCH.TALKIE:           "talkie",
     MODEL_ARCH.MELLUM:           "mellum",
 }
@@ -1564,6 +1568,8 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM:    "blk.{bid}.nextn.shared_head_norm",
     MODEL_TENSOR.DFLASH_FC:                 "dflash_fc",
     MODEL_TENSOR.DFLASH_HIDDEN_NORM:        "dflash_hidden_norm",
+    MODEL_TENSOR.GEMMA4_DFLASH_FC:          "dflash.fc",
+    MODEL_TENSOR.GEMMA4_DFLASH_HIDDEN_NORM: "dflash.hidden_norm",
     MODEL_TENSOR.FC:                        "fc",
     MODEL_TENSOR.D2T:                       "d2t",
 }
@@ -4406,6 +4412,24 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_UP,
         MODEL_TENSOR.DFLASH_FC,
         MODEL_TENSOR.DFLASH_HIDDEN_NORM,
+    ],
+    MODEL_ARCH.GEMMA4_DFLASH_DRAFT: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_Q_NORM,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_K_NORM,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.GEMMA4_DFLASH_FC,
+        MODEL_TENSOR.GEMMA4_DFLASH_HIDDEN_NORM,
     ],
     MODEL_ARCH.MELLUM: [
         MODEL_TENSOR.TOKEN_EMBD,

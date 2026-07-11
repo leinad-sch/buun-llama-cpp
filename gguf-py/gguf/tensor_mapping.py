@@ -185,6 +185,14 @@ class TensorNameMap:
         MODEL_TENSOR.DFLASH_HIDDEN_NORM: (
             "hidden_norm",         # dflash drafter
         ),
+        MODEL_TENSOR.GEMMA4_DFLASH_FC: (
+            "fc",                  # gemma4 dflash drafter (dot-form GGUF name)
+            "model.fc",
+        ),
+        MODEL_TENSOR.GEMMA4_DFLASH_HIDDEN_NORM: (
+            "hidden_norm",         # gemma4 dflash drafter (dot-form GGUF name)
+            "model.hidden_norm",
+        ),
     }
 
     block_mappings_cfg: dict[MODEL_TENSOR, tuple[str, ...]] = {
