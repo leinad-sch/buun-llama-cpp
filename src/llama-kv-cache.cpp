@@ -626,9 +626,15 @@ llama_kv_cache::llama_kv_cache(
         v_heads[s] = 0;
     }
 
-    v_cells.resize(n_stream);
-    for (uint32_t s = 0; s < n_stream; ++s) {
-        v_cells[s].resize(kv_size);
+    // shared cells ([TAG_KV_CACHE_SHARE_CELLS]) adopt the source cache's stream layout —
+    // resizing here would shrink the source's streams when the two caches disagree on n_stream
+    if (!other) {
+        v_cells.resize(n_stream);
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            v_cells[s].resize(kv_size);
+        }
+    } else {
+        GGML_ASSERT(v_cells.size() >= n_stream);
     }
 
     // by default, all sequence ids are mapped to the 0th stream
