@@ -929,6 +929,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
+    int32_t         target_layer_ids_buf[8] = {}; // backing store for fork-arch drafters
 
     // scratch buffer for concatenated target features [n_tokens, n_embd_enc]
     std::vector<float> features_buf;
@@ -946,6 +947,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         target_layer_ids   = llama_model_target_layer_ids  (model_dft);
         target_layer_ids_n = llama_model_target_layer_ids_n(model_dft);
+        if (target_layer_ids_n == 0) {
+            // fork drafter archs (dflash-draft, gemma4-dflash-draft) publish their layer ids
+            // via hparams (%s.dflash.target_layer_ids), not the upstream model vector
+            // (%s.target_layers) that eagle3/upstream-dflash fill — read the fork plumbing too
+            int32_t n = llama_model_dflash_target_layer_ids(model_dft, target_layer_ids_buf,
+                    (int32_t) (sizeof(target_layer_ids_buf) / sizeof(target_layer_ids_buf[0])));
+            if (n > 0) {
+                target_layer_ids   = target_layer_ids_buf;
+                target_layer_ids_n = (uint32_t) n;
+            }
+        }
         GGML_ASSERT(target_layer_ids_n > 0 && "DFlash model has no target_layer_ids");
 
         n_embd_tgt    = llama_model_n_embd(model_tgt);
