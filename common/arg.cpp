@@ -118,6 +118,11 @@ common_arg & common_arg::set_preset_only() {
     return *this;
 }
 
+common_arg & common_arg::set_hidden() {
+    is_hidden = true;
+    return *this;
+}
+
 bool common_arg::in_example(enum llama_example ex) {
     return examples.find(ex) != examples.end();
 }
@@ -1449,6 +1454,9 @@ static void common_params_print_usage(common_params_context & ctx_arg) {
     std::vector<common_arg *> spec_options;
     std::vector<common_arg *> specific_options;
     for (auto & opt : ctx_arg.options) {
+        if (opt.is_hidden) {
+            continue;
+        }
         // in case multiple LLAMA_EXAMPLE_* are set, we prioritize the LLAMA_EXAMPLE_* matching current example
         if (opt.is_sampling) {
             sampling_options.push_back(&opt);
@@ -1482,6 +1490,9 @@ static void common_params_print_completion(common_params_context & ctx_arg) {
     std::vector<common_arg *> specific_options;
 
     for (auto & opt : ctx_arg.options) {
+        if (opt.is_hidden) {
+            continue;
+        }
         if (opt.is_sampling) {
             sampling_options.push_back(&opt);
         } else if (opt.is_spec) {
@@ -2954,7 +2965,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.vbr_budget = value;
             params.vbr_budget_explicit = true;
         }
-    ).set_env("LLAMA_ARG_VBR_BUDGET"));
+    ).set_env("LLAMA_ARG_VBR_BUDGET").set_hidden());
     add_opt(common_arg(
         {"--vbr-floor", "--vbr-min-bits"}, "BITS",
         "aggregate VBR bits/value floor; accepts decimal bits or tier aliases f16, t8, t4, t3, t2, t1. Dynamic mode enforces it LITERALLY: the degrade order stops at the last step whose aggregate stays at or above the floor (e.g. 4.25 = t4 layout with a few units held a tier higher), and the advertised context capacity is computed at this floor (default: t1 = 1.25)",
@@ -2992,7 +3003,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.vbr_policy = value;
             params.vbr_policy_explicit = true;
         }
-    ).set_env("LLAMA_ARG_VBR_POLICY"));
+    ).set_env("LLAMA_ARG_VBR_POLICY").set_hidden());
     add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",
