@@ -1158,16 +1158,22 @@ static __global__ void k_bf16_to_f16_tkhe(
 // Persistent Q rotation buffer per device (shared between prefill and decode paths)
 static float * q_rot_buf[GGML_CUDA_MAX_DEVICES] = {};
 static size_t  q_rot_buf_size[GGML_CUDA_MAX_DEVICES] = {};
-// Bumped every time q_rot_buf[device] is (re)allocated to a new address. The buffer's address is
-// not part of any ggml_tensor node's src[], so CUDA-graph-capture reuse (ggml-cuda.cu) cannot see
-// it change on its own — see ggml_cuda_q_rot_buf_epoch()'s doc comment in vbr-transcode.cuh.
-static unsigned long long q_rot_buf_epoch[GGML_CUDA_MAX_DEVICES] = {};
+// Address moves of fattn's persistent scratch — doc on the accessor in fattn.cuh
+static unsigned long long fattn_scratch_epoch[GGML_CUDA_MAX_DEVICES] = {};
 
-unsigned long long ggml_cuda_q_rot_buf_epoch(int device) {
-    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
-        return 0;
+unsigned long long ggml_cuda_fattn_scratch_epoch(int device) {
+    return fattn_scratch_epoch[device];
+}
+
+// Grow-only allocator for q_rot_buf. An address move MUST bump the scratch epoch — the buffer is
+// not a graph node src, so the epoch is the only fence a captured CUDA graph has against it.
+static void q_rot_buf_ensure(int device, size_t q_size) {
+    if (q_size > q_rot_buf_size[device]) {
+        if (q_rot_buf[device]) CUDA_CHECK(cudaFree(q_rot_buf[device]));
+        CUDA_CHECK(cudaMalloc(&q_rot_buf[device], q_size));
+        q_rot_buf_size[device] = q_size;
+        fattn_scratch_epoch[device]++;
     }
-    return q_rot_buf_epoch[device];
 }
 
 // Persistent K/V fp16 dequant buffers per device (shared between prefill and decode paths).
@@ -1346,7 +1352,9 @@ static int64_t next_pow2_i64(int64_t x) {
 // issuing no cuMem*/cudaMalloc under stream capture. This mirrors the invariant the prior
 // cudaMalloc-in-decode path relied on. A VA re-reservation changes the base pointer, but only on a
 // growth (eager) pass, and the graph's per-node src-ne memcmp independently forces a re-capture
-// that bakes in the new pointer, so a replayed graph can never point at a stale reservation.
+// that bakes in the new pointer — for the graph whose OWN K/V view grew. A co-resident context's
+// captured graph on the same device sees no ne change, so address moves also bump
+// fattn_scratch_epoch, which fences ALL captured graphs (see fattn.cuh).
 static half * kv_dequant_scratch(int device, size_t need_bytes,
                                  ggml_vbr_vmm_pool ** vmm, size_t * vmm_va,
                                  half ** cuda_buf, size_t * cuda_size) {
@@ -1361,6 +1369,7 @@ static half * kv_dequant_scratch(int device, size_t need_bytes,
             *vmm = ggml_backend_cuda_vmm_pool_init(device, va);
             if (*vmm) {
                 *vmm_va = va;
+                fattn_scratch_epoch[device]++; // base moved with the new reservation
             }
         }
         if (*vmm) {
@@ -1377,6 +1386,7 @@ static half * kv_dequant_scratch(int device, size_t need_bytes,
         if (*cuda_buf) CUDA_CHECK(cudaFree(*cuda_buf));
         CUDA_CHECK(cudaMalloc(cuda_buf, alloc));
         *cuda_size = alloc;
+        fattn_scratch_epoch[device]++; // address moved
     }
     return *cuda_buf;
 }
@@ -1567,12 +1577,7 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
             K->type != GGML_TYPE_TURBO1_TCQ &&
             Q->ne[0] % 128 == 0) {
         const size_t q_size = ggml_nelements(Q) * sizeof(float);
-        if (q_size > q_rot_buf_size[device]) {
-            if (q_rot_buf[device]) CUDA_CHECK(cudaFree(q_rot_buf[device]));
-            CUDA_CHECK(cudaMalloc(&q_rot_buf[device], q_size));
-            q_rot_buf_size[device] = q_size;
-            q_rot_buf_epoch[device]++; // address moved — invalidate any CUDA graph capturing the old one
-        }
+        q_rot_buf_ensure(device, q_size);
         q_rotated = q_rot_buf[device];
         const int64_t n_q_groups = ggml_nelements(Q) / 128;
         k_turbo_fwht_forward<<<(int)n_q_groups, 128, 0, stream>>>(
@@ -2175,12 +2180,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         const bool fused_k_original_domain = (K->type == GGML_TYPE_F16);
         if (!fused_k_original_domain && Q->ne[0] % 128 == 0) {
             const size_t q_size = ggml_nelements(Q) * sizeof(float);
-            if (q_size > q_rot_buf_size[device]) {
-                if (q_rot_buf[device]) CUDA_CHECK(cudaFree(q_rot_buf[device]));
-                CUDA_CHECK(cudaMalloc(&q_rot_buf[device], q_size));
-                q_rot_buf_size[device] = q_size;
-                q_rot_buf_epoch[device]++; // address moved — invalidate any CUDA graph capturing the old one
-            }
+            q_rot_buf_ensure(device, q_size);
             const int64_t n_q_groups = ggml_nelements(Q) / 128;
             k_turbo_fwht_forward<<<(int)n_q_groups, 128, 0, stream>>>(
                 (const float *)Q->data, q_rot_buf[device], ggml_nelements(Q));
@@ -2486,12 +2486,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         const bool turbo_k_in_orig_domain = do_decode_dequant && turbo_k_any && !k_uses_rotated_path;
         if (turbo_k_any && !turbo_k_in_orig_domain && Q->ne[0] % 128 == 0) {
             const size_t q_size = ggml_nelements(Q) * sizeof(float);
-            if (q_size > q_rot_buf_size[device_dec]) {
-                if (q_rot_buf[device_dec]) CUDA_CHECK(cudaFree(q_rot_buf[device_dec]));
-                CUDA_CHECK(cudaMalloc(&q_rot_buf[device_dec], q_size));
-                q_rot_buf_size[device_dec] = q_size;
-                q_rot_buf_epoch[device_dec]++; // address moved — invalidate any CUDA graph capturing the old one
-            }
+            q_rot_buf_ensure(device_dec, q_size);
             const int64_t n_q_groups = ggml_nelements(Q) / 128;
             k_turbo_fwht_forward<<<(int)n_q_groups, 128, 0, stream>>>(
                 (const float *)Q->data, q_rot_buf[device_dec], ggml_nelements(Q));

@@ -2461,15 +2461,13 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
-    // q_rot_buf[device] (fattn.cu) can move (cudaFree+cudaMalloc, grow-only) without touching any
-    // node's src[] — it's an internal scratch buffer swapped into dst->src[0] only for the duration
-    // of the flash-attn dispatch call, so the diff below is blind to it. Check its epoch FIRST and
-    // unconditionally, since the cgraph->uid fast path right below returns early without walking
-    // nodes at all; a stale-address graph replayed via that fast path is exactly the reset+shared-KV
-    // drafter hazard this guards against.
-    const unsigned long long q_rot_epoch_now = ggml_cuda_q_rot_buf_epoch(cuda_ctx->device);
-    if (q_rot_epoch_now != graph->q_rot_buf_epoch_at_capture) {
-        graph->q_rot_buf_epoch_at_capture = q_rot_epoch_now;
+    // fattn's persistent scratch buffers can move without touching any node's src[] (doc:
+    // ggml_cuda_fattn_scratch_epoch, fattn.cuh). Check the epoch FIRST and unconditionally — the
+    // cgraph->uid fast path right below returns early without walking nodes, and a stale-address
+    // graph replayed through it is exactly the hazard this fences.
+    const unsigned long long scratch_epoch_now = ggml_cuda_fattn_scratch_epoch(cuda_ctx->device);
+    if (scratch_epoch_now != graph->fattn_scratch_epoch_at_capture) {
+        graph->fattn_scratch_epoch_at_capture = scratch_epoch_now;
         res = true;
     }
 
@@ -2480,8 +2478,8 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
             GGML_ASSERT((int)graph->node_props.size() == cgraph->n_nodes);
             return false;
         }
-        // q_rot_buf moved since this uid was captured — fall through and recapture even though the
-        // ggml-level graph itself is being reused verbatim.
+        // fattn scratch moved since this uid was captured — fall through and recapture even
+        // though the ggml-level graph itself is being reused verbatim.
     }
 
     graph->uid = cgraph->uid;

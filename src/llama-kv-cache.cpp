@@ -572,9 +572,7 @@ llama_kv_cache::llama_kv_cache(
     // llama_context disarms drafter-side VBR at creation (ctx_other), so hitting this is an
     // internal-API misuse, not a user configuration.
     if ((other || share) && (vbr_params_.dynamic || vbr_params_.budget_bytes)) {
-        throw std::runtime_error("internal: a share-linked KV cache (mem_other/share) must not arm "
-                "its own VBR controller — the owning cache's controller manages the shared tensors "
-                "(drafter contexts are disarmed automatically at context creation)");
+        throw std::runtime_error("internal: share-linked KV cache must not arm its own VBR controller");
     }
 
     // shared cells view the source cache's K/V tensors, so the cell count
