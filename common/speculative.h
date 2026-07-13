@@ -54,6 +54,19 @@ common_speculative_draft_params & common_speculative_get_draft_params(common_spe
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 
 // process the batch and update the internal state of the speculative context
+//
+// CALLING CONTRACT (every consumer — server AND examples — must follow this;
+// the 2026-07 upstream sync silently broke speculative-simple by reordering it):
+//   1. common_speculative_init() BEFORE the prompt is decoded on the target —
+//      capture-based impls (DFlash) enable target hidden-state extraction here,
+//      so a prompt decoded earlier is invisible to the drafter.
+//   2. common_speculative_process(batch) after EVERY llama_decode on the target
+//      (prompt prefill and verify steps alike) — capture-based impls gather the
+//      extracted features here before the next decode overwrites them. No-op
+//      for impls that don't need it; always safe to call.
+//   3. DFlash-family drafter contexts must NOT be fed raw token batches
+//      (classic lockstep drafter decodes) — their state is managed entirely via
+//      begin()/process()/draft().
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
 
 // true if any implementation requires target post-norm embeddings to be extracted
