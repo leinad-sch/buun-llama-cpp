@@ -1241,6 +1241,12 @@ struct ggml_cuda_graph {
     };
     std::vector<node_properties> node_props;
 
+    // q_rot_buf[device] (fattn.cu, k_turbo_fwht_forward's Q-rotation scratch) at the time this
+    // graph was last captured. It is not a node src[], so the node-property diff above cannot see
+    // it move — snapshot it separately and force a recapture if it changed (see
+    // ggml_cuda_q_rot_buf_epoch's doc comment in vbr-transcode.cuh).
+    unsigned long long q_rot_buf_epoch_at_capture = 0;
+
     bool is_enabled() const {
         static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
         return !(disable_due_to_gpu_arch || disable_cuda_graphs_due_to_env);

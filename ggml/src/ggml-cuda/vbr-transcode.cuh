@@ -24,3 +24,15 @@ void vbr_dequant_turbo_to_f32(const char * src, enum ggml_type src_type, enum gg
 // Called at the top of every CUDA graph_compute so the next decode graph orders after the wave's
 // async transcodes without a host block. No-op when unarmed (one branch on a static bool).
 void ggml_cuda_vbr_fence_consume(int device, cudaStream_t stream);
+
+// q_rot_buf reallocation epoch (defined in fattn.cu): k_turbo_fwht_forward's Q-rotation scratch
+// (q_rot_buf[device] in fattn.cu) is a grow-only cudaMalloc'd buffer, NOT one of the flash-attn
+// node's declared src[] tensors — its address is invisible to ggml_cuda_graph_update_required's
+// node-property diff. A captured CUDA graph bakes in whatever address q_rot_buf[device] held at
+// capture time; if a later call cudaFree+cudaMalloc's the buffer to a new address (a Q-shape grow
+// on that device), every replay of the stale-captured graph still launches the FWHT kernel against
+// the OLD address, now dangling/reused -> invalid write (seen: reset-triggered re-prefill growing Q
+// right as a shared-KV drafter's differently-shaped Q first engages on the same device). Bump this
+// once per (re)allocation; ggml-cuda.cu snapshots it per-graph and forces a recapture on mismatch,
+// exactly like a node-property change.
+unsigned long long ggml_cuda_q_rot_buf_epoch(int device);

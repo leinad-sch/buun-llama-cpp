@@ -1158,6 +1158,17 @@ static __global__ void k_bf16_to_f16_tkhe(
 // Persistent Q rotation buffer per device (shared between prefill and decode paths)
 static float * q_rot_buf[GGML_CUDA_MAX_DEVICES] = {};
 static size_t  q_rot_buf_size[GGML_CUDA_MAX_DEVICES] = {};
+// Bumped every time q_rot_buf[device] is (re)allocated to a new address. The buffer's address is
+// not part of any ggml_tensor node's src[], so CUDA-graph-capture reuse (ggml-cuda.cu) cannot see
+// it change on its own — see ggml_cuda_q_rot_buf_epoch()'s doc comment in vbr-transcode.cuh.
+static unsigned long long q_rot_buf_epoch[GGML_CUDA_MAX_DEVICES] = {};
+
+unsigned long long ggml_cuda_q_rot_buf_epoch(int device) {
+    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
+        return 0;
+    }
+    return q_rot_buf_epoch[device];
+}
 
 // Persistent K/V fp16 dequant buffers per device (shared between prefill and decode paths).
 // These are the cudaMalloc FALLBACK, used only when the device has no VMM support; the primary
@@ -1560,6 +1571,7 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
             if (q_rot_buf[device]) CUDA_CHECK(cudaFree(q_rot_buf[device]));
             CUDA_CHECK(cudaMalloc(&q_rot_buf[device], q_size));
             q_rot_buf_size[device] = q_size;
+            q_rot_buf_epoch[device]++; // address moved — invalidate any CUDA graph capturing the old one
         }
         q_rotated = q_rot_buf[device];
         const int64_t n_q_groups = ggml_nelements(Q) / 128;
@@ -2167,6 +2179,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 if (q_rot_buf[device]) CUDA_CHECK(cudaFree(q_rot_buf[device]));
                 CUDA_CHECK(cudaMalloc(&q_rot_buf[device], q_size));
                 q_rot_buf_size[device] = q_size;
+                q_rot_buf_epoch[device]++; // address moved — invalidate any CUDA graph capturing the old one
             }
             const int64_t n_q_groups = ggml_nelements(Q) / 128;
             k_turbo_fwht_forward<<<(int)n_q_groups, 128, 0, stream>>>(
@@ -2477,6 +2490,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 if (q_rot_buf[device_dec]) CUDA_CHECK(cudaFree(q_rot_buf[device_dec]));
                 CUDA_CHECK(cudaMalloc(&q_rot_buf[device_dec], q_size));
                 q_rot_buf_size[device_dec] = q_size;
+                q_rot_buf_epoch[device_dec]++; // address moved — invalidate any CUDA graph capturing the old one
             }
             const int64_t n_q_groups = ggml_nelements(Q) / 128;
             k_turbo_fwht_forward<<<(int)n_q_groups, 128, 0, stream>>>(
