@@ -865,7 +865,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr int  nbatch_K2       = ggml_cuda_fattn_mma_get_nbatch_K2(DKQ, DV, ncols);
     constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg (DKQ, DV, ncols);
-    constexpr bool is_turbo_kv     = (type_K != GGML_TYPE_F16 || type_V != GGML_TYPE_F16);
+    // Per-side turbo flags gate the K/V tile-load chains independently: in an asymmetric
+    // f16<->turbo pair each side takes its own loader (the f16 side must use the plain f16
+    // tile load, which the turbo loaders below lack). is_turbo_kv is the combined property,
+    // needed only to disable the multi-stage cp.async pipeline (which requires both sides f16).
+    constexpr bool is_turbo_k      = (type_K != GGML_TYPE_F16);
+    constexpr bool is_turbo_v      = (type_V != GGML_TYPE_F16);
+    constexpr bool is_turbo_kv     = is_turbo_k || is_turbo_v;
     constexpr int  nstages         = is_turbo_kv ? 0 : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2);
 
     constexpr int stride_tile_K = nbatch_K2 + 4;
@@ -905,7 +911,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const int k0_stop = k0_start + nbatch_K2 < DKQ/2 ? k0_start + nbatch_K2 : DKQ/2;
 
         if constexpr (nstages <= 1) {
-            if constexpr (!is_turbo_kv) {
+            // f16 K (whether both sides f16 or the f16 side of an asymmetric pair) uses the plain
+            // f16 tile load — the turbo loaders below have no F16 case. In turbo mode nstages == 0,
+            // so use_cp_async is false and the load is synchronous; Q is left unrotated for f16 K at
+            // dispatch (fused_k_original_domain), so the tile matches.
+            if constexpr (!is_turbo_k) {
                 const int k0_diff = k0_stop - k0_start;
                 constexpr bool use_cp_async = nstages == 1;
                 flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
@@ -1273,7 +1283,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const int i0_stop = i0_start + 2*nbatch_V2;
 
         if constexpr (nstages <= 1) {
-            if constexpr (!is_turbo_kv) {
+            // f16 V (both sides f16, or the f16 side of an asymmetric pair) uses the plain f16 tile
+            // load — the turbo loaders below have no F16 case. V is stored in the original domain
+            // (as is turbo V after decode), so no domain fix is needed.
+            if constexpr (!is_turbo_v) {
                 const int i0_diff = i0_stop - i0_start;
                 if (!V_is_K_view || i0_stop > 2*nbatch_K2) {
                     constexpr bool use_cp_async = nstages == 1;
@@ -2143,10 +2156,14 @@ static __global__ void flash_attn_ext_f16(
 
     const int stride_Q1   = nb01 / sizeof(float2);
     const int stride_Q2   = nb02 / sizeof(float2);
-    const int stride_K    = is_turbo_kv ? nb11 : nb11 / sizeof(half2);
+    // Stride unit is PER SIDE, keyed on each side's own type — not the combined is_turbo_kv flag.
+    // Turbo loaders cast to char* and want the raw byte stride; the f16 loader indexes a half2*
+    // and wants the half2-element stride. In an asymmetric f16<->t8 pair each side takes its own
+    // path, so a single is_turbo_kv-based stride mis-indexes the f16 side (VBR entry-band garbage).
+    const int stride_K    = (type_K != GGML_TYPE_F16) ? nb11 : nb11 / sizeof(half2);
     const int stride_mask = nb31 / sizeof(half);
 
-    const int stride_V = V_is_K_view ? stride_K : (is_turbo_kv ? nb21 : nb21 / sizeof(half2));
+    const int stride_V = V_is_K_view ? stride_K : ((type_V != GGML_TYPE_F16) ? nb21 : nb21 / sizeof(half2));
 
     const int iter_k     = (ne11      + (nbatch_fa - 1)) / nbatch_fa;
     const int iter_j     = (ne01.z    + (ncols1    - 1)) / ncols1;
