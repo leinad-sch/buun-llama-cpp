@@ -62,6 +62,19 @@ static uint32_t server_n_outputs_max(const common_params & params) {
         return n_batch;
     }
 
+    // the fork DFlash impl reports need_embd() on generating slots, so every prompt
+    // chunk on a DFlash slot decodes with output-all embeddings. The cap must cover a
+    // full batch or output_reserve aborts on the first prompt chunk longer than the
+    // per-seq floor (~64 tokens) — e.g. any follow-up turn that re-processes context.
+    // DFlash may only be detected from the draft GGUF after the target context is
+    // created (same ordering problem as the verify floor below), so gate on has_dft()
+    // too. output_reserve grows its buffers lazily, so the higher cap costs nothing
+    // until a batch actually requests that many outputs (the pre-cap reservation).
+    if (params.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH) ||
+        params.speculative.has_dft()) {
+        return n_batch;
+    }
+
     const uint32_t n_outputs_per_seq = 1 + common_speculative_n_max(&params.speculative);
 
     const uint64_t n_outputs = (uint64_t) params.n_parallel * n_outputs_per_seq;
