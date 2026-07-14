@@ -1710,7 +1710,12 @@ static void multiple_choice_score(llama_context * ctx, const common_params & par
 
 // EXP-15d: defined in ggml-cuda/set-rows.cu. Weak so CPU-only builds link cleanly
 // (symbol resolves to nullptr → call is skipped below).
+#if defined(_MSC_VER)
+static inline void ggml_cuda_ragged_set_window_dummy(int) {}
+#define ggml_cuda_ragged_set_window ggml_cuda_ragged_set_window_dummy
+#else
 extern "C" __attribute__((weak)) void ggml_cuda_ragged_set_window(int window);
+#endif
 
 static void kl_divergence(llama_context * ctx, const common_params & params) {
     const llama_model * model = llama_get_model(ctx);

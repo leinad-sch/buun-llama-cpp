@@ -7,7 +7,9 @@
 #include <cctype>
 #include <string>
 #include <vector>
-
+#if defined(_WIN32) && !defined(strtok_r)
+#define strtok_r strtok_s
+#endif
 // Definition for the extern in turbo-quant-cuda.cuh. When true, the encode mean-sub tap is skipped
 // (VBR transcode re-encode: its input is already stored-domain V - mu_V).
 bool g_turbo_meansub_suppress = false;

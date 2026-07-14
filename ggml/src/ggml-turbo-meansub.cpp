@@ -30,7 +30,7 @@ static const ggml_meansub_entry * g_active = NULL;
 static float * g_dense_k = NULL;
 static float * g_dense_v = NULL;
 
-void ggml_turbo_meansub_set_model(const char * arch, int n_layer, int n_embd) {
+GGML_API void ggml_turbo_meansub_set_model(const char * arch, int n_layer, int n_embd) {
     if (arch) {
         strncpy(g_arch, arch, sizeof(g_arch) - 1);
         g_arch[sizeof(g_arch) - 1] = 0;
@@ -77,7 +77,7 @@ static float * expand_dense(const ggml_meansub_entry * e, int kvsel) {
     return dense;
 }
 
-const float * ggml_turbo_meansub_active(int kvsel, int * out_max_l, int * out_max_c, int * out_live) {
+GGML_API const float * ggml_turbo_meansub_active(int kvsel, int * out_max_l, int * out_max_c, int * out_live) {
     if (!g_active) {
         return NULL;
     }
