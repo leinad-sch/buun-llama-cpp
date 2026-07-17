@@ -1190,6 +1190,11 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
 
+    // fence reuse off in-place VBR tier flips in the attention child (see llm_graph_input_attn_kv).
+    // The hybrid wrappers bypass inp_attn->can_reuse, so the fence must be repeated here — a
+    // mid-decode promote/degrade flips type/strides with no shape change the checks above can see.
+    res &= inp_attn->vbr_epoch == llm_graph_vbr_epoch(mctx->get_attn());
+
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
     res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
@@ -1232,6 +1237,9 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
     res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+
+    // fence reuse off in-place VBR tier flips in the attention child (see llm_graph_input_mem_hybrid)
+    res &= inp_attn->vbr_epoch == llm_graph_vbr_epoch(mctx->get_attn());
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -1322,6 +1330,9 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
     }
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask_swa, attn_ctx->get_swa(), params.ubatch, params.cparams);
+
+    // fence reuse off in-place VBR tier flips in either attention child (see llm_graph_input_mem_hybrid)
+    res &= inp_attn->vbr_epoch == llm_graph_vbr_epoch(attn_ctx);
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
