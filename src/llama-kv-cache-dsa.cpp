@@ -248,6 +248,10 @@ const llama_ubatch & llama_kv_cache_dsa_context::get_ubatch() const {
     return ubatches[i_next];
 }
 
+uint64_t llama_kv_cache_dsa_context::get_vbr_epoch() const {
+    return get_mla()->get_vbr_epoch() + get_lid()->get_vbr_epoch();
+}
+
 const llama_kv_cache_context * llama_kv_cache_dsa_context::get_mla() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 

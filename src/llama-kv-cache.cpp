@@ -575,6 +575,56 @@ static std::shared_ptr<llama_kv_cells_vec> kv_cells_make(uint32_t n_stream, uint
     return cells;
 }
 
+// VMM pool wrapping a physical buffer, if any
+template <typename POOLS>
+static auto kv_vmm_pool_for(POOLS & pools, ggml_backend_buffer_t pb) -> decltype(&pools[0]) {
+    for (auto & p : pools) {
+        if (p.vmm != nullptr && p.buf == pb) {
+            return &p;
+        }
+    }
+    return nullptr;
+}
+
+// physical buffers behind one KV buffer: the per-device simple buffers underneath a meta
+// buffer (-sm tensor), else the buffer itself — the boundary translation clear() and
+// memory_breakdown() share
+static std::vector<ggml_backend_buffer_t> kv_phys_buffers(ggml_backend_buffer_t buf) {
+    std::vector<ggml_backend_buffer_t> phys;
+    if (ggml_backend_buffer_is_meta(buf)) {
+        const size_t n = ggml_backend_meta_buffer_n_bufs(buf);
+        for (size_t i = 0; i < n; ++i) {
+            phys.push_back(ggml_backend_meta_buffer_simple_buffer(buf, i));
+        }
+    } else {
+        phys.push_back(buf);
+    }
+    return phys;
+}
+
+// fixed VA slot of a cache tensor: every extent reserves its F16-max footprint so tier flips
+// never move data pointers — this expression is the single encoding of that sizing rule
+static size_t vbr_slot_bytes(const ggml_tensor * t) {
+    return (size_t) ggml_row_size(GGML_TYPE_F16, t->ne[0]) * t->ne[1] * t->ne[2];
+}
+
+// byte spans of one (pool, extent) unit at tier type_B: how much must stay resident (keep),
+// how far the live watermark extends it (keep_live), and the page-padded map target (keep_pad).
+// One computation shared by the promote hysteresis/map/transcode phases and the degrade path.
+struct vbr_span {
+    size_t slot, keep, keep_live, keep_pad;
+};
+static vbr_span vbr_span_of(const ggml_tensor * t, ggml_type type_B, int64_t n_cells,
+                            uint32_t wm_next, size_t gran) {
+    const size_t rB   = ggml_row_size(type_B, t->ne[0]);
+    const size_t slot = vbr_slot_bytes(t);
+    const size_t keep      = rB * (size_t) std::max<int64_t>(n_cells, 1);
+    const size_t keep_live = std::min(slot, std::max(keep, rB * (size_t) wm_next));
+    const size_t keep_pad  = std::min(slot, (size_t) GGML_PAD(keep_live, gran));
+    return { slot, keep, keep_live, keep_pad };
+}
+
+
 llama_kv_cache::llama_kv_cache(
         const llama_model & model,
         const llama_hparams & hparams,
@@ -964,9 +1014,7 @@ llama_kv_cache::llama_kv_cache(
                     continue;
                 }
                 const bool is_cache = strncmp(t->name, "cache_", 6) == 0;
-                const size_t slot = is_cache
-                    ? (size_t) ggml_row_size(GGML_TYPE_F16, t->ne[0]) * t->ne[1] * t->ne[2]
-                    : ggml_nbytes(t);
+                const size_t slot = is_cache ? vbr_slot_bytes(t) : ggml_nbytes(t);
                 // slot sizing assumes F16 is the widest tier any cache tensor can hold
                 GGML_ASSERT(!is_cache || ggml_row_size(t->type, t->ne[0]) <= ggml_row_size(GGML_TYPE_F16, t->ne[0]));
                 off = GGML_PAD(off, gran);
@@ -997,6 +1045,8 @@ llama_kv_cache::llama_kv_cache(
                     return nullptr;
                 }
             }
+            // views: needed on the plain-buft direct call; the meta _ext path would also
+            // finalize them (it skips views whose buffer is already set)
             for (ggml_tensor * t = ggml_get_first_tensor(cc); t != nullptr; t = ggml_get_next_tensor(cc, t)) {
                 if (t->view_src != nullptr) {
                     t->buffer = b;
@@ -1028,17 +1078,13 @@ llama_kv_cache::llama_kv_cache(
         // hand each device's shard context to the same layout routine. The meta buffer wraps the
         // per-device pool buffers so graph building sees ordinary meta tensors.
         const size_t pools_before = vbr_pools_.size();
-        struct meta_alloc_ud {
-            const std::function<ggml_backend_buffer_t(const llama_vbr_dev &, ggml_context *)> * fn;
-            const std::vector<llama_vbr_dev> * devs;
-        };
-        const std::function<ggml_backend_buffer_t(const llama_vbr_dev &, ggml_context *)> fn = vmm_alloc_ctx;
-        meta_alloc_ud ud = { &fn, &devs };
+        // std::function bridges the capturing lambda across the C callback (alive only for this call)
+        const std::function<ggml_backend_buffer_t(size_t, ggml_context *)> alloc_one =
+            [&](size_t i, ggml_context * sctx) { return vmm_alloc_ctx(devs[i], sctx); };
         ggml_backend_buffer_t buf = ggml_backend_meta_alloc_ctx_tensors_from_buft_ext(c, bft,
             [](size_t i, ggml_backend_buffer_type_t /*simple_buft*/, ggml_context * sctx, void * u) -> ggml_backend_buffer_t {
-                const meta_alloc_ud * mud = (const meta_alloc_ud *) u;
-                return (*mud->fn)((*mud->devs)[i], sctx);
-            }, &ud);
+                return (*(const std::function<ggml_backend_buffer_t(size_t, ggml_context *)> *) u)(i, sctx);
+            }, (void *) &alloc_one);
         if (buf == nullptr) {
             // unwind pools created for devices that DID succeed: their buffers were already freed
             // by the meta teardown; the VA reservations are ours to release
@@ -1128,7 +1174,7 @@ llama_kv_cache::llama_kv_cache(
                 return out;
             }
             if (ggml_backend_buffer_is_meta(t->buffer)) {
-                const size_t n = ggml_backend_meta_buft_n_bufts(ggml_backend_buffer_get_type(t->buffer));
+                const size_t n = ggml_backend_meta_buffer_n_bufs(t->buffer);
                 for (size_t i = 0; i < n; ++i) {
                     ggml_tensor * shard = ggml_backend_meta_buffer_simple_tensor(t, i);
                     if (shard != nullptr && shard->data != nullptr && ggml_nbytes(shard) > 0) {
@@ -1169,9 +1215,8 @@ llama_kv_cache::llama_kv_cache(
                 vbr_extent & e = is_v ? p->v[ikv] : p->k[ikv];
                 e.t        = inst;
                 e.byte_off = (size_t)((char *) inst->data - p->base);
-                e.byte_len = ggml_nbytes(inst);
                 e.type0    = inst->type; // entry tier — the full-clear reset target
-                p->used = std::max(p->used, e.byte_off + e.byte_len);
+                p->used = std::max(p->used, e.byte_off + ggml_nbytes(inst));
             }
         };
         for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
@@ -1192,6 +1237,26 @@ llama_kv_cache::llama_kv_cache(
             auto & p = vbr_pools_[pi];
             LLAMA_LOG_INFO("%s: VBR pool #%zu (device %d): %.2f MiB buffer, %.2f MiB used\n",
                     __func__, pi, p.device, p.size/1024.0/1024.0, p.used/1024.0/1024.0);
+        }
+
+        // (pool, extent) unit table: which VMM pools hold each (ikv, side) unit is fixed from
+        // here on — precompute so the per-boundary degrade/promote walks never allocate. MUST
+        // precede vbr_floor_clamp_order below (it consults vbr_unit_pooled), and vbr_pools_
+        // must never grow again (the table holds pointers into it).
+        vbr_units_tab_.resize(layers.size() * 2);
+        for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+            for (int side = 0; side < 2; ++side) {
+                auto & slot = vbr_units_tab_[ikv * 2 + side];
+                for (auto & p : vbr_pools_) {
+                    if (p.vmm == nullptr) {
+                        continue;
+                    }
+                    vbr_extent & e = side ? p.v[ikv] : p.k[ikv];
+                    if (e.t != nullptr) {
+                        slot.push_back({ &p, &e });
+                    }
+                }
+            }
         }
         // S3/S4: arm the decode-time degrade controller (VMM mode only). Inputs come from
         // cparams (llama_memory_vbr_params, threaded through create_memory): budget_bytes is
@@ -1246,14 +1311,14 @@ llama_kv_cache::llama_kv_cache(
                     }
                     // exact for the single-pool (single-GPU) case; double is plenty for the
                     // multi-pool proportional split (checks are page-granular anyway)
-                    const double va_share = n_vmm == 1 ? 1.0 : (double) p.size / (double) total_va;
+                    const auto share_of = [&](size_t total) {
+                        return n_vmm == 1 ? total : (size_t) ((double) total * ((double) p.size / (double) total_va));
+                    };
                     if (budget_fit_armed) {
-                        p.budget = n_vmm == 1 ? vbr_budget_bytes_
-                                 : (size_t) ((double) vbr_budget_bytes_ * va_share);
+                        p.budget      = share_of(vbr_budget_bytes_);
                         p.budget_base = p.budget; // re-derivation floor: never below the armed value
                     } else {
-                        const size_t floor_share = n_vmm == 1 ? vbr_floor_cost_bytes_
-                                 : (size_t) ((double) vbr_floor_cost_bytes_ * va_share);
+                        const size_t floor_share = share_of(vbr_floor_cost_bytes_);
                         p.budget      = std::max(vbr_pool_reach(p), floor_share);
                         p.budget_base = floor_share;
                         derived_total += p.budget;
@@ -1283,6 +1348,7 @@ llama_kv_cache::llama_kv_cache(
             }
         }
     }
+
 
     {
         const size_t memory_size_k = size_k_bytes();
@@ -1430,25 +1496,8 @@ void llama_kv_cache::clear(bool data) {
             }
         }
         for (auto & [_, buf] : ctxs_bufs) {
-            // physical buffers behind this KV buffer: itself, or the per-device buffers
-            // underneath a meta buffer (-sm tensor)
-            std::vector<ggml_backend_buffer_t> phys;
-            if (ggml_backend_buffer_is_meta(buf.get())) {
-                const size_t n = ggml_backend_meta_buft_n_bufts(ggml_backend_buffer_get_type(buf.get()));
-                for (size_t i = 0; i < n; ++i) {
-                    phys.push_back(ggml_backend_meta_buffer_simple_buffer(buf.get(), i));
-                }
-            } else {
-                phys.push_back(buf.get());
-            }
-            for (ggml_backend_buffer_t pb : phys) {
-                const vbr_pool * p = nullptr;
-                for (const auto & pp : vbr_pools_) {
-                    if (pp.vmm != nullptr && pp.buf == pb) {
-                        p = &pp;
-                        break;
-                    }
-                }
+            for (ggml_backend_buffer_t pb : kv_phys_buffers(buf.get())) {
+                const vbr_pool * p = kv_vmm_pool_for(vbr_pools_, pb);
                 if (p != nullptr) {
                     // a full-buffer clear would memset unmapped VA; zero only the mapped pages
                     p->be->vmm_pool_clear(p->vmm);
@@ -1785,36 +1834,22 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() 
             ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
         } else {
             // GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) != nullptr); // multi_buffer does not have a defined base
-            size_t sz = ggml_backend_buffer_get_size(buf.get());
-            if (ggml_backend_buffer_is_meta(buf.get())) {
-                // -sm tensor: the pools wrap the per-device buffers underneath the meta buffer;
-                // report the sum of mapped-physical bytes when they are VMM-backed
-                size_t sz_meta  = 0;
-                bool   any_vmm  = false;
-                const size_t n = ggml_backend_meta_buft_n_bufts(buft);
-                for (size_t i = 0; i < n; ++i) {
-                    ggml_backend_buffer_t pb = ggml_backend_meta_buffer_simple_buffer(buf.get(), i);
-                    size_t sz_i = pb != nullptr ? ggml_backend_buffer_get_size(pb) : 0;
-                    for (const auto & p : vbr_pools_) {
-                        if (p.vmm != nullptr && p.buf == pb) {
-                            sz_i    = p.be->vmm_pool_mapped(p.vmm);
-                            any_vmm = true;
-                            break;
-                        }
-                    }
-                    sz_meta += sz_i;
+            // for VMM-backed buffers the buffer size is the VA reservation — report the
+            // mapped-physical bytes instead (summed across the per-device buffers under a
+            // meta buffer; -sm tensor)
+            size_t sz      = 0;
+            bool   any_vmm = false;
+            for (ggml_backend_buffer_t pb : kv_phys_buffers(buf.get())) {
+                const vbr_pool * p = kv_vmm_pool_for(vbr_pools_, pb);
+                if (p != nullptr) {
+                    sz     += p->be->vmm_pool_mapped(p->vmm);
+                    any_vmm = true;
+                } else {
+                    sz += pb != nullptr ? ggml_backend_buffer_get_size(pb) : 0;
                 }
-                if (any_vmm) {
-                    sz = sz_meta;
-                }
-            } else {
-                for (const auto & p : vbr_pools_) {
-                    if (p.vmm != nullptr && p.buf == buf.get()) {
-                        // VMM pool: the buffer size is the VA reservation; report mapped-physical
-                        sz = p.be->vmm_pool_mapped(p.vmm);
-                        break;
-                    }
-                }
+            }
+            if (!any_vmm) {
+                sz = ggml_backend_buffer_get_size(buf.get());
             }
             ret[buft] += sz;
         }
@@ -2509,32 +2544,15 @@ const llama_kv_cache::vbr_pool * llama_kv_cache::vbr_pool_of(const ggml_tensor *
     return const_cast<llama_kv_cache *>(this)->vbr_pool_of(t);
 }
 
-std::vector<std::pair<llama_kv_cache::vbr_pool *, llama_kv_cache::vbr_extent *>>
-llama_kv_cache::vbr_units_of(size_t ikv, bool is_v) {
-    std::vector<std::pair<vbr_pool *, vbr_extent *>> out;
-    for (auto & p : vbr_pools_) {
-        if (p.vmm == nullptr) {
-            continue;
-        }
-        vbr_extent & e = is_v ? p.v[ikv] : p.k[ikv];
-        if (e.byte_len > 0 && e.t != nullptr) {
-            out.push_back({ &p, &e });
-        }
-    }
-    return out;
+const std::vector<std::pair<llama_kv_cache::vbr_pool *, llama_kv_cache::vbr_extent *>> &
+llama_kv_cache::vbr_units_of(size_t ikv, bool is_v) const {
+    // non-VBR caches never build the table (no pools) — every unit is unpooled
+    static const std::vector<std::pair<vbr_pool *, vbr_extent *>> none;
+    return vbr_units_tab_.empty() ? none : vbr_units_tab_[ikv * 2 + (is_v ? 1 : 0)];
 }
 
 bool llama_kv_cache::vbr_unit_pooled(size_t ikv, bool is_v) const {
-    for (const auto & p : vbr_pools_) {
-        if (p.vmm == nullptr) {
-            continue;
-        }
-        const vbr_extent & e = is_v ? p.v[ikv] : p.k[ikv];
-        if (e.byte_len > 0 && e.t != nullptr) {
-            return true;
-        }
-    }
-    return false;
+    return !vbr_units_of(ikv, is_v).empty();
 }
 
 // The configured budget bounds the POOL, but the card bounds reality: weights + compute
@@ -2550,6 +2568,13 @@ size_t llama_kv_cache::vbr_budget_eff(const vbr_pool & p) const {
         const char * e = getenv("VBR_VRAM_HEADROOM_MIB");
         return (size_t) (e ? strtoull(e, nullptr, 10) : 192) * 1024 * 1024;
     }();
+    // memoized per boundary: the degrade loop re-evaluates over_budget per step and the promote
+    // hysteresis visits every pool, so an uncached get_device_memory here is a driver round-trip
+    // multiplied by wave length x pools — and free VRAM cannot meaningfully move within one
+    // boundary (tail unmaps are deferred to the next one)
+    if (p.budget_eff_stamp == vbr_boundary_count_) {
+        return p.budget_eff_cache;
+    }
     size_t budget_eff = p.budget;
     size_t free_b = 0, total_b = 0;
     p.be->get_device_memory(p.device, &free_b, &total_b);
@@ -2558,6 +2583,8 @@ size_t llama_kv_cache::vbr_budget_eff(const vbr_pool & p) const {
     if (cap < budget_eff) {
         budget_eff = cap;
     }
+    p.budget_eff_stamp = vbr_boundary_count_;
+    p.budget_eff_cache = budget_eff;
     return budget_eff;
 }
 
@@ -2631,7 +2658,7 @@ bool llama_kv_cache::vbr_vmm_try_map(uint32_t wm) {
             for (int side = 0; side < 2; ++side) {
                 const vbr_extent  & e = side ? pool.v[ikv] : pool.k[ikv];
                 const ggml_tensor * t = e.t; // pool-local instance (shard under -sm tensor)
-                if (e.byte_len == 0 || t == nullptr) {
+                if (t == nullptr) {
                     continue;
                 }
                 const size_t row_b = ggml_row_size(t->type, t->ne[0]); // n_stream == 1 (gated at construction)
@@ -2679,7 +2706,7 @@ size_t llama_kv_cache::vbr_vmm_projected_bytes(const vbr_pool & p, uint32_t wm_c
         for (int side = 0; side < 2; ++side) {
             const vbr_extent  & e = side ? p.v[ikv] : p.k[ikv];
             const ggml_tensor * t = e.t; // pool-local instance (shard under -sm tensor)
-            if (e.byte_len == 0 || t == nullptr) {
+            if (t == nullptr) {
                 continue;
             }
             const size_t need = (size_t) ggml_row_size(t->type, t->ne[0]) * wm_cells;
@@ -3008,7 +3035,7 @@ static void vbr_set_tensor_type(ggml_tensor * t, std::vector<ggml_tensor *> & vi
     // transcode kernels operate on the per-device SHARDS — flip them in lockstep. Shard strides
     // derive from the shard's own ne0 (its slice of the head*dim axis), not the meta tensor's.
     if (t->buffer != nullptr && ggml_backend_buffer_is_meta(t->buffer)) {
-        const size_t n = ggml_backend_meta_buft_n_bufts(ggml_backend_buffer_get_type(t->buffer));
+        const size_t n = ggml_backend_meta_buffer_n_bufs(t->buffer);
         for (size_t i = 0; i < n; ++i) {
             ggml_tensor * shard = ggml_backend_meta_buffer_simple_tensor(t, i);
             if (shard == nullptr) {
@@ -3033,7 +3060,7 @@ char * llama_kv_cache::vbr_stash_ensure(vbr_pool & p) {
             for (int side = 0; side < 2; ++side) {
                 vbr_extent        & ex = side ? p.v[j] : p.k[j];
                 const ggml_tensor * tt = ex.t; // pool-local instance (shard under -sm tensor)
-                if (ex.byte_len == 0 || tt == nullptr) {
+                if (tt == nullptr) {
                     continue;
                 }
                 ex.stash_off = total;
@@ -3074,7 +3101,7 @@ void llama_kv_cache::vbr_full_reset() {
             for (int side = 0; side < 2; ++side) {
                 vbr_extent  & e  = side ? pool.v[ikv]   : pool.k[ikv];
                 ggml_tensor * tc = side ? layers[ikv].v : layers[ikv].k; // canonical (graph) tensor
-                if (e.byte_len == 0 || e.t == nullptr || tc == nullptr) {
+                if (e.t == nullptr || tc == nullptr) {
                     continue;
                 }
                 if (tc->type != e.type0) {
@@ -3084,10 +3111,9 @@ void llama_kv_cache::vbr_full_reset() {
                     vbr_tier_epoch_++; // fence graph reuse off the old views
                     undone++;
                 }
-                e.byte_len     = ggml_nbytes(e.t);
                 e.stash_valid  = 0;
                 e.promote_hops = 0; // fresh hop budget — the reset epoch starts clean
-                const size_t slot = (size_t) ggml_row_size(GGML_TYPE_F16, e.t->ne[0]) * e.t->ne[1] * e.t->ne[2];
+                const size_t slot = vbr_slot_bytes(e.t);
                 pool.be->vmm_pool_unmap(pool.vmm, e.byte_off, slot);
             }
         }
@@ -3124,11 +3150,11 @@ void llama_kv_cache::vbr_shrink_watermark() {
             for (int side = 0; side < 2; ++side) {
                 const vbr_extent  & e = side ? pool.v[ikv] : pool.k[ikv];
                 const ggml_tensor * t = e.t; // pool-local instance (shard under -sm tensor)
-                if (e.byte_len == 0 || t == nullptr) {
+                if (t == nullptr) {
                     continue;
                 }
                 const size_t keep = ggml_row_size(t->type, t->ne[0]) * (size_t) wm_now;
-                const size_t slot = (size_t) ggml_row_size(GGML_TYPE_F16, t->ne[0]) * t->ne[1] * t->ne[2];
+                const size_t slot = vbr_slot_bytes(t);
                 pool.be->vmm_pool_unmap(pool.vmm, e.byte_off + keep, slot - keep);
             }
         }
@@ -3155,7 +3181,7 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
         }
         const int32_t ikv = it->second;
         ggml_tensor * t = st.is_v ? layers[ikv].v : layers[ikv].k; // canonical tensor: the type source of truth
-        auto units = vbr_units_of(ikv, st.is_v != 0); // every VMM pool holding this unit
+        const auto & units = vbr_units_of(ikv, st.is_v != 0); // every VMM pool holding this unit
         if (t == nullptr || units.empty()) {
             vbr_degrade_cursor_--; // this entry's degrade never applied (skipped no-op) — free rewind
             continue;
@@ -3226,27 +3252,16 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
         // tier-A bytes). All maps must succeed BEFORE the flip; on a mid-way failure the extra
         // pages of earlier pools are harmless (fungible, reclaimed by the next watermark shrink).
         for (const auto & [pp, ep] : units) {
-            const int64_t ne0       = ep->t->ne[0];
-            const size_t  rB        = ggml_row_size(type_B, ne0);
-            const int64_t n_cells   = pp->wm_cells;
-            const size_t  slot      = (size_t) ggml_row_size(GGML_TYPE_F16, ne0) * ep->t->ne[1] * ep->t->ne[2];
-            const size_t  keep      = rB * (size_t) std::max<int64_t>(n_cells, 1);
-            const size_t  keep_live = std::min(slot, std::max(keep, rB * (size_t) wm_next));
-            const size_t  keep_pad  = std::min(slot, (size_t) GGML_PAD(keep_live, pp->gran));
-            if (!pp->be->vmm_pool_map(pp->vmm, ep->byte_off, keep_pad)) {
+            const vbr_span sp = vbr_span_of(ep->t, type_B, pp->wm_cells, wm_next, pp->gran);
+            if (!pp->be->vmm_pool_map(pp->vmm, ep->byte_off, sp.keep_pad)) {
                 return false; // physical memory tight — promotion is optional, just stop
             }
         }
 
         for (auto & [pp, ep] : units) {
-            vbr_extent  & e   = *ep;
-            const int64_t ne0 = e.t->ne[0];
-            const size_t  rB  = ggml_row_size(type_B, ne0);
+            vbr_extent  & e = *ep;
             const int64_t n_cells = pp->wm_cells;
-            const size_t slot      = (size_t) ggml_row_size(GGML_TYPE_F16, ne0) * e.t->ne[1] * e.t->ne[2];
-            const size_t keep      = rB * (size_t) std::max<int64_t>(n_cells, 1);
-            const size_t keep_live = std::min(slot, std::max(keep, rB * (size_t) wm_next));
-            const size_t keep_pad  = std::min(slot, (size_t) GGML_PAD(keep_live, pp->gran));
+            const vbr_span sp = vbr_span_of(e.t, type_B, n_cells, wm_next, pp->gran);
             if (n_cells > 0) {
                 if (pp->backend == nullptr) {
                     pp->backend = pp->be->backend_init(pp->device);
@@ -3273,7 +3288,7 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
                     /*.is_v        =*/ st.is_v != 0,
                     /*.stash_f16   =*/ stash_ptr,
                     /*.stash_rows  =*/ stash_rows,
-                    /*.scrub_bytes =*/ keep_pad - keep,
+                    /*.scrub_bytes =*/ sp.keep_pad - sp.keep,
                 };
                 pp->be->kv_transcode(pp->backend, &tp);
                 pp->wave_pending = true;
@@ -3282,9 +3297,6 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
         }
         vbr_set_tensor_type(t, st.is_v ? layers[ikv].v_stream : layers[ikv].k_stream, type_B);
         vbr_tier_epoch_++; // fence graph reuse off the old views (type/strides changed in place)
-        for (auto & u : units) {
-            u.second->byte_len = ggml_nbytes(u.second->t);
-        }
         vbr_degrade_cursor_--;
 
         for (const auto & [pp, ep] : units) {
@@ -3310,7 +3322,7 @@ bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
         ggml_tensor * t = st.is_v ? layers[ikv].v : layers[ikv].k; // canonical tensor: the type source of truth
         // every VMM pool holding this unit: one under -sm layer, one per device (each with its
         // shard) under -sm tensor. The tier flip is a property of the UNIT — all pools move together.
-        auto units = vbr_units_of(ikv, st.is_v != 0);
+        const auto & units = vbr_units_of(ikv, st.is_v != 0);
         if (t == nullptr || units.empty()) {
             continue;
         }
@@ -3332,7 +3344,6 @@ bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
             vbr_extent  & e   = *ep;
             const int64_t ne0 = e.t->ne[0];
             const size_t rA = ggml_row_size(e.t->type, ne0);
-            const size_t rB = ggml_row_size(type_B,    ne0);
 
             // every mapped row must become a VALID tier-B row — reads pad n_kv past the used cells, and
             // stale tier-A bytes reinterpreted as B can carry NaN f16 block scales that poison V sums
@@ -3344,9 +3355,10 @@ bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
             //               watermark wm_next at the new tier before the wave's transcode completes
             //   mapped_hi — current mapped high-water for this tensor (tier-A extent, page-rounded);
             //               scrub stops here — pages past it are zero-filled fresh on map
-            const size_t slot      = (size_t) ggml_row_size(GGML_TYPE_F16, ne0) * e.t->ne[1] * e.t->ne[2];
-            const size_t keep      = rB * (size_t) std::max<int64_t>(n_cells, 1);
-            const size_t keep_live = std::min(slot, std::max(keep, rB * (size_t) wm_next));
+            const vbr_span sp = vbr_span_of(e.t, type_B, n_cells, wm_next, pp->gran);
+            const size_t slot      = sp.slot;
+            const size_t keep      = sp.keep;
+            const size_t keep_live = sp.keep_live;
             const size_t mapped_hi = std::min(slot, (size_t) GGML_PAD(rA * (size_t) n_cells, pp->gran));
             const size_t scrub_end = std::min(mapped_hi, (size_t) GGML_PAD(keep_live, pp->gran));
 
@@ -3419,9 +3431,6 @@ bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
         // are tier B.
         vbr_set_tensor_type(t, st.is_v ? layers[ikv].v_stream : layers[ikv].k_stream, type_B);
         vbr_tier_epoch_++; // fence graph reuse off the old views (type/strides changed in place)
-        for (auto & u : units) {
-            u.second->byte_len = ggml_nbytes(u.second->t);
-        }
         return true;
     }
     return false;
@@ -3580,13 +3589,19 @@ void llama_kv_cache::vbr_transcode_anchor_test() {
             ggml_backend_synchronize(bk);
 
             // header contexts: transcode reads type/ne[0]/nb[1]/data/name of src only
-            ggml_init_params iph = { 32*ggml_tensor_overhead(), nullptr, true };
+            ggml_init_params iph = { 48*ggml_tensor_overhead(), nullptr, true };
             ggml_context * hc = ggml_init(iph);
             auto alias = [&](ggml_type tt) {
                 ggml_tensor * x = ggml_new_tensor_2d(hc, tt, ne0, N);
                 x->data = slab; x->buffer = slabbuf;
                 ggml_set_name(x, nm);
                 return x;
+            };
+            // raw device->host byte copy via a throwaway I8 header (tensor_get needs one)
+            auto download = [&](void * base, ggml_backend_buffer_t b, void * dst, size_t nbytes) {
+                ggml_tensor * d = ggml_new_tensor_1d(hc, GGML_TYPE_I8, (int64_t) nbytes);
+                d->data = base; d->buffer = b;
+                ggml_backend_tensor_get(d, dst, 0, nbytes);
             };
             for (int h = 0; h + 1 < 4; ++h) {
                 const ggml_type tto  = ladder[h + 1];
@@ -3609,13 +3624,8 @@ void llama_kv_cache::vbr_transcode_anchor_test() {
                 ggml_backend_synchronize(bk);
 
                 std::vector<uint8_t> hb(bytesTo), ib(bytesTo);
-                { ggml_init_params ip4 = { 4*ggml_tensor_overhead(), nullptr, true }; ggml_context * tc = ggml_init(ip4);
-                  ggml_tensor * d1 = ggml_new_tensor_1d(tc, GGML_TYPE_I8, (int64_t) bytesTo);
-                  d1->data = ggml_backend_buffer_get_base(hsep); d1->buffer = hsep;
-                  ggml_backend_tensor_get(d1, hb.data(), 0, bytesTo);
-                  ggml_tensor * d2 = ggml_new_tensor_1d(tc, GGML_TYPE_I8, (int64_t) bytesTo);
-                  d2->data = slab; d2->buffer = slabbuf;
-                  ggml_backend_tensor_get(d2, ib.data(), 0, bytesTo); ggml_free(tc); }
+                download(ggml_backend_buffer_get_base(hsep), hsep, hb.data(), bytesTo);
+                download(slab, slabbuf, ib.data(), bytesTo);
                 size_t same = 0, first_bad = bytesTo;
                 for (size_t i = 0; i < bytesTo; ++i) {
                     if (hb[i] == ib[i]) { same++; } else if (first_bad == bytesTo) { first_bad = i; }
@@ -3638,13 +3648,8 @@ void llama_kv_cache::vbr_transcode_anchor_test() {
                     be->kv_stash_capture(bk, alias(tto), ggml_backend_buffer_get_base(f2), N, ivar != 0);
                     ggml_backend_synchronize(bk);
                     std::vector<uint16_t> v1(fb/2), v2(fb/2);
-                    { ggml_init_params ip5 = { 4*ggml_tensor_overhead(), nullptr, true }; ggml_context * tc = ggml_init(ip5);
-                      ggml_tensor * d1 = ggml_new_tensor_1d(tc, GGML_TYPE_I8, (int64_t) fb);
-                      d1->data = ggml_backend_buffer_get_base(f1); d1->buffer = f1;
-                      ggml_backend_tensor_get(d1, v1.data(), 0, fb);
-                      ggml_tensor * d2 = ggml_new_tensor_1d(tc, GGML_TYPE_I8, (int64_t) fb);
-                      d2->data = ggml_backend_buffer_get_base(f2); d2->buffer = f2;
-                      ggml_backend_tensor_get(d2, v2.data(), 0, fb); ggml_free(tc); }
+                    download(ggml_backend_buffer_get_base(f1), f1, v1.data(), fb);
+                    download(ggml_backend_buffer_get_base(f2), f2, v2.data(), fb);
                     size_t vbad = 0; int64_t first_row = -1;
                     for (size_t i = 0; i < v1.size(); ++i) {
                         if (v1[i] != v2[i]) { vbad++; if (first_row < 0) { first_row = (int64_t) (i / (size_t) ne0); } }
@@ -3791,7 +3796,7 @@ llama_memory_vbr_state_data llama_kv_cache::memory_vbr_state(llama_seq_id seq_id
                 continue;
             }
             const vbr_extent & e = stp.is_v ? p.v[it->second] : p.k[it->second];
-            if (e.byte_len == 0 || e.t == nullptr) {
+            if (e.t == nullptr) {
                 continue;
             }
             const size_t rA_p = ggml_row_size(sim[slot], e.t->ne[0]);
@@ -4656,7 +4661,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
                 for (int side = 0; side < 2; ++side) {
                     const vbr_extent  & e = side ? p.v[ikv] : p.k[ikv];
                     const ggml_tensor * t = side ? layers[ikv].v : layers[ikv].k;
-                    if (e.byte_len != 0 && t != nullptr && t->type != e.type0) {
+                    if (e.t != nullptr && t != nullptr && t->type != e.type0) {
                         throw std::runtime_error(
                             "cannot serialize a dynamic-VBR KV cache after tier degrades — the "
                             "snapshot could never restore; save before the budget triggers, or "
@@ -5316,7 +5321,7 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
     return ubatches[i_cur];
 }
 
-uint64_t llama_kv_cache_context::get_vbr_tier_epoch() const {
+uint64_t llama_kv_cache_context::get_vbr_epoch() const {
     return kv->vbr_tier_epoch();
 }
 

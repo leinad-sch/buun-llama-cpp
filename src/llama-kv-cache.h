@@ -275,7 +275,6 @@ private:
     struct vbr_extent {
         ggml_tensor * t    = nullptr;           // pool-local tensor instance (canonical or shard)
         size_t    byte_off = 0;                 // offset of this tensor's data within the pool buffer
-        size_t    byte_len = 0;                 // current byte size (0 = tensor not pooled)
         ggml_type type0    = GGML_TYPE_COUNT;   // ENTRY tier (immutable; full-clear reset target)
         size_t    stash_off   = 0;              // offset into the f16 sink-stash buffer
         uint32_t  stash_valid = 0;              // rows captured (0 = not yet)
@@ -285,7 +284,7 @@ private:
     };
     // Multi-GPU: one vbr_pool per KV-hosting device buffer. Extent vectors stay indexed by ikv in
     // EVERY pool; only entries whose tensor (or tensor shard) lives in that pool's buffer are
-    // populated (byte_len == 0 elsewhere). Under -sm layer the populated sets are DISJOINT (each
+    // populated (e.t == nullptr elsewhere). Under -sm layer the populated sets are DISJOINT (each
     // device owns whole layers); under -sm tensor every pool holds a per-device SHARD of every
     // (layer,side), so a tier flip transcodes in every pool that has a nonzero extent for it.
     // With a single GPU there is exactly one pool and all logic reduces to the previous
@@ -297,6 +296,10 @@ private:
         size_t                used    = 0;        // high-water of placed extents (log-only)
         size_t                budget  = 0;         // per-pool share of vbr_budget_bytes_ (VA-size proportional)
         size_t                budget_base = 0;      // init-armed/fallback share: the re-derivation floor
+        // vbr_budget_eff memo: one live free-VRAM query per pool per boundary (the degrade loop
+        // and promote hysteresis both consult it repeatedly within one boundary)
+        mutable uint64_t      budget_eff_stamp = ~0ull;
+        mutable size_t        budget_eff_cache = 0;
         std::vector<vbr_extent> k;                // indexed by kv-cache layer id (ikv)
         std::vector<vbr_extent> v;
         // backend VBR vtable that owns this pool's device (resolved from the buffer type's
@@ -379,7 +382,10 @@ private:
     // every VMM pool holding an extent for one (layer,side) unit: exactly one under -sm layer,
     // one per device under -sm tensor (each with that device's shard), empty for static units.
     // A tier step applies to the unit — i.e. to EVERY entry returned here.
-    std::vector<std::pair<vbr_pool *, vbr_extent *>> vbr_units_of(size_t ikv, bool is_v);
+    // every VMM pool holding unit (ikv, side): a const ref into vbr_units_tab_, precomputed
+    // once after pool construction (membership is fixed for the cache's lifetime) — the
+    // degrade/promote paths call this per decode boundary, so it must not allocate
+    const std::vector<std::pair<vbr_pool *, vbr_extent *>> & vbr_units_of(size_t ikv, bool is_v) const;
     bool vbr_unit_pooled(size_t ikv, bool is_v) const;         // any VMM pool holds this unit
     uint32_t vbr_watermark_cells(uint32_t extra_tokens) const; // shared by prepare() + ensure_mapped
     bool     vbr_degrade_next(uint32_t wm_next);      // one step down the order; false = exhausted
@@ -440,6 +446,8 @@ private:
     // Dynamic VBR shared KV pools (M2 bookkeeping; M3 transcode/relocate) — one per KV buffer
     // (per device under -sm layer; exactly one on a single GPU)
     std::vector<vbr_pool> vbr_pools_;
+    // [ikv*2 + is_v] -> (pool, extent) units; built once at ctor end, immutable after
+    std::vector<std::vector<std::pair<vbr_pool *, vbr_extent *>>> vbr_units_tab_;
 
     // Permanent transcode oracle (env VBR_TRANSCODE_TEST): synthetic turbo8 A->A byte round-trip +
     // turbo8->turbo4 in-place-vs-separate identity, on a scoped CUDA backend. See definition.
@@ -523,14 +531,14 @@ public:
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
+    // VBR tier-flip epoch of the underlying cache (0 when VBR is off — the counter never moves)
+    uint64_t get_vbr_epoch() const override;
+
     //
     // llama_kv_cache_context specific API
     //
 
     uint32_t get_n_kv() const;
-
-    // VBR tier-flip epoch of the underlying cache (0 when VBR is off — the counter never moves)
-    uint64_t get_vbr_tier_epoch() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;

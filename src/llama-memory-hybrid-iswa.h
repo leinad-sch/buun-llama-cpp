@@ -134,6 +134,9 @@ public:
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
+    // tier epoch of the attention child (the recurrent child has no VBR)
+    uint64_t get_vbr_epoch() const override;
+
     //
     // llama_memory_hybrid_iswa_context
     //

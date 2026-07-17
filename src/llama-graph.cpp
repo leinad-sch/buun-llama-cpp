@@ -680,14 +680,6 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     turbo_vmean_fill(self_vmean, hparams);
 }
 
-uint64_t llm_graph_vbr_epoch(const llama_kv_cache_context * mctx) {
-    return mctx->get_vbr_tier_epoch();
-}
-
-uint64_t llm_graph_vbr_epoch(const llama_kv_cache_iswa_context * mctx) {
-    return mctx->get_base()->get_vbr_tier_epoch() + mctx->get_swa()->get_vbr_tier_epoch();
-}
-
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_kv_cache_context *>(params.mctx);
 
@@ -699,11 +691,6 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
-
-    // in-place VBR tier flips rewrite the cache tensors' type/strides; this graph's K/V views
-    // and set_rows dst were baked at build time (a mid-band free-VRAM-clamp wave flips tiers
-    // without an n_kv shape change, so the checks above cannot see it)
-    res &= vbr_epoch == llm_graph_vbr_epoch(mctx);
 
     return res;
 }
@@ -724,9 +711,6 @@ bool llm_graph_input_attn_k::can_reuse(const llm_graph_params & params) {
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
-
-    // fence reuse off in-place VBR tier flips (see llm_graph_input_attn_kv)
-    res &= vbr_epoch == llm_graph_vbr_epoch(mctx);
 
     return res;
 }
@@ -830,9 +814,6 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
     if (self_kq_mask_swa && self_kq_mask_swa->buffer) {
         res &= can_reuse_kq_mask(self_kq_mask_swa, mctx->get_swa(), params.ubatch, params.cparams);
     }
-
-    // fence reuse off in-place VBR tier flips in either cache (see llm_graph_input_attn_kv)
-    res &= vbr_epoch == llm_graph_vbr_epoch(mctx);
 
     return res;
 }
@@ -1190,11 +1171,6 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
 
-    // fence reuse off in-place VBR tier flips in the attention child (see llm_graph_input_attn_kv).
-    // The hybrid wrappers bypass inp_attn->can_reuse, so the fence must be repeated here — a
-    // mid-decode promote/degrade flips type/strides with no shape change the checks above can see.
-    res &= inp_attn->vbr_epoch == llm_graph_vbr_epoch(mctx->get_attn());
-
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
     res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
@@ -1237,9 +1213,6 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
     res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
-
-    // fence reuse off in-place VBR tier flips in the attention child (see llm_graph_input_mem_hybrid)
-    res &= inp_attn->vbr_epoch == llm_graph_vbr_epoch(mctx->get_attn());
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -1330,9 +1303,6 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
     }
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask_swa, attn_ctx->get_swa(), params.ubatch, params.cparams);
-
-    // fence reuse off in-place VBR tier flips in either attention child (see llm_graph_input_mem_hybrid)
-    res &= inp_attn->vbr_epoch == llm_graph_vbr_epoch(attn_ctx);
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -1493,6 +1463,17 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
         return false;
     }
 
+    // in-place VBR tier flips rewrite the cache tensors' type/strides under this graph's baked
+    // K/V views and set_rows dst with no shape change any input can see (e.g. a mid-decode
+    // promote or a free-VRAM-clamp degrade wave). One fence here covers every input class.
+    if (params.mctx != nullptr && vbr_epoch != params.mctx->get_vbr_epoch()) {
+        if (debug > 1) {
+            LLAMA_LOG_DEBUG("%s: cannot reuse graph due to a VBR tier flip\n", __func__);
+        }
+
+        return false;
+    }
+
     if (debug > 1) {
         LLAMA_LOG_DEBUG("%s: checking compatibility of %d inputs:\n", __func__, (int) inputs.size());
     }
@@ -1523,6 +1504,8 @@ llm_graph_input_i * llm_graph_result::add_input(llm_graph_input_ptr input) {
 
 void llm_graph_result::set_params(const llm_graph_params & params) {
     this->params = params;
+
+    vbr_epoch = params.mctx != nullptr ? params.mctx->get_vbr_epoch() : 0;
 }
 
 //

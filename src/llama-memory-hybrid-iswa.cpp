@@ -289,6 +289,10 @@ const llama_ubatch & llama_memory_hybrid_iswa_context::get_ubatch() const {
     return ubatches[i_next];
 }
 
+uint64_t llama_memory_hybrid_iswa_context::get_vbr_epoch() const {
+    return get_attn()->get_vbr_epoch();
+}
+
 const llama_kv_cache_iswa_context * llama_memory_hybrid_iswa_context::get_attn() const {
     return static_cast<const llama_kv_cache_iswa_context *>(ctx_attn.get());
 }

@@ -408,6 +408,7 @@ extern "C" {
     GGML_API bool                       ggml_backend_buffer_is_meta        (ggml_backend_buffer_t buf);
     GGML_API size_t                     ggml_backend_meta_buft_n_bufts     (ggml_backend_buffer_type_t meta_buft);
     GGML_API ggml_backend_buffer_type_t ggml_backend_meta_buft_simple_buft (ggml_backend_buffer_type_t meta_buft, size_t index);
+    GGML_API size_t                     ggml_backend_meta_buffer_n_bufs(ggml_backend_buffer_t meta_buf);
     GGML_API ggml_backend_buffer_t      ggml_backend_meta_buffer_simple_buffer(ggml_backend_buffer_t meta_buf, size_t index);
     // per-device shard of a tensor placed in a meta buffer (NULL if the tensor is unknown to the buffer)
     GGML_API struct ggml_tensor *       ggml_backend_meta_buffer_simple_tensor(const struct ggml_tensor * tensor, size_t index);

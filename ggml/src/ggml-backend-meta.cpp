@@ -457,7 +457,7 @@ static void ggml_backend_meta_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     delete buf_ctx;
 }
 
-static size_t ggml_backend_meta_buffer_n_bufs(ggml_backend_buffer_t meta_buf) {
+size_t ggml_backend_meta_buffer_n_bufs(ggml_backend_buffer_t meta_buf) {
     GGML_ASSERT(ggml_backend_buffer_is_meta(meta_buf));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) meta_buf->context;
     return buf_ctx->bufs.size();
@@ -1582,10 +1582,11 @@ ggml_backend_buffer_t ggml_backend_meta_alloc_ctx_tensors_from_buft_ext(
                 return nullptr;
             }
             meta_buf_ctx->bufs[i].reset(simple_buf);
+            // finalize any views the callback left untouched (it only owes the non-view tensors);
+            // a callback that finalized its own views is fine — those are skipped by the null check
             for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-                if (t->view_src != nullptr) {
-                    t->buffer = simple_buf;
-                    t->data   = (char *) t->view_src->data + t->view_offs;
+                if (t->view_src != nullptr && t->buffer == nullptr) {
+                    ggml_backend_view_init(t);
                 }
             }
         } else {

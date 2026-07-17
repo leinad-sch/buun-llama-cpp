@@ -116,6 +116,9 @@ public:
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
+    // sum of both caches' tier epochs — a flip in either fences graph reuse
+    uint64_t get_vbr_epoch() const override;
+
     //
     // llama_kv_cache_dsa_context specific API
     //
