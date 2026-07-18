@@ -44,8 +44,7 @@ struct llama_memory_vbr_params {
     // this cache's fraction of its device's spare VRAM (iSWA children share a device; the
     // parent splits by entry-tier footprint so the children never double-claim the same free)
     double   device_share = 1.0;
-    // pinned sides (mixed config, e.g. -ctk turbo8 -ctv vbr): the degrade/promote ladder
-    // never touches them; they stay in the min_bits aggregate at their fixed bits/value
+    // mixed-config side pins, see llama.h vbr_pin_k
     bool     pin_k = false;
     bool     pin_v = false;
 };

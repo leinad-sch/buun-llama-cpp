@@ -2915,12 +2915,10 @@ void llama_kv_cache::vbr_synth_generic_order() {
             __func__, vbr_degrade_order_.size(), n);
 }
 
-// --vbr-floor (cparams min_bits; env VBR_MIN_BITS override, decimal bits/value): a LITERAL
-// aggregate floor. Walk the order against the initial layout and clamp the cursor at the first
-// step that would take the aggregate below the floor — e.g. floor 4.25 with t4 = 4.125 bpv stops
-// with a few units still a tier higher. Strict-prefix clamp: the aggregate is monotone decreasing
-// along the order, and skipping ahead to a cheaper later step would violate the measured price
-// order. The default t1 floor (1.25) equals the full order's end point, so nothing clamps.
+bool llama_kv_cache::vbr_unit_movable(ggml_type t, bool is_v) const {
+    return vbr_type_is_movable(t) && !vbr_side_pinned(is_v);
+}
+
 // resolve a --vbr-floor value: env override, then the bottom-tier default for 0/auto
 static double vbr_resolve_floor_bpv(double min_bits) {
     double floor_bpv = min_bits;
@@ -2960,13 +2958,13 @@ llama_kv_cache::vbr_floor_sim_result llama_kv_cache::vbr_floor_sim(
             sim[ikv*2 + side] = entry;
             sum_bits += 8.0 * ggml_row_size(entry, t->ne[0]);
             sum_vals += t->ne[0];
-            res.n_pinned += !vbr_type_is_movable(entry) || vbr_side_pinned(side != 0);
+            res.n_pinned += !vbr_unit_movable(entry, side != 0);
         }
     }
+    res.clamp_step = vbr_degrade_order_.size();
     if (sum_vals == 0) {
         return res;
     }
-    res.clamp_step = vbr_degrade_order_.size();
     for (size_t i = 0; i < vbr_degrade_order_.size(); ++i) {
         const auto & st = vbr_degrade_order_[i];
         const auto it = map_layer_ids.find(st.il);
@@ -2975,8 +2973,7 @@ llama_kv_cache::vbr_floor_sim_result llama_kv_cache::vbr_floor_sim(
         }
         const size_t slot = (size_t) it->second * 2 + (st.is_v ? 1 : 0);
         const ggml_tensor * t = st.is_v ? layers[it->second].v : layers[it->second].k;
-        if (sim[slot] == GGML_TYPE_COUNT || t == nullptr || !vbr_type_is_movable(sim[slot]) ||
-                vbr_side_pinned(st.is_v != 0)) {
+        if (sim[slot] == GGML_TYPE_COUNT || t == nullptr || !vbr_unit_movable(sim[slot], st.is_v != 0)) {
             continue; // absent or pinned (runtime skips these steps identically)
         }
         const ggml_type type_B = vbr_tier_type(st.tier);
@@ -2988,14 +2985,12 @@ llama_kv_cache::vbr_floor_sim_result llama_kv_cache::vbr_floor_sim(
         const double bits_next = sum_bits - 8.0*rA + 8.0*rB;
         if (bits_next / sum_vals < floor_bpv - 1e-9) {
             res.clamp_step = i;
-            res.clamped    = true;
             res.next_bpv   = bits_next / sum_vals;
             break;
         }
         sim[slot] = type_B;
         sum_bits  = bits_next;
     }
-    res.aggregate_bpv  = sum_bits / sum_vals;
     res.bits_per_token = sum_bits; // one row per token per unit
     return res;
 }
@@ -3009,20 +3004,25 @@ double llama_kv_cache::memory_vbr_floor_bits_per_token(ggml_type entry_k, ggml_t
     return vbr_floor_sim(vbr_resolve_floor_bpv(floor_bpv), !vbr_pools_.empty(), entry_k, entry_v).bits_per_token;
 }
 
+// --vbr-floor (cparams min_bits; env VBR_MIN_BITS override, decimal bits/value): a LITERAL
+// aggregate floor. Walk the order against the initial layout and clamp the cursor at the first
+// step that would take the aggregate below the floor — e.g. floor 4.25 with t4 = 4.125 bpv stops
+// with a few units still a tier higher. Strict-prefix clamp: the aggregate is monotone decreasing
+// along the order, and skipping ahead to a cheaper later step would violate the measured price
+// order. The default t1 floor (1.25) equals the full order's end point, so nothing clamps.
 void llama_kv_cache::vbr_floor_clamp_order() {
     const double floor_bpv = vbr_resolve_floor_bpv(vbr_params_.min_bits);
     const auto res = vbr_floor_sim(floor_bpv, /*pooled_only =*/ true);
     vbr_degrade_limit_ = res.clamp_step;
-    if (res.end_types.empty() || res.aggregate_bpv == 0.0) {
-        vbr_degrade_limit_ = vbr_degrade_order_.size();
-        return;
+    if (res.bits_per_token == 0.0) {
+        return; // no VMM-pooled units
     }
     if (res.n_pinned > 0) {
         LLAMA_LOG_INFO("%s: VBR: %zu (layer,side) units are PINNED at non-vbr types — degrade steps "
                 "touching them are skipped; they stay in the aggregate at their fixed bits/value\n",
                 __func__, res.n_pinned);
     }
-    if (res.clamped) {
+    if (res.clamp_step < vbr_degrade_order_.size()) {
         LLAMA_LOG_INFO("%s: VBR floor %.4g bits/value: degrade order clamped at %zu/%zu steps "
                 "(next step would drop the aggregate to %.4g)\n",
                 __func__, floor_bpv, res.clamp_step, vbr_degrade_order_.size(), res.next_bpv);
@@ -3226,6 +3226,13 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
             vbr_degrade_cursor_--; // this entry's degrade never applied (skipped no-op) — free rewind
             continue;
         }
+        if (!vbr_unit_movable(t->type, st.is_v != 0)) {
+            // pinned unit: its degrades never applied, so its entries rewind for free. The
+            // type-mismatch check below does NOT cover a side pinned AT a tier type (the entry
+            // type equals the step tier for its own order entries) — guard explicitly.
+            vbr_degrade_cursor_--;
+            continue;
+        }
         if (t->type != vbr_tier_type(st.tier)) {
             vbr_degrade_cursor_--; // this entry's degrade never applied (skipped no-op) — free rewind
             continue;
@@ -3366,7 +3373,7 @@ bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
         if (t == nullptr || units.empty()) {
             continue;
         }
-        if (!vbr_type_is_movable(t->type) || vbr_side_pinned(st.is_v != 0)) {
+        if (!vbr_unit_movable(t->type, st.is_v != 0)) {
             continue; // PINNED unit (explicit non-vbr side): the ladder never touches it
         }
         const ggml_type type_B = vbr_tier_type(st.tier);
@@ -3820,8 +3827,7 @@ llama_memory_vbr_state_data llama_kv_cache::memory_vbr_state(llama_seq_id seq_id
         }
         const size_t slot = (size_t) it->second * 2 + (stp.is_v ? 1 : 0);
         const ggml_tensor * t = stp.is_v ? layers[it->second].v : layers[it->second].k;
-        if (sim[slot] == GGML_TYPE_COUNT || t == nullptr || !vbr_type_is_movable(sim[slot]) ||
-                vbr_side_pinned(stp.is_v != 0)) {
+        if (sim[slot] == GGML_TYPE_COUNT || t == nullptr || !vbr_unit_movable(sim[slot], stp.is_v != 0)) {
             continue;
         }
         const ggml_type type_B = vbr_tier_type(stp.tier);

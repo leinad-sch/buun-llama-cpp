@@ -186,11 +186,9 @@ public:
     // shared floor-walk core (runtime clamp + fit capacity math), see impl comment
     struct vbr_floor_sim_result {
         size_t clamp_step     = 0;     // steps applied before the clamp (== order size if unclamped)
-        bool   clamped        = false;
         size_t n_pinned       = 0;
-        double aggregate_bpv  = 0.0;   // end-state aggregate bits/value (0 = no units)
         double next_bpv       = 0.0;   // aggregate the clamping step would have produced
-        double bits_per_token = 0.0;   // end-state KV bits per token across all units
+        double bits_per_token = 0.0;   // end-state KV bits per token (0 = no units)
         std::vector<ggml_type> end_types; // [layers*2] end-state tier, GGML_TYPE_COUNT = absent
     };
     vbr_floor_sim_result vbr_floor_sim(double floor_bpv, bool pooled_only,
@@ -404,6 +402,9 @@ private:
     bool vbr_unit_pooled(size_t ikv, bool is_v) const;         // any VMM pool holds this unit
     // side pinned via mixed config (-ctk turbo8 -ctv vbr): ladder never touches it
     bool vbr_side_pinned(bool is_v) const { return is_v ? vbr_params_.pin_v : vbr_params_.pin_k; }
+    // unified pin contract: a unit may be stepped only if its current type is a vbr tier AND
+    // its side is not flag-pinned — every degrade/promote/sim walk must use this predicate
+    bool vbr_unit_movable(ggml_type t, bool is_v) const;
     uint32_t vbr_watermark_cells(uint32_t extra_tokens) const; // shared by prepare() + ensure_mapped
     bool     vbr_degrade_next(uint32_t wm_next);      // one step down the order; false = exhausted
                                                       // wm_next = projected watermark incl. the

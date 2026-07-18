@@ -1627,11 +1627,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.vbr_vram_budget_bytes = params.vbr_vram_budget_bytes;
     cparams.vbr_dynamic           = params.vbr_dynamic();
     cparams.vbr_budget_explicit   = params.vbr_vram_budget_explicit;
-    // mixed config: a side that did NOT select the vbr alias while the other did is PINNED
-    // at its explicit type (arg.cpp warns about this at parse time — enforce it here).
-    // Whole-cache turbo configs driven by --vbr-* knobs alone pin nothing (both sides degrade).
-    cparams.vbr_pin_k = params.vbr_dynamic() && !params.vbr_cache_type_k && params.vbr_cache_type_v;
-    cparams.vbr_pin_v = params.vbr_dynamic() && !params.vbr_cache_type_v && params.vbr_cache_type_k;
+    cparams.vbr_pin_k = params.vbr_pin_k();
+    cparams.vbr_pin_v = params.vbr_pin_v();
 
     return cparams;
 }

@@ -38,7 +38,6 @@ class common_params_fit_exception : public std::runtime_error {
 struct common_vbr_fit_costs {
     ggml_type entry_k = GGML_TYPE_COUNT; // in: true entry types (cparams' are price-swapped)
     ggml_type entry_v = GGML_TYPE_COUNT;
-    double    floor_bpv = 0.0;           // in: --vbr-floor (0 = bottom-tier default)
     double    bits_pt_floor = 0.0;       // out: per-token KV bits at the achievable clamped mix
     double    bits_pt_price = 0.0;       // out: per-token KV bits at cparams' (price) types
 };
@@ -182,7 +181,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     common_memory_breakdown_print(ctx);
 
     if (vbr_costs != nullptr) {
-        vbr_costs->bits_pt_floor = llama_vbr_floor_bits_per_token(ctx, vbr_costs->entry_k, vbr_costs->entry_v, vbr_costs->floor_bpv);
+        vbr_costs->bits_pt_floor = llama_vbr_floor_bits_per_token(ctx, vbr_costs->entry_k, vbr_costs->entry_v, cparams->vbr_min_bits);
         vbr_costs->bits_pt_price = llama_vbr_floor_bits_per_token(ctx, cparams->type_k, cparams->type_v, 1e30);
     }
 
@@ -238,9 +237,8 @@ static void common_params_fit_impl(
 
     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
     common_vbr_fit_costs vbr_costs;
-    vbr_costs.entry_k   = type_k_entry;
-    vbr_costs.entry_v   = type_v_entry;
-    vbr_costs.floor_bpv = cparams->vbr_min_bits;
+    vbr_costs.entry_k = type_k_entry;
+    vbr_costs.entry_v = type_v_entry;
     const dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level,
             cparams->vbr_dynamic ? &vbr_costs : nullptr);
     const size_t nd = devs.size(); // number of devices
@@ -460,9 +458,7 @@ static void common_params_fit_impl(
         // common_fit_params); scale to the achievable floor-mix cost so these byte->token
         // estimates are true floor capacities, capped at the trained context (beyond it rope
         // is invalid and compute growth unaccounted)
-        const double kv_scale = cparams->vbr_dynamic ? vbr_kv_scale : 1.0;
-
-        const int64_t ctx_full = (int64_t) ((double) sum_context_kv_bytes(dmds_full) * kv_scale);
+        const int64_t ctx_full = (int64_t) ((double) sum_context_kv_bytes(dmds_full) * vbr_kv_scale);
         if (ctx_full <= 0) {
             return uint32_t(0);
         }
@@ -476,7 +472,7 @@ static void common_params_fit_impl(
         const dmds_t dmds_probe = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
         cparams->n_ctx = 0;
 
-        const int64_t ctx_probe = (int64_t) ((double) sum_context_kv_bytes(dmds_probe) * kv_scale);
+        const int64_t ctx_probe = (int64_t) ((double) sum_context_kv_bytes(dmds_probe) * vbr_kv_scale);
         if (ctx_probe <= 0 || ctx_full <= ctx_probe) {
             return vbr_scale_est((uint64_t) budget_bytes * hp_nct / (uint64_t) ctx_full);
         }
@@ -1214,21 +1210,23 @@ enum common_params_fit_status common_fit_params(
     const ggml_type type_v_entry = cparams->type_v;
     if (cparams->vbr_dynamic) {
         const ggml_type price_t = common_vbr_floor_price_tier(cparams->vbr_min_bits);
-        // only the degradable sides price at the floor: turbo tiers and F16 (the dynamic
-        // entry). A PINNED side (explicit q8_0/bf16 in a mixed config) keeps its real cost —
-        // pricing it at the floor tier would over-advertise capacity for that half.
-        auto movable = [](ggml_type t) {
-            return t == GGML_TYPE_F16 ;
+        // only the degradable sides price at the floor: a swappable type (F16 dynamic entry or
+        // a turbo tier) on a side that is not pin-flagged. A PINNED side (vbr_pin_k/v, or an
+        // explicit q8_0/bf16 the runtime cannot transcode) keeps its real cost — pricing it at
+        // the floor tier would over-advertise capacity for that half. Mirrors the runtime's
+        // vbr_unit_movable contract: type swappable AND side not pinned.
+        auto movable = [](ggml_type t, bool pinned) {
+            return !pinned && (t == GGML_TYPE_F16 || ggml_is_turbo_kv_type(t));
         };
-        if (movable(cparams->type_k)) {
+        if (movable(cparams->type_k, cparams->vbr_pin_k)) {
             cparams->type_k = price_t;
         }
-        if (movable(cparams->type_v)) {
+        if (movable(cparams->type_v, cparams->vbr_pin_v)) {
             cparams->type_v = price_t;
         }
         LOG_INF("%s: VBR dynamic: fitting with KV priced at the %s floor tier%s\n",
                 __func__, ggml_type_name(price_t),
-                (movable(type_k_entry) && movable(type_v_entry))
+                (movable(type_k_entry, cparams->vbr_pin_k) && movable(type_v_entry, cparams->vbr_pin_v))
                     ? "" : " (pinned side at its own cost)");
     }
 
@@ -1247,12 +1245,9 @@ enum common_params_fit_status common_fit_params(
     cparams->type_k = type_k_entry;
     cparams->type_v = type_v_entry;
 
-    // the fit priced KV at the largest tier <= the floor; the runtime floor clamp keeps the
-    // aggregate at >= the LITERAL floor, so a fit-chosen n_ctx overstates capacity by
-    // floor/price — scale the advert down (tier-exact floors: factor 1, no change)
-    // (fit-derived adverts are already floor-mix-priced: the estimators inside
+    // fit-derived adverts are already floor-mix-priced (the estimators inside
     // common_params_fit_impl scale measured price-tier KV bytes by the degrade-order walk's
-    // achievable mix cost — no scalar price/floor post-adjustment needed here)
+    // achievable mix cost) — no post-adjustment needed here
 
     const int64_t t1_us = llama_time_us();
     LOG_TRC("%s: fitting params to free memory took %.2f seconds\n", __func__, (t1_us - t0_us) * 1e-6);

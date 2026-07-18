@@ -703,6 +703,11 @@ struct common_params {
     bool vbr_dynamic() const {
         return vbr_enabled() && (vbr_budget == "dynamic" || vbr_budget == "auto" || vbr_budget.empty());
     }
+    // mixed config: a side that did NOT select the vbr alias while the other did is PINNED at
+    // its explicit type (arg.cpp warns at parse time; the runtime ladder skips it). Whole-cache
+    // turbo configs driven by --vbr-* knobs alone pin nothing — both sides degrade.
+    bool vbr_pin_k() const { return vbr_dynamic() && !vbr_cache_type_k && vbr_cache_type_v; }
+    bool vbr_pin_v() const { return vbr_dynamic() && !vbr_cache_type_v && vbr_cache_type_k; }
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
