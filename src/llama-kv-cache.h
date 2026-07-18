@@ -181,6 +181,21 @@ public:
     // totals for cross-cache aggregation (iSWA weights its children by stored values)
     void   kv_bpv_accum(double & bits, double & vals) const;
 
+    double memory_vbr_floor_bits_per_token(ggml_type entry_k, ggml_type entry_v, double floor_bpv) override;
+
+    // shared floor-walk core (runtime clamp + fit capacity math), see impl comment
+    struct vbr_floor_sim_result {
+        size_t clamp_step     = 0;     // steps applied before the clamp (== order size if unclamped)
+        bool   clamped        = false;
+        size_t n_pinned       = 0;
+        double aggregate_bpv  = 0.0;   // end-state aggregate bits/value (0 = no units)
+        double next_bpv       = 0.0;   // aggregate the clamping step would have produced
+        double bits_per_token = 0.0;   // end-state KV bits per token across all units
+        std::vector<ggml_type> end_types; // [layers*2] end-state tier, GGML_TYPE_COUNT = absent
+    };
+    vbr_floor_sim_result vbr_floor_sim(double floor_bpv, bool pooled_only,
+            ggml_type entry_k = GGML_TYPE_COUNT, ggml_type entry_v = GGML_TYPE_COUNT) const;
+
     bool get_has_shift() const;
 
     ggml_type type_k() const;

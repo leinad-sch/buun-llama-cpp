@@ -94,6 +94,14 @@ LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * m
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
+// Per-token KV bits of the layout the --vbr-floor clamp lands on: walk the VBR degrade order
+// from the given entry types (GGML_TYPE_COUNT = each tensor's current type) until the aggregate
+// bits/value would cross floor_bpv (<= 0 = bottom-tier default; pass 1e30 for the un-walked
+// layout cost of the given types). Returns 0 when the context has no VBR-capable cache.
+// Works on no_alloc (fit dry-load) contexts — the fit uses it for floor-true capacity math.
+LLAMA_API double llama_vbr_floor_bits_per_token(struct llama_context * ctx,
+        enum ggml_type entry_k, enum ggml_type entry_v, double floor_bpv);
+
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits

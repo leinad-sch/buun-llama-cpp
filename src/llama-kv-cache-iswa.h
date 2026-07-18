@@ -71,6 +71,14 @@ public:
 
     llama_memory_vbr_state_data memory_vbr_state(llama_seq_id seq_id, uint32_t n_tokens_extra) const override;
 
+    // summed across both children: each context token holds one row in each cache, so the
+    // per-token floor cost is additive (SWA rows recycle, but the fit's measured KV bytes
+    // count both caches the same way — the ratio consumer stays on one basis)
+    double memory_vbr_floor_bits_per_token(ggml_type entry_k, ggml_type entry_v, double floor_bpv) override {
+        return kv_base->memory_vbr_floor_bits_per_token(entry_k, entry_v, floor_bpv) +
+               kv_swa ->memory_vbr_floor_bits_per_token(entry_k, entry_v, floor_bpv);
+    }
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;

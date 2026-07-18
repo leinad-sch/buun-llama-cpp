@@ -5786,6 +5786,15 @@ struct llama_memory_vbr_state_data llama_memory_vbr_state(llama_memory_t mem, ll
     return mem->memory_vbr_state(seq_id, n_tokens_extra);
 }
 
+double llama_vbr_floor_bits_per_token(struct llama_context * ctx, enum ggml_type entry_k, enum ggml_type entry_v, double floor_bpv) {
+    llama_memory_t mem = ctx ? llama_get_memory(ctx) : nullptr;
+    if (!mem) {
+        return 0.0;
+    }
+
+    return mem->memory_vbr_floor_bits_per_token(entry_k, entry_v, floor_bpv);
+}
+
 static llama_memory_recurrent * get_recurrent_mem(llama_memory_t mem) {
     if (auto * h = dynamic_cast<llama_memory_hybrid *>(mem))      return h->get_mem_recr();
     if (auto * h = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) return h->get_mem_recr();

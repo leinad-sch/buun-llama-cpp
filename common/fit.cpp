@@ -31,6 +31,18 @@ class common_params_fit_exception : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// floor-true KV pricing inputs/outputs for dynamic VBR (see common_params_fit_impl): the dry
+// context is created with PRICE-tier types (the movable swap in common_fit_params), while the
+// runtime floor clamp lands on a discrete tier MIX along the degrade order — capacity math must
+// use the mix cost, queried from the dry context via llama_vbr_floor_bits_per_token.
+struct common_vbr_fit_costs {
+    ggml_type entry_k = GGML_TYPE_COUNT; // in: true entry types (cparams' are price-swapped)
+    ggml_type entry_v = GGML_TYPE_COUNT;
+    double    floor_bpv = 0.0;           // in: --vbr-floor (0 = bottom-tier default)
+    double    bits_pt_floor = 0.0;       // out: per-token KV bits at the achievable clamped mix
+    double    bits_pt_price = 0.0;       // out: per-token KV bits at cparams' (price) types
+};
+
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const char * path_model,
         const llama_model_params * mparams,
@@ -39,7 +51,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         uint32_t & hp_ngl,
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
-        ggml_log_level log_level) {
+        ggml_log_level log_level,
+        common_vbr_fit_costs * vbr_costs = nullptr) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -168,6 +181,11 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
 
     common_memory_breakdown_print(ctx);
 
+    if (vbr_costs != nullptr) {
+        vbr_costs->bits_pt_floor = llama_vbr_floor_bits_per_token(ctx, vbr_costs->entry_k, vbr_costs->entry_v, vbr_costs->floor_bpv);
+        vbr_costs->bits_pt_price = llama_vbr_floor_bits_per_token(ctx, cparams->type_k, cparams->type_v, 1e30);
+    }
+
     llama_free(ctx);
     llama_model_free(model);
     llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
@@ -201,7 +219,8 @@ common_device_memory_data_vec common_get_device_memory_data(
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
-        size_t * margins_s, uint32_t n_ctx_min, enum ggml_log_level log_level) {
+        size_t * margins_s, uint32_t n_ctx_min, enum ggml_log_level log_level,
+        ggml_type type_k_entry, ggml_type type_v_entry) {
     // SPLIT_MODE_TENSOR runs through the single-device paths below: the model exposes exactly one
     // meta device whose memory report is the balanced-equivalent aggregate of the real GPUs (see
     // common_get_device_memory_data_impl) and whose margin is the sum of the per-device targets.
@@ -218,8 +237,27 @@ static void common_params_fit_impl(
     // step 1: get data for default parameters and check whether any changes are necessary in the first place
 
     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
-    const dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+    common_vbr_fit_costs vbr_costs;
+    vbr_costs.entry_k   = type_k_entry;
+    vbr_costs.entry_v   = type_v_entry;
+    vbr_costs.floor_bpv = cparams->vbr_min_bits;
+    const dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level,
+            cparams->vbr_dynamic ? &vbr_costs : nullptr);
     const size_t nd = devs.size(); // number of devices
+
+    // dynamic VBR: measured dry-load KV bytes are PRICE-tier-priced (largest tier <= the floor)
+    // but the runtime clamp holds the aggregate at a discrete tier MIX >= the literal floor —
+    // capacity estimates must scale measured KV cost up by mix/price or they over-advertise
+    // (e.g. floor 6: price t4 = 4.125 bpv vs an achievable mix of ~6.04)
+    double vbr_kv_scale = 1.0;
+    if (vbr_costs.bits_pt_floor > 0.0 && vbr_costs.bits_pt_price > 0.0) {
+        vbr_kv_scale = std::max(1.0, vbr_costs.bits_pt_floor / vbr_costs.bits_pt_price);
+        if (vbr_kv_scale > 1.0 + 1e-6) {
+            LOG_INF("%s: VBR dynamic: floor mix costs %.4g bits/token vs %.4g at the pricing tier "
+                    "— scaling KV capacity math by %.3f\n",
+                    __func__, vbr_costs.bits_pt_floor, vbr_costs.bits_pt_price, vbr_kv_scale);
+        }
+    }
 
     const bool sm_tensor = mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR; // nd == 1, a meta device wrapping the real GPUs
 
@@ -322,13 +360,14 @@ static void common_params_fit_impl(
             return 0;
         }
         int64_t budget_gr = 0;
-        int64_t ctx_kv    = 0; // floor-priced KV cost of the full context (RS excluded)
+        int64_t ctx_kv    = 0; // price-tier KV cost of the full context (RS excluded)
         for (size_t id = 0; id < nd; id++) {
             const llama_device_memory_data & dmd = dmds_full[id];
             budget_gr += std::max<int64_t>(0, dmd.total - (int64_t) dmd.mb.model - (int64_t) dmd.mb.compute
                                               - (int64_t) dmd.mb.context_fixed - margins[id]);
             ctx_kv    += (int64_t) dmd.mb.context - (int64_t) dmd.mb.context_fixed;
         }
+        ctx_kv = (int64_t) ((double) ctx_kv * vbr_kv_scale); // floor-mix cost, not price-tier
         if (ctx_kv <= 0 || budget_gr <= 0) {
             return 0;
         }
@@ -397,21 +436,19 @@ static void common_params_fit_impl(
         LOG_INF("%s: VBR dynamic: KV VRAM budget %" PRIu64 " MiB (%s) — decode-time degrade controller armed\n",
                 __func__, std::max<uint64_t>(1, budget / MiB),
                 vbr_budget_explicit != 0 ? "explicit" : "auto, from remaining memory");
-        // the fit prices KV at the largest tier <= the floor; the runtime clamp keeps the
-        // aggregate >= the LITERAL floor, so the full context really costs ctx_priced*floor/price.
-        // Warn up front when the budget cannot deliver it (the runtime will also warn, at fill).
+        // the fit prices KV at the largest tier <= the floor; the runtime clamp lands on the
+        // achievable tier MIX (vbr_kv_scale x the priced cost). Warn up front when the budget
+        // cannot deliver the full context there (the runtime will also warn, at fill).
         const double floor_bpv = cparams->vbr_min_bits > 0.0 ? cparams->vbr_min_bits
                                                              : vbr_type_bits(GGML_TYPE_TURBO1_TCQ);
-        const double price_bpv = vbr_type_bits(common_vbr_floor_price_tier(cparams->vbr_min_bits));
         const int64_t ctx_priced = sum_context_kv_bytes(dmds_full);
-        // fire for the tier-exact default floor too (ratio 1): a budget below the floor-priced
-        // full-context cost is the only startup signal for the runtime's warn-once-exceed state
-        if (ctx_priced > 0 &&
-            (double) budget < (double) ctx_priced * std::max(1.0, floor_bpv / price_bpv)) {
+        // fire for the tier-exact default floor too (scale 1): a budget below the floor-cost
+        // full context is the only startup signal for the runtime's warn-once-exceed state
+        if (ctx_priced > 0 && (double) budget < (double) ctx_priced * vbr_kv_scale) {
             LOG_WRN("%s: VBR dynamic: the KV budget (%" PRIu64 " MiB) is below the full-context cost "
                     "at the %.4g bits/value floor (~%.0f MiB) — the deepest fills will hit the floor "
                     "clamp early\n", __func__, budget / MiB,
-                    floor_bpv, (double) ctx_priced * (floor_bpv / price_bpv) / (double) MiB);
+                    floor_bpv, (double) ctx_priced * vbr_kv_scale / (double) MiB);
         }
     };
 
@@ -419,12 +456,13 @@ static void common_params_fit_impl(
         if (!vbr_selected || cparams->n_ctx != 0 || hp_nct == 0 || budget_bytes == 0) {
             return uint32_t(0);
         }
-        // in dynamic mode the KV is priced at the floor tier for the whole fit (see
-        // common_fit_params), so these byte->token estimates ARE floor capacities already; just
-        // cap at the trained context (beyond it rope is invalid and compute growth unaccounted)
+        // in dynamic mode the KV is priced at the PRICE tier for the whole fit (see
+        // common_fit_params); scale to the achievable floor-mix cost so these byte->token
+        // estimates are true floor capacities, capped at the trained context (beyond it rope
+        // is invalid and compute growth unaccounted)
+        const double kv_scale = cparams->vbr_dynamic ? vbr_kv_scale : 1.0;
 
-
-        const int64_t ctx_full = sum_context_kv_bytes(dmds_full);
+        const int64_t ctx_full = (int64_t) ((double) sum_context_kv_bytes(dmds_full) * kv_scale);
         if (ctx_full <= 0) {
             return uint32_t(0);
         }
@@ -438,7 +476,7 @@ static void common_params_fit_impl(
         const dmds_t dmds_probe = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
         cparams->n_ctx = 0;
 
-        const int64_t ctx_probe = sum_context_kv_bytes(dmds_probe);
+        const int64_t ctx_probe = (int64_t) ((double) sum_context_kv_bytes(dmds_probe) * kv_scale);
         if (ctx_probe <= 0 || ctx_full <= ctx_probe) {
             return vbr_scale_est((uint64_t) budget_bytes * hp_nct / (uint64_t) ctx_full);
         }
@@ -1174,7 +1212,6 @@ enum common_params_fit_status common_fit_params(
     // load — the cache still STARTS at turbo8 and degrades toward the floor as it fills.
     const ggml_type type_k_entry = cparams->type_k;
     const ggml_type type_v_entry = cparams->type_v;
-    const uint32_t  n_ctx_entry  = cparams->n_ctx;
     if (cparams->vbr_dynamic) {
         const ggml_type price_t = common_vbr_floor_price_tier(cparams->vbr_min_bits);
         // only the degradable sides price at the floor: turbo tiers and F16 (the dynamic
@@ -1196,7 +1233,8 @@ enum common_params_fit_status common_fit_params(
     }
 
     try {
-        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, log_level);
+        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, log_level,
+                type_k_entry, type_v_entry);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());
@@ -1212,32 +1250,9 @@ enum common_params_fit_status common_fit_params(
     // the fit priced KV at the largest tier <= the floor; the runtime floor clamp keeps the
     // aggregate at >= the LITERAL floor, so a fit-chosen n_ctx overstates capacity by
     // floor/price — scale the advert down (tier-exact floors: factor 1, no change)
-    if (cparams->vbr_dynamic && n_ctx_entry == 0 && cparams->n_ctx != 0) {
-        const double floor_bpv = cparams->vbr_min_bits > 0.0
-            ? cparams->vbr_min_bits
-            : 8.0 * ggml_type_size(GGML_TYPE_TURBO1_TCQ) / ggml_blck_size(GGML_TYPE_TURBO1_TCQ);
-        const ggml_type price_t  = common_vbr_floor_price_tier(cparams->vbr_min_bits);
-        const double price_bpv = 8.0 * ggml_type_size(price_t) / ggml_blck_size(price_t);
-        if (floor_bpv > price_bpv + 1e-9) {
-            // Only VBR-dynamic sides were priced at price_t (via movable()). Pinned
-            // sides kept their real cost. Compute the correct per-token KV ratio.
-            // movable() = (t == GGML_TYPE_F16) but that lambda isn't in scope here
-            auto is_vbr = [](ggml_type t) { return t == GGML_TYPE_F16; };
-            auto type_bpv = [](ggml_type t) { return 8.0 * ggml_type_size(t) / ggml_blck_size(t); };
-            double k_cost = is_vbr(type_k_entry) ? price_bpv : type_bpv(type_k_entry);
-            double v_cost = is_vbr(type_v_entry) ? price_bpv : type_bpv(type_v_entry);
-            double kv_at_price = k_cost + v_cost;
-            k_cost = is_vbr(type_k_entry) ? floor_bpv : type_bpv(type_k_entry);
-            v_cost = is_vbr(type_v_entry) ? floor_bpv : type_bpv(type_v_entry);
-            double kv_at_floor = k_cost + v_cost;
-            uint32_t adjusted = (uint32_t) ((double) cparams->n_ctx * (kv_at_price / kv_at_floor));
-            adjusted = std::max<uint32_t>(256, adjusted - adjusted % 256);
-            LOG_INF("%s: VBR dynamic: advertised n_ctx %" PRIu32 " -> %" PRIu32 " (literal floor %.4g "
-                    "bits/value costs more than the %s pricing tier)\n",
-                    __func__, cparams->n_ctx, adjusted, floor_bpv, ggml_type_name(price_t));
-            cparams->n_ctx = adjusted;
-        }
-    }
+    // (fit-derived adverts are already floor-mix-priced: the estimators inside
+    // common_params_fit_impl scale measured price-tier KV bytes by the degrade-order walk's
+    // achievable mix cost — no scalar price/floor post-adjustment needed here)
 
     const int64_t t1_us = llama_time_us();
     LOG_TRC("%s: fitting params to free memory took %.2f seconds\n", __func__, (t1_us - t0_us) * 1e-6);

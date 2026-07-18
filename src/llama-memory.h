@@ -145,6 +145,14 @@ struct llama_memory_i {
         return {};
     }
 
+    // per-token KV bits of the layout the --vbr-floor clamp lands on when walking the degrade
+    // order from the given entry types (GGML_TYPE_COUNT = each tensor's current type;
+    // floor_bpv <= 0 = bottom-tier default). 0 = no VBR-capable cache. The fit pass calls this
+    // on its dry-load context for floor-true capacity math (llama_vbr_floor_bits_per_token).
+    virtual double memory_vbr_floor_bits_per_token(ggml_type /*entry_k*/, ggml_type /*entry_v*/, double /*floor_bpv*/) {
+        return 0.0;
+    }
+
     //
     // ops
     //

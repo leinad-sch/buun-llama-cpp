@@ -2921,44 +2921,52 @@ void llama_kv_cache::vbr_synth_generic_order() {
 // with a few units still a tier higher. Strict-prefix clamp: the aggregate is monotone decreasing
 // along the order, and skipping ahead to a cheaper later step would violate the measured price
 // order. The default t1 floor (1.25) equals the full order's end point, so nothing clamps.
-void llama_kv_cache::vbr_floor_clamp_order() {
-    vbr_degrade_limit_ = vbr_degrade_order_.size();
-    double floor_bpv = vbr_params_.min_bits;
+// resolve a --vbr-floor value: env override, then the bottom-tier default for 0/auto
+static double vbr_resolve_floor_bpv(double min_bits) {
+    double floor_bpv = min_bits;
     if (const char * env = getenv("VBR_MIN_BITS")) {
         floor_bpv = atof(env); // "auto"/"none" parse to 0 -> the t1 default below
     }
     if (floor_bpv <= 0.0) {
         floor_bpv = 8.0 * ggml_type_size(GGML_TYPE_TURBO1_TCQ) / ggml_blck_size(GGML_TYPE_TURBO1_TCQ);
     }
-    // simulate the order over the per-unit tiers of the initial layout. PINNED units (non-tier
-    // types) stay in the aggregate at their fixed bpv — the floor is a literal aggregate — but
-    // no step may move them (mirrors the runtime skip in vbr_degrade_next).
-    std::vector<ggml_type> sim(layers.size() * 2, GGML_TYPE_COUNT);
+    return floor_bpv;
+}
+
+// Shared floor-walk core (runtime clamp AND fit capacity math): simulate the degrade order over
+// the per-unit tiers of the entry layout, stopping before the aggregate would cross floor_bpv.
+// PINNED units (non-tier types or a flag-pinned side) stay in the aggregate at their fixed bpv —
+// the floor is a literal aggregate — but no step may move them (mirrors vbr_degrade_next).
+// pooled_only restricts units to VMM-pooled ones (the runtime); dry-load contexts have no pools
+// and pass false. entry_k/entry_v override each side's tensor type (the fit's cparams types are
+// price-swapped during fitting; it passes the true entry types) — GGML_TYPE_COUNT = tensor type.
+llama_kv_cache::vbr_floor_sim_result llama_kv_cache::vbr_floor_sim(
+        double floor_bpv, bool pooled_only, ggml_type entry_k, ggml_type entry_v) const {
+    vbr_floor_sim_result res;
+    res.end_types.assign(layers.size() * 2, GGML_TYPE_COUNT);
+    auto & sim = res.end_types;
     double  sum_bits = 0.0;
     int64_t sum_vals = 0;
-    size_t  n_pinned = 0;
     for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
         for (int side = 0; side < 2; ++side) {
             const ggml_tensor * t = side ? layers[ikv].v : layers[ikv].k;
-            if (t == nullptr || !vbr_unit_pooled(ikv, side != 0)) { // only VMM-pooled units can degrade
-                continue;
+            if (t == nullptr || (pooled_only && !vbr_unit_pooled(ikv, side != 0))) {
+                continue; // absent, or (runtime) not VMM-pooled — only pooled units can degrade
             }
+            const ggml_type entry = side ? (entry_v != GGML_TYPE_COUNT ? entry_v : t->type)
+                                         : (entry_k != GGML_TYPE_COUNT ? entry_k : t->type);
             // aggregate math on the canonical tensor: shard row sizes are additive across pools
             // (blocks never straddle the split), so this is exact under -sm tensor too
-            sim[ikv*2 + side] = t->type;
-            sum_bits += 8.0 * ggml_row_size(t->type, t->ne[0]);
+            sim[ikv*2 + side] = entry;
+            sum_bits += 8.0 * ggml_row_size(entry, t->ne[0]);
             sum_vals += t->ne[0];
-            n_pinned += !vbr_type_is_movable(t->type) || vbr_side_pinned(side != 0);
+            res.n_pinned += !vbr_type_is_movable(entry) || vbr_side_pinned(side != 0);
         }
     }
     if (sum_vals == 0) {
-        return;
+        return res;
     }
-    if (n_pinned > 0) {
-        LLAMA_LOG_INFO("%s: VBR: %zu (layer,side) units are PINNED at non-vbr types — degrade steps "
-                "touching them are skipped; they stay in the aggregate at their fixed bits/value\n",
-                __func__, n_pinned);
-    }
+    res.clamp_step = vbr_degrade_order_.size();
     for (size_t i = 0; i < vbr_degrade_order_.size(); ++i) {
         const auto & st = vbr_degrade_order_[i];
         const auto it = map_layer_ids.find(st.il);
@@ -2979,14 +2987,45 @@ void llama_kv_cache::vbr_floor_clamp_order() {
         }
         const double bits_next = sum_bits - 8.0*rA + 8.0*rB;
         if (bits_next / sum_vals < floor_bpv - 1e-9) {
-            vbr_degrade_limit_ = i;
-            LLAMA_LOG_INFO("%s: VBR floor %.4g bits/value: degrade order clamped at %zu/%zu steps "
-                    "(next step would drop the aggregate to %.4g)\n",
-                    __func__, floor_bpv, i, vbr_degrade_order_.size(), bits_next / sum_vals);
+            res.clamp_step = i;
+            res.clamped    = true;
+            res.next_bpv   = bits_next / sum_vals;
             break;
         }
         sim[slot] = type_B;
         sum_bits  = bits_next;
+    }
+    res.aggregate_bpv  = sum_bits / sum_vals;
+    res.bits_per_token = sum_bits; // one row per token per unit
+    return res;
+}
+
+// per-token KV bits of the layout the floor clamp lands on — the fit pass calls this on its
+// dry-load context (llama_vbr_floor_bits_per_token) for floor-true capacity math
+double llama_kv_cache::memory_vbr_floor_bits_per_token(ggml_type entry_k, ggml_type entry_v, double floor_bpv) {
+    if (vbr_degrade_order_.empty()) {
+        vbr_load_degrade_order(); // dry contexts never reach the VMM arming block
+    }
+    return vbr_floor_sim(vbr_resolve_floor_bpv(floor_bpv), !vbr_pools_.empty(), entry_k, entry_v).bits_per_token;
+}
+
+void llama_kv_cache::vbr_floor_clamp_order() {
+    const double floor_bpv = vbr_resolve_floor_bpv(vbr_params_.min_bits);
+    const auto res = vbr_floor_sim(floor_bpv, /*pooled_only =*/ true);
+    vbr_degrade_limit_ = res.clamp_step;
+    if (res.end_types.empty() || res.aggregate_bpv == 0.0) {
+        vbr_degrade_limit_ = vbr_degrade_order_.size();
+        return;
+    }
+    if (res.n_pinned > 0) {
+        LLAMA_LOG_INFO("%s: VBR: %zu (layer,side) units are PINNED at non-vbr types — degrade steps "
+                "touching them are skipped; they stay in the aggregate at their fixed bits/value\n",
+                __func__, res.n_pinned);
+    }
+    if (res.clamped) {
+        LLAMA_LOG_INFO("%s: VBR floor %.4g bits/value: degrade order clamped at %zu/%zu steps "
+                "(next step would drop the aggregate to %.4g)\n",
+                __func__, floor_bpv, res.clamp_step, vbr_degrade_order_.size(), res.next_bpv);
     }
 
     // page-exact mapped-physical cost of the FLOOR layout (the sim's end state) at full kv_size —
@@ -2999,12 +3038,12 @@ void llama_kv_cache::vbr_floor_clamp_order() {
     }
     for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
         for (int side = 0; side < 2; ++side) {
-            if (sim[ikv*2 + side] == GGML_TYPE_COUNT) {
+            if (res.end_types[ikv*2 + side] == GGML_TYPE_COUNT) {
                 continue;
             }
             // page rounding is per pool instance (per device shard under -sm tensor)
             for (const auto & [p, e] : vbr_units_of(ikv, side != 0)) {
-                const size_t need = ggml_row_size(sim[ikv*2 + side], e->t->ne[0]) * (size_t) e->t->ne[1];
+                const size_t need = ggml_row_size(res.end_types[ikv*2 + side], e->t->ne[0]) * (size_t) e->t->ne[1];
                 vbr_floor_cost_bytes_ += GGML_PAD(need, p->gran);
             }
         }
