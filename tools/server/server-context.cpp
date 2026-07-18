@@ -1667,6 +1667,21 @@ private:
                         llama_model_dflash_block_size(model_dft.get()));
             }
 
+            // DFlash verify is not lossless when the target runs --split-mode tensor: the
+            // hidden-state capture callback splits the meta-backend graph mid-layer and the
+            // verify logits drift from the sequential decode (temp-0 outputs diverge; MTP
+            // verify on the same target is bit-exact). Refuse rather than silently degrade.
+            // LLAMA_DFLASH_TP_UNSAFE=1 re-enables for debugging.
+            if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
+                params_base.split_mode == LLAMA_SPLIT_MODE_TENSOR &&
+                getenv("LLAMA_DFLASH_TP_UNSAFE") == nullptr) {
+                SRV_WRN("%s", "DFlash speculative decoding is not yet lossless with "
+                        "--split-mode tensor — disabling speculative decoding (for a "
+                        "TP-compatible drafter use MTP: --spec-type draft-mtp)\n");
+                model_dft.reset();
+                params_base.speculative.set_type(COMMON_SPECULATIVE_TYPE_NONE);
+            }
+
             if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
                 const int block_size = llama_model_dflash_block_size(model_dft.get());
                 params_dft.n_ubatch = LLAMA_DFLASH_MAX_SLOTS * block_size;
@@ -1693,7 +1708,8 @@ private:
             }
 
             // Upstream MTP: create draft context from target model's MTP heads
-            if (spec_mtp && params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH) {
+            if (spec_mtp && model_dft != nullptr &&
+                params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH) {
                 auto cparams = common_context_params_to_llama(params_dft);
                 cparams.ctx_type  = LLAMA_CONTEXT_TYPE_MTP;
                 cparams.n_rs_seq  = 0;
