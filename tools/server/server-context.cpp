@@ -1667,21 +1667,6 @@ private:
                         llama_model_dflash_block_size(model_dft.get()));
             }
 
-            // DFlash verify is not lossless when the target runs --split-mode tensor: the
-            // hidden-state capture callback splits the meta-backend graph mid-layer and the
-            // verify logits drift from the sequential decode (temp-0 outputs diverge; MTP
-            // verify on the same target is bit-exact). Refuse rather than silently degrade.
-            // LLAMA_DFLASH_TP_UNSAFE=1 re-enables for debugging.
-            if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
-                params_base.split_mode == LLAMA_SPLIT_MODE_TENSOR &&
-                getenv("LLAMA_DFLASH_TP_UNSAFE") == nullptr) {
-                SRV_WRN("%s", "DFlash speculative decoding is not yet lossless with "
-                        "--split-mode tensor — disabling speculative decoding (for a "
-                        "TP-compatible drafter use MTP: --spec-type draft-mtp)\n");
-                model_dft.reset();
-                params_base.speculative.set_type(COMMON_SPECULATIVE_TYPE_NONE);
-            }
-
             if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
                 const int block_size = llama_model_dflash_block_size(model_dft.get());
                 params_dft.n_ubatch = LLAMA_DFLASH_MAX_SLOTS * block_size;
@@ -1708,8 +1693,7 @@ private:
             }
 
             // Upstream MTP: create draft context from target model's MTP heads
-            if (spec_mtp && model_dft != nullptr &&
-                params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH) {
+            if (spec_mtp && params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH) {
                 auto cparams = common_context_params_to_llama(params_dft);
                 cparams.ctx_type  = LLAMA_CONTEXT_TYPE_MTP;
                 cparams.n_rs_seq  = 0;
@@ -4604,8 +4588,13 @@ private:
 
         // DFlash: enable tape recording if any slot has draft backup (needs tape replay for rollback);
         // turned off in post_cycle() so recording stays active across ALL sub-batches
+        // Not under --split-mode tensor: the meta backend exposes no GPU-typed backend, so tape
+        // capture degrades to CPU eval-callback reads of head-sharded mid-GDN tensors, which the
+        // meta get_tensor chunk splicer cannot represent (asserts or garbage → corrupted replay
+        // state, worse with draft depth). TP rollback re-decodes accepted tokens instead.
         dflash_tape_active = needs_reeval
             && params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH
+            && params_base.split_mode != LLAMA_SPLIT_MODE_TENSOR
             && std::any_of(slots.begin(), slots.end(), [](const server_slot & s) { return s.has_draft_backup; });
         if (dflash_tape_active) {
             llama_set_tape_recording(ctx_tgt, true);
@@ -5055,6 +5044,25 @@ private:
                         auto * mem = llama_get_memory(ctx_tgt);
                         llama_memory_seq_rm(mem, seq_backup, -1, -1);
                         llama_memory_seq_rm(mem, slot.id, slot.prompt.tokens.pos_next(), -1);
+                    } else if (params_base.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+                        // tensor-split target records no tape (see dflash_tape_active) — restore
+                        // from backup and re-decode the accepted tokens (exact, replay-free)
+                        llama_clear_tree_parent_ids(ctx_tgt);
+                        auto * mem = llama_get_memory(ctx_tgt);
+                        const int n_past_before = slot.n_tokens_before_draft;
+                        llama_memory_seq_rm(mem, slot.id, n_past_before, -1);
+                        llama_memory_seq_cp(mem, seq_backup, slot.id, -1, -1);
+                        llama_memory_seq_rm(mem, seq_backup, -1, -1);
+                        const int n_reeval = slot.prompt.n_tokens() - n_past_before;
+                        if (n_reeval > 0) {
+                            llama_batch batch_reeval = llama_batch_init(n_reeval, 0, 1);
+                            const auto & toks = slot.prompt.tokens.get_text_tokens();
+                            for (int j = n_past_before; j < slot.prompt.n_tokens(); ++j) {
+                                common_batch_add(batch_reeval, toks[j], j, { slot.id }, false);
+                            }
+                            llama_decode(ctx_tgt, batch_reeval);
+                            llama_batch_free(batch_reeval);
+                        }
                     } else {
                         llama_clear_tree_parent_ids(ctx_tgt);
                         llama_dflash_rollback(ctx_tgt, slot.id, seq_backup, slot.n_tokens_before_draft, (int) ids.size());
