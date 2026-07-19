@@ -373,10 +373,19 @@ static void common_params_fit_impl(
         ctx_kv = (int64_t) ((double) ctx_kv * vbr_kv_scale); // floor-mix cost, not price-tier
         // #88: the fattn f16 dequant scratch grows linearly with the attended width at depth
         // (turbo/degraded tiers materialize K/V to f16). It lives OUTSIDE the KV budget — it is
-        // paid from the margin — so it belongs in exactly this total-VRAM wall constraint and
-        // nowhere else: adding it to the budget solves would double-charge the margin (auto) or
-        // free VRAM (--vbr-vram). On train-capped boxes this term changes nothing.
-        ctx_kv += (int64_t) (vbr_costs.scratch_bytes_pt * (double) hp_nct);
+        // paid from the fit MARGIN — so charge it against the margin, not on top of it: the wall
+        // subtracts max(margin, full-context scratch), i.e. only the scratch excess beyond the
+        // margin tightens the cap. Charging margin + scratch would double-count (on a typical
+        // 24GB single-model box S(n_ctx_train) ~= the 1 GiB margin and the advert is unchanged —
+        // matching measured full-context fills); the budget solves must not carry it at all.
+        {
+            const double scratch_full = vbr_costs.scratch_bytes_pt * (double) hp_nct;
+            double margin_total = 0.0;
+            for (size_t id = 0; id < nd; id++) {
+                margin_total += (double) margins[id];
+            }
+            budget_gr -= (int64_t) std::max(0.0, scratch_full - margin_total);
+        }
         if (ctx_kv <= 0 || budget_gr <= 0) {
             return 0;
         }
