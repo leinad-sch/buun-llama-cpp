@@ -146,6 +146,17 @@ static std::vector<llama_vbr_dev> llama_vbr_backend_devs_for_buft(ggml_backend_b
     return ret;
 }
 
+// #88: which sides the fattn f16 dequant scratch serves for a (K,V) type pair — mirrors the
+// prefill/decode materialize conditions in ggml-cuda/fattn.cu (turbo tiers always; q8_0/bf16
+// only when paired with a turbo side, where the mixed pair is dequanted to (F16,F16)). F16
+// never materializes.
+static void llama_kv_scratch_sides(ggml_type tk, ggml_type tv, bool & need_k, bool & need_v) {
+    const bool turbo_k = ggml_is_turbo_kv_type(tk);
+    const bool turbo_v = ggml_is_turbo_kv_type(tv);
+    need_k = turbo_k || ((tk == GGML_TYPE_Q8_0 || tk == GGML_TYPE_BF16) && turbo_v);
+    need_v = turbo_v || ((tv == GGML_TYPE_Q8_0 || tv == GGML_TYPE_BF16) && turbo_k);
+}
+
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
@@ -1208,6 +1219,20 @@ llama_kv_cache::llama_kv_cache(
                         p.buf  = inst->buffer;
                         p.base = (char *) ggml_backend_buffer_get_base(inst->buffer);
                         p.size = ggml_backend_buffer_get_size(inst->buffer);
+                        // #88: even bookkeeping-only (static, non-VMM) pools need the backend
+                        // vtable + device ordinal for the boundary-time dequant-scratch reserve.
+                        // nullptr on backends without turbo support — those pools' types can
+                        // never be turbo, and the reserve loop skips them.
+                        ggml_backend_buffer_type_t pbft = ggml_backend_buffer_get_type(inst->buffer);
+                        p.be = llama_vbr_backend_iface_for_buft(pbft);
+                        if (p.be != nullptr) {
+                            for (int j = 0; j < p.be->get_device_count(); ++j) {
+                                if (p.be->buffer_type(j) == pbft) {
+                                    p.device = j;
+                                    break;
+                                }
+                            }
+                        }
                         vbr_pools_.push_back(std::move(p));
                     }
                 }
@@ -2066,6 +2091,22 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         vbr_last_used_ = used_now;
     }
 
+    // #88: grow the fattn f16 dequant scratch to this batch's watermark OUTSIDE the graphs, for
+    // the sides that are dequant-active after the wave above — see vbr_scratch_reserve. Runs for
+    // every turbo-typed cache (bookkeeping pools exist even without the dynamic controller);
+    // non-turbo caches have no pools and skip in O(1).
+    if (!vbr_pools_.empty()) {
+        uint32_t n_tokens_scr = 0;
+        for (const auto & ub : ubatches) {
+            n_tokens_scr += ub.n_tokens;
+        }
+        if (!vbr_scratch_reserve(vbr_watermark_cells(n_tokens_scr))) {
+            LLAMA_LOG_ERROR("%s: f16 dequant scratch reserve failed (device memory exhausted) — "
+                    "failing this batch recoverably\n", __func__);
+            return {};
+        }
+    }
+
     llama_kv_cache::slot_info_vec_t res;
 
     struct state_t {
@@ -2653,6 +2694,59 @@ bool llama_kv_cache::vbr_over_budget(uint32_t wm_cells) const {
     return false;
 }
 
+// #88: boundary-time f16 dequant scratch reserve. The fattn prefill/materialize paths grow a
+// per-(device, side) f16 scratch to the attended width implicitly, mid-graph — a context-linear
+// consumer the budget doesn't own, and one that can JUMP from zero to watermark width in a
+// single graph when a degrade wave first takes a side off f16 (the #88 abort: a 217 MiB grow
+// with only the 192 MiB live headroom left at wave time). Growing it HERE — sized for the sides
+// that are dequant-active AFTER this boundary's wave — keeps every grow in an eager pass where
+// exhaustion fails the batch recoverably. Sides that never leave f16 never reserve a byte, so
+// symmetric-vbr sessions under no memory pressure are byte-identical to before. Covers static
+// turbo pools too (bookkeeping-only pools resolve their vtable at init).
+bool llama_kv_cache::vbr_scratch_reserve(uint32_t wm_cells) {
+    for (auto & p : vbr_pools_) {
+        if (p.be == nullptr || p.device < 0) {
+            continue;
+        }
+        size_t k_bytes = 0;
+        size_t v_bytes = 0;
+        for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+            const ggml_tensor * tk = p.k[ikv].t;
+            const ggml_tensor * tv = p.v[ikv].t;
+            if (tk == nullptr && tv == nullptr) {
+                continue;
+            }
+            bool need_k = false;
+            bool need_v = false;
+            llama_kv_scratch_sides(tk ? tk->type : GGML_TYPE_F16,
+                                   tv ? tv->type : GGML_TYPE_F16, need_k, need_v);
+            if (need_k && tk) {
+                k_bytes = std::max(k_bytes, ggml_row_size(GGML_TYPE_F16, tk->ne[0]) * wm_cells);
+            }
+            if (need_v && tv) {
+                v_bytes = std::max(v_bytes, ggml_row_size(GGML_TYPE_F16, tv->ne[0]) * wm_cells);
+            }
+        }
+        if (k_bytes == 0 && v_bytes == 0) {
+            continue;
+        }
+        if (!p.be->kv_dequant_scratch_reserve(p.device, k_bytes, v_bytes)) {
+            // First-activation transient: the wave that just took this side off f16 queued its
+            // freed tier-A tail pages as deferred unmaps (released at the NEXT boundary), so the
+            // bytes the wave freed are physically unavailable to the very reserve it triggered.
+            // Reclaim them now and retry once — mirrors vbr_vmm_try_map below.
+            LLAMA_LOG_WARN("%s: f16 dequant scratch reserve of %.1f + %.1f MiB failed on device %d — "
+                    "flushing deferred unmaps and retrying\n",
+                    __func__, k_bytes/1048576.0, v_bytes/1048576.0, p.device);
+            vbr_flush_deferred_unmaps();
+            if (!p.be->kv_dequant_scratch_reserve(p.device, k_bytes, v_bytes)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 // grow every pool's physical backing to `wm` cells. Returns false on physical exhaustion
 // (after reclaiming the previous wave's deferred tail unmaps and retrying once) WITHOUT
 // aborting — the caller decides whether its position in the batch lifecycle is recoverable.
@@ -3013,6 +3107,75 @@ double llama_kv_cache::memory_vbr_floor_bits_per_token(ggml_type entry_k, ggml_t
         vbr_load_degrade_order(); // dry contexts never reach the VMM arming block
     }
     return vbr_floor_sim(vbr_resolve_floor_bpv(floor_bpv), !vbr_pools_.empty(), entry_k, entry_v).bits_per_token;
+}
+
+// #88: per-token bytes of the fattn f16 dequant scratch at the SETTLED (deep-fill) state,
+// summed over KV-hosting devices. The scratch is one f16-width buffer per (device, side),
+// shared across layers — its per-token cost is the widest layer's f16 row, NOT a per-layer
+// sum. A side contributes when its settled state needs dequant: static/pinned turbo entry
+// types always; movable (unpinned f16) sides in dynamic mode whenever the floor is below f16
+// (they leave f16 under pressure at exactly the depths where this cost matters); q8_0/bf16
+// pinned sides only next to an active partner. The fit charges this in the total-VRAM wall
+// constraint (vbr_growth_reachable_ctx_cap) ONLY — the auto/explicit KV budget solves must
+// not carry it (the scratch draws from the fit margin / free VRAM, not from the KV budget).
+double llama_kv_cache::memory_vbr_scratch_bytes_per_token(ggml_type entry_k, ggml_type entry_v, double floor_bpv) {
+    if (layers.empty()) {
+        return 0.0;
+    }
+    const double floor_eff = vbr_resolve_floor_bpv(floor_bpv);
+    auto side_settles_active = [&](ggml_type t0, bool pinned) -> bool {
+        if (ggml_is_turbo_kv_type(t0)) {
+            return true; // dequant-active from token 0
+        }
+        if (t0 == GGML_TYPE_F16 && !pinned && vbr_params_.dynamic && floor_eff < 16.0 - 1e-9) {
+            return true; // degrades off f16 under pressure
+        }
+        return false;
+    };
+    const ggml_type ek = entry_k != GGML_TYPE_COUNT ? entry_k
+                       : (layers[0].k ? layers[0].k->type : GGML_TYPE_F16);
+    const ggml_type ev = entry_v != GGML_TYPE_COUNT ? entry_v
+                       : (layers[0].v ? layers[0].v->type : GGML_TYPE_F16);
+    bool ak = side_settles_active(ek, vbr_params_.pin_k);
+    bool av = side_settles_active(ev, vbr_params_.pin_v);
+    // mixed q8_0/bf16 corner: those sides only materialize next to a turbo partner
+    ak = ak || ((ek == GGML_TYPE_Q8_0 || ek == GGML_TYPE_BF16) && av);
+    av = av || ((ev == GGML_TYPE_Q8_0 || ev == GGML_TYPE_BF16) && ak);
+    if (!ak && !av) {
+        return 0.0;
+    }
+    // per-device (per-pool) widest f16 row per active side; pools exist for every turbo-capable
+    // config. Dry no-pool contexts (fit probe before allocation) fall back to the canonical
+    // layer tensors as one device — the fit runs single-device dry loads.
+    double total = 0.0;
+    if (!vbr_pools_.empty()) {
+        for (const auto & p : vbr_pools_) {
+            size_t k_row = 0;
+            size_t v_row = 0;
+            for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+                if (p.k[ikv].t != nullptr) {
+                    k_row = std::max(k_row, ggml_row_size(GGML_TYPE_F16, p.k[ikv].t->ne[0]));
+                }
+                if (p.v[ikv].t != nullptr) {
+                    v_row = std::max(v_row, ggml_row_size(GGML_TYPE_F16, p.v[ikv].t->ne[0]));
+                }
+            }
+            total += (ak ? (double) k_row : 0.0) + (av ? (double) v_row : 0.0);
+        }
+    } else {
+        size_t k_row = 0;
+        size_t v_row = 0;
+        for (const auto & L : layers) {
+            if (L.k != nullptr) {
+                k_row = std::max(k_row, ggml_row_size(GGML_TYPE_F16, L.k->ne[0]));
+            }
+            if (L.v != nullptr) {
+                v_row = std::max(v_row, ggml_row_size(GGML_TYPE_F16, L.v->ne[0]));
+            }
+        }
+        total = (ak ? (double) k_row : 0.0) + (av ? (double) v_row : 0.0);
+    }
+    return total;
 }
 
 // --vbr-floor (cparams min_bits; env VBR_MIN_BITS override, decimal bits/value): a LITERAL

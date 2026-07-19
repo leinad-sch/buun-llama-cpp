@@ -40,6 +40,10 @@ struct common_vbr_fit_costs {
     ggml_type entry_v = GGML_TYPE_COUNT;
     double    bits_pt_floor = 0.0;       // out: per-token KV bits at the achievable clamped mix
     double    bits_pt_price = 0.0;       // out: per-token KV bits at cparams' (price) types
+    // #88: per-token bytes of the fattn f16 dequant scratch at the settled deep-fill state — a
+    // context-linear consumer OUTSIDE the KV budget (it draws from the fit margin). Charged in
+    // the total-VRAM wall constraint only, never in the budget-capacity solves.
+    double    scratch_bytes_pt = 0.0;    // out
 };
 
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
@@ -183,6 +187,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     if (vbr_costs != nullptr) {
         vbr_costs->bits_pt_floor = llama_vbr_floor_bits_per_token(ctx, vbr_costs->entry_k, vbr_costs->entry_v, cparams->vbr_min_bits);
         vbr_costs->bits_pt_price = llama_vbr_floor_bits_per_token(ctx, cparams->type_k, cparams->type_v, 1e30);
+        vbr_costs->scratch_bytes_pt = llama_vbr_scratch_bytes_per_token(ctx, vbr_costs->entry_k, vbr_costs->entry_v, cparams->vbr_min_bits);
     }
 
     llama_free(ctx);
@@ -366,6 +371,12 @@ static void common_params_fit_impl(
             ctx_kv    += (int64_t) dmd.mb.context - (int64_t) dmd.mb.context_fixed;
         }
         ctx_kv = (int64_t) ((double) ctx_kv * vbr_kv_scale); // floor-mix cost, not price-tier
+        // #88: the fattn f16 dequant scratch grows linearly with the attended width at depth
+        // (turbo/degraded tiers materialize K/V to f16). It lives OUTSIDE the KV budget — it is
+        // paid from the margin — so it belongs in exactly this total-VRAM wall constraint and
+        // nowhere else: adding it to the budget solves would double-charge the margin (auto) or
+        // free VRAM (--vbr-vram). On train-capped boxes this term changes nothing.
+        ctx_kv += (int64_t) (vbr_costs.scratch_bytes_pt * (double) hp_nct);
         if (ctx_kv <= 0 || budget_gr <= 0) {
             return 0;
         }
@@ -447,6 +458,19 @@ static void common_params_fit_impl(
                     "at the %.4g bits/value floor (~%.0f MiB) — the deepest fills will hit the floor "
                     "clamp early\n", __func__, budget / MiB,
                     floor_bpv, (double) ctx_priced * vbr_kv_scale / (double) MiB);
+        }
+        // #88: explicit -c bypasses every advert estimator, so the only startup honesty signal
+        // for an overcommitted context is this warn: the f16 dequant scratch is paid from the
+        // fit margin, and when the full-context scratch outgrows it the deepest fills can stop
+        // short of -c — recoverably (per-request context-exceeded), not with an abort.
+        if (cparams->n_ctx != 0 && vbr_costs.scratch_bytes_pt > 0.0) {
+            const double scratch_full = vbr_costs.scratch_bytes_pt * (double) cparams->n_ctx;
+            if (scratch_full > (double) margin_per_dev) {
+                LOG_WRN("%s: VBR dynamic: the f16 dequant scratch needs ~%.0f MiB at -c %u, beyond "
+                        "the %.0f MiB fit margin — the deepest fills may stop short of the full "
+                        "context (recoverably)\n", __func__, scratch_full / (double) MiB,
+                        cparams->n_ctx, (double) margin_per_dev / (double) MiB);
+            }
         }
     };
 

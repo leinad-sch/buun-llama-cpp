@@ -182,6 +182,7 @@ public:
     void   kv_bpv_accum(double & bits, double & vals) const;
 
     double memory_vbr_floor_bits_per_token(ggml_type entry_k, ggml_type entry_v, double floor_bpv) override;
+    double memory_vbr_scratch_bytes_per_token(ggml_type entry_k, ggml_type entry_v, double floor_bpv) override;
 
     // shared floor-walk core (runtime clamp + fit capacity math), see impl comment
     struct vbr_floor_sim_result {
@@ -383,6 +384,7 @@ private:
     bool     vbr_promote_next(uint32_t wm_next);      // occupancy dropped: re-promote one container
     void     vbr_floor_clamp_order();
     void     vbr_flush_deferred_unmaps();
+    bool     vbr_scratch_reserve(uint32_t wm_cells);  // #88: boundary-time f16 dequant scratch grow
     char *   vbr_stash_ensure(vbr_pool & p);          // lazy per-pool sink-stash buffer; returns base
     void     vbr_load_degrade_order();                // baked table, VBR_DEGRADE_ORDER=<file>, or generic fallback
     void     vbr_synth_generic_order();               // cross-model curves for unsupported archs (VBR_FORCE_GENERIC=1 to force)

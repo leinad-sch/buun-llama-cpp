@@ -92,6 +92,12 @@ struct ggml_vbr_backend_iface {
     // per-device fence; the device's next graph_compute inserts a GPU-side wait on it, so
     // the decode graph waits for the degrade wave WITHOUT blocking the host.
     void (*fence_arm)(ggml_backend_t backend);
+    // #88: grow the per-device f16 dequant scratch (the buffer the flash-attention prefill /
+    // materialize paths grow implicitly to the attended width) to hold >= k_bytes / v_bytes,
+    // OUTSIDE any graph. Called at the decode boundary so physical exhaustion fails HERE,
+    // recoverably, instead of aborting mid-decode. false = physical memory exhausted (the
+    // caller flushes its deferred unmaps and retries once before failing the batch).
+    bool (*kv_dequant_scratch_reserve)(int device, size_t k_bytes, size_t v_bytes);
 };
 
 // proc name resolved via ggml_backend_reg_get_proc_address

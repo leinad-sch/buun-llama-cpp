@@ -872,9 +872,9 @@ static void common_params_postprocess_vbr(common_params & params) {
             params.vbr_capacity_bits  = common_vbr_capacity_surrogate_bits(floor_bits);
         }
         // Dynamic = the M3 runtime degrade controller (VMM-backed pool, price-ordered in-place
-        // transcodes). The cache starts at the turbo8 entry tier (the baked degrade order's F16
-        // band no-ops on a t8 start) and whole (layer,side) tensors degrade selectively as mapped
-        // bytes approach the KV VRAM budget:
+        // transcodes). The cache starts at the F16 entry tier (forced below; the baked orders'
+        // f16->t8 band is the first to fire) and whole (layer,side) tensors degrade selectively
+        // as mapped bytes approach the KV VRAM budget:
         //   entry = F16; the baked orders' fp16->t8 band degrades it first under pressure;
         //   --vbr-vram <SIZE>  explicit budget, armed here;
         //   --vbr-vram auto    (default) budget derived from remaining VRAM after model/overhead

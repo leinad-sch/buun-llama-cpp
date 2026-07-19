@@ -1355,15 +1355,17 @@ static int64_t next_pow2_i64(int64_t x) {
 // that bakes in the new pointer — for the graph whose OWN K/V view grew. A co-resident context's
 // captured graph on the same device sees no ne change, so address moves also bump
 // fattn_scratch_epoch, which fences ALL captured graphs (see fattn.cuh).
-static half * kv_dequant_scratch(int device, size_t need_bytes,
-                                 ggml_vbr_vmm_pool ** vmm, size_t * vmm_va,
-                                 half ** cuda_buf, size_t * cuda_size) {
+static half * kv_dequant_scratch_try(int device, size_t need_bytes,
+                                     ggml_vbr_vmm_pool ** vmm, size_t * vmm_va,
+                                     half ** cuda_buf, size_t * cuda_size) {
     if (ggml_backend_cuda_vmm_available(device)) {
         if (*vmm == nullptr || need_bytes > *vmm_va) {
             if (*vmm) {
                 ggml_backend_cuda_vmm_pool_free(*vmm);
                 *vmm = nullptr;
                 *vmm_va = 0;
+                fattn_scratch_epoch[device]++; // old base dies with the reservation, even if
+                                               // the re-reserve below fails
             }
             const size_t va = (size_t) next_pow2_i64((int64_t) need_bytes);
             *vmm = ggml_backend_cuda_vmm_pool_init(device, va);
@@ -1374,8 +1376,8 @@ static half * kv_dequant_scratch(int device, size_t need_bytes,
         }
         if (*vmm) {
             if (!ggml_backend_cuda_vmm_pool_map(*vmm, 0, need_bytes)) {
-                GGML_ABORT("VBR f16 dequant scratch: VMM physical exhausted mapping %.1f MiB on "
-                           "device %d (KV budget under-degraded)", need_bytes / 1048576.0, device);
+                return nullptr; // physical exhaustion — caller decides (reserve fails
+                                // recoverably; the in-graph wrapper below aborts)
             }
             return (half *) ggml_backend_cuda_vmm_pool_base(*vmm);
         }
@@ -1383,12 +1385,55 @@ static half * kv_dequant_scratch(int device, size_t need_bytes,
     }
     const size_t alloc = (size_t) next_pow2_i64((int64_t) need_bytes);
     if (alloc > *cuda_size) {
-        if (*cuda_buf) CUDA_CHECK(cudaFree(*cuda_buf));
-        CUDA_CHECK(cudaMalloc(cuda_buf, alloc));
+        if (*cuda_buf) {
+            CUDA_CHECK(cudaFree(*cuda_buf));
+            *cuda_buf  = nullptr;
+            *cuda_size = 0;
+            fattn_scratch_epoch[device]++; // old address gone even if the grow below fails
+        }
+        half * p = nullptr;
+        if (cudaMalloc(&p, alloc) != cudaSuccess) {
+            (void) cudaGetLastError(); // clear the OOM so later CUDA_CHECKs don't trip on it
+            return nullptr;
+        }
+        *cuda_buf  = p;
         *cuda_size = alloc;
-        fattn_scratch_epoch[device]++; // address moved
     }
     return *cuda_buf;
+}
+
+static half * kv_dequant_scratch(int device, size_t need_bytes,
+                                 ggml_vbr_vmm_pool ** vmm, size_t * vmm_va,
+                                 half ** cuda_buf, size_t * cuda_size) {
+    half * buf = kv_dequant_scratch_try(device, need_bytes, vmm, vmm_va, cuda_buf, cuda_size);
+    if (buf == nullptr) {
+        // Expected unreachable: the boundary-time reserve below grows the scratch to the
+        // watermark before every batch, so a mid-graph grow should always find its pages mapped.
+        GGML_ABORT("VBR f16 dequant scratch: physical memory exhausted growing to %.1f MiB on "
+                   "device %d (boundary reserve missed)", need_bytes / 1048576.0, device);
+    }
+    return buf;
+}
+
+// Boundary-time scratch reserve (ggml_vbr_backend_iface): grow both sides' f16 dequant scratch
+// OUTSIDE graph execution, so the mid-graph growers above always find their pages mapped and
+// physical exhaustion surfaces here — recoverably — instead of aborting mid-decode. Called by
+// the KV cache at the llama_decode boundary with post-degrade-wave watermark sizes; also keeps
+// every scratch address move in an eager pass by construction (CUDA-graph capture safety).
+bool ggml_backend_cuda_kv_dequant_scratch_reserve(int device, size_t k_bytes, size_t v_bytes) {
+    GGML_ASSERT(device >= 0 && device < GGML_CUDA_MAX_DEVICES);
+    ggml_cuda_set_device(device); // the cudaMalloc fallback path allocates on the current device
+    if (k_bytes > 0 && kv_dequant_scratch_try(device, k_bytes,
+                                              &kv_dequant_k_vmm[device], &kv_dequant_k_vmm_va[device],
+                                              &kv_dequant_k_buf[device], &kv_dequant_k_buf_size[device]) == nullptr) {
+        return false;
+    }
+    if (v_bytes > 0 && kv_dequant_scratch_try(device, v_bytes,
+                                              &kv_dequant_v_vmm[device], &kv_dequant_v_vmm_va[device],
+                                              &kv_dequant_v_buf[device], &kv_dequant_v_buf_size[device]) == nullptr) {
+        return false;
+    }
+    return true;
 }
 
 static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
