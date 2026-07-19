@@ -121,6 +121,14 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override;
 
+    // set_input() rewrites every buffer (hidden window, positions, masks) from the live
+    // cross state on each call, so the graph is reusable whenever the baked shapes match.
+    // Without this override the base class refuses reuse and the drafter rebuilds its
+    // graph (and re-captures CUDA graphs) on every draft call.
+    bool can_reuse(const llm_graph_params & params) override {
+        return cross == params.cross && n_block == (int64_t) params.ubatch.n_tokens;
+    }
+
     ggml_tensor * target_hidden     = nullptr; // [n_target_features, ctx_len]
     ggml_tensor * pos_ctx           = nullptr; // [ctx_len]
     ggml_tensor * kq_mask           = nullptr; // [ctx_len + n_block, n_block, 1, 1]
