@@ -131,6 +131,20 @@ struct dflash_capture_data {
     // Reused scratch for the multi-seq scatter path (avoid per-ubatch alloc).
     std::vector<float> scatter_buf;
 
+    // GPU capture staging: per-captured-layer [n_embd, stage_max_tokens] tensors the
+    // graph copies l_out into directly (single-seq whole-batch decodes). While a staged
+    // ubatch is in flight the eval callback skips l_out entirely — no graph chop, no
+    // device→host gather. stage_n_tokens reports how many tokens the last staged
+    // decode captured (0 = staging did not cover the last decode; read the host
+    // buffers instead).
+    std::vector<ggml_tensor *> stage_tensors;
+    ggml_context * stage_ctx = nullptr;
+    ggml_backend_buffer_t stage_buf = nullptr;
+    int stage_max_tokens = 0;
+    bool stage_enabled = false;  // consumer opted in (a D2D route out of staging exists)
+    bool stage_active = false;
+    int stage_n_tokens = 0;
+
     dflash_tape_gpu * active_tape() const {
         return (active_tape_idx >= 0 && active_tape_idx < (int) tapes.size())
                    ? tapes[active_tape_idx].get()
@@ -170,6 +184,12 @@ struct dflash_capture_data {
         }
         if (replay_buf) {
             ggml_backend_buffer_free(replay_buf);
+        }
+        if (stage_buf) {
+            ggml_backend_buffer_free(stage_buf);
+        }
+        if (stage_ctx) {
+            ggml_free(stage_ctx);
         }
     }
 };
@@ -538,6 +558,11 @@ public:
     int32_t get_n_layer_hiddens() const;
 
     void set_dflash_capture(const int32_t * layer_ids, int32_t n_layers);
+    void allocate_capture_stage_gpu();
+    void set_capture_stage_enabled(bool enabled);
+    // returns tokens staged by the last staged decode (0 = none) and the device
+    // pointer of the layer's staging data (shard 0 under --split-mode tensor)
+    int32_t dflash_capture_stage_get(int32_t layer_idx, const void ** data);
     void set_dflash_sample_temp(float temp);
     void set_dflash_topk(int k);
     void set_dflash_n_slots(int n);

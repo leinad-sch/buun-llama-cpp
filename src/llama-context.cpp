@@ -1205,7 +1205,9 @@ static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_d
 
     if (ask) {
         if (h_it != cap->hidden_name_idx.end()) {
-            return true;
+            // graph-embedded staging copies capture this ubatch — skipping here avoids
+            // the per-layer graph chop + full-device sync the callback would force
+            return !cap->stage_active;
         }
         if (cap->tape_enabled && cap->tape_name_map.count(t->name)) {
             if (cap->active_tape()) {
@@ -1396,6 +1398,93 @@ void llama_context::set_dflash_capture(const int32_t * layer_ids, int32_t n_laye
     if (memory) {
         memory->set_force_split_seq(true);
     }
+
+    allocate_capture_stage_gpu();
+}
+
+// GPU capture staging: one [n_embd, LLAMA_DFLASH_MAX_VERIFY_TOKENS] tensor per captured
+// layer, allocated on the GPU (or in a meta buffer under --split-mode tensor, where the
+// split-state callback defaults unknown names to MIRRORED — the post-allreduce l_out is
+// mirrored too, so the graph-embedded copy is a device-local write on every GPU and the
+// consumer reads shard 0). Failure to allocate just leaves the eval-callback path active.
+void llama_context::allocate_capture_stage_gpu() {
+    if (!dflash_capture || dflash_capture->layer_ids.empty() || !dflash_capture->stage_tensors.empty()) {
+        return;
+    }
+
+    ggml_backend_buffer_type_t buft = nullptr;
+    if (ggml_backend_t gpu_backend = find_gpu_backend()) {
+        buft = ggml_backend_get_default_buffer_type(gpu_backend);
+    } else {
+        for (auto & backend : backends) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+            if (dev && ggml_backend_dev_is_meta(dev)) {
+                buft = ggml_backend_get_default_buffer_type(backend.get());
+                break;
+            }
+        }
+    }
+    if (!buft) {
+        return; // CPU-only context: host capture is already free of device syncs
+    }
+
+    const int n_layers   = (int) dflash_capture->layer_ids.size();
+    const int max_tokens = (int) LLAMA_DFLASH_MAX_VERIFY_TOKENS;
+    const int64_t n_embd = model.hparams.n_embd;
+
+    size_t ctx_mem = ggml_tensor_overhead() * (n_layers + 2);
+    struct ggml_init_params ctx_params = { ctx_mem, nullptr, true };
+    ggml_context * stage_ctx = ggml_init(ctx_params);
+
+    dflash_capture->stage_tensors.reserve(n_layers);
+    for (int i = 0; i < n_layers; ++i) {
+        ggml_tensor * t = ggml_new_tensor_2d(stage_ctx, GGML_TYPE_F32, n_embd, max_tokens);
+        ggml_format_name(t, "dflash_stage-%d", i);
+        dflash_capture->stage_tensors.push_back(t);
+    }
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(stage_ctx, buft);
+    if (!buf) {
+        LLAMA_LOG_WARN("%s: failed to allocate GPU capture staging — falling back to eval-callback capture\n", __func__);
+        dflash_capture->stage_tensors.clear();
+        ggml_free(stage_ctx);
+        return;
+    }
+
+    dflash_capture->stage_ctx = stage_ctx;
+    dflash_capture->stage_buf = buf;
+    dflash_capture->stage_max_tokens = max_tokens;
+
+    cparams.capture_stage = dflash_capture->stage_tensors.data();
+    cparams.capture_stage_max_tokens = max_tokens;
+
+    LLAMA_LOG_INFO("%s: allocated GPU capture staging: %d layers x %d tokens x %" PRId64 " embd (%.1f MB)\n",
+        __func__, n_layers, max_tokens, n_embd, ggml_backend_buffer_get_size(buf) / (1024.0 * 1024.0));
+}
+
+void llama_context::set_capture_stage_enabled(bool enabled) {
+    if (!dflash_capture) {
+        return;
+    }
+    dflash_capture->stage_enabled = enabled;
+}
+
+int32_t llama_context::dflash_capture_stage_get(int32_t layer_idx, const void ** data) {
+    if (!dflash_capture || dflash_capture->stage_n_tokens <= 0 ||
+        layer_idx < 0 || layer_idx >= (int32_t) dflash_capture->stage_tensors.size()) {
+        return 0;
+    }
+    ggml_tensor * t = dflash_capture->stage_tensors[layer_idx];
+    if (t->buffer && ggml_backend_buffer_is_meta(t->buffer)) {
+        ggml_tensor * shard = ggml_backend_meta_buffer_simple_tensor(t, 0);
+        if (!shard || !shard->data) {
+            return 0;
+        }
+        *data = shard->data;
+    } else {
+        *data = t->data;
+    }
+    return dflash_capture->stage_n_tokens;
 }
 
 void llama_context::dflash_reset_hidden_capture() {
@@ -1411,6 +1500,9 @@ void llama_context::dflash_reset_hidden_capture() {
     // The decode loop sets ubatch per iteration; null it here so a callback
     // that fires outside the loop can't read a stale pointer.
     dflash_capture->ubatch = nullptr;
+    // Staging validity is per-decode: the decode loop re-arms it for staged ubatches.
+    dflash_capture->stage_active = false;
+    dflash_capture->stage_n_tokens = 0;
 }
 
 // idempotent: populates recurrent-layer ids + tape name map the first time it's called.
@@ -3415,6 +3507,30 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 const llama_seq_id seq = ubatch.seq_id_unq[0];
                 if (seq >= 0 && seq < (int) dflash_capture->tapes.size()) {
                     dflash_capture->active_tape_idx = seq;
+                }
+            }
+
+            // GPU capture staging covers this ubatch iff it is the whole batch (single
+            // ubatch), single-slot single-seq, and fits the staging capacity. Toggling
+            // changes graph topology (embedded copies), so invalidate the graph cache
+            // on a switch.
+            {
+                const bool stage_ok = dflash_capture->stage_enabled
+                    && !dflash_capture->stage_tensors.empty()
+                    && ubatch.n_seqs_unq == 1
+                    && ubatch.seq_id_unq[0] == 0
+                    && dflash_capture->hiddens && dflash_capture->hiddens->size() == 1
+                    && (int64_t) ubatch.n_tokens == n_tokens_all
+                    && (int) ubatch.n_tokens <= dflash_capture->stage_max_tokens;
+                dflash_capture->stage_active = stage_ok;
+                if (stage_ok != cparams.capture_stage_active) {
+                    cparams.capture_stage_active = stage_ok;
+                    if (gf_res_prev) {
+                        gf_res_prev->reset();
+                    }
+                }
+                if (stage_ok) {
+                    dflash_capture->stage_n_tokens = (int) ubatch.n_tokens;
                 }
             }
         }
@@ -5502,6 +5618,8 @@ struct dflash_cross_ring_handle {
     void   (*fn_write)(void *, int, int, const float *, int, int);
     const float * (*fn_interleave)(void *, int, int, int);
     void   (*fn_set_tensor)(void *, const void *, size_t, size_t);
+    void   (*fn_write_d2d)(void *, int, int, const void *, int, int);
+    void   (*fn_read)(void *, int, int, float *, int, int);
 };
 
 void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_size) {
@@ -5525,6 +5643,11 @@ void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_siz
     auto fn_interleave = (interleave_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_interleave");
     auto fn_set_tensor = (set_tensor_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_set_tensor");
 
+    using write_d2d_fn_t = void (*)(void *, int, int, const void *, int, int);
+    using read_fn_t      = void (*)(void *, int, int, float *, int, int);
+    auto fn_write_d2d = (write_d2d_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_write_d2d");
+    auto fn_read      = (read_fn_t)      ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_read");
+
     if (!fn_alloc || !fn_free || !fn_write || !fn_interleave || !fn_set_tensor) {
         return nullptr;
     }
@@ -5538,11 +5661,21 @@ void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_siz
     handle->fn_write      = fn_write;
     handle->fn_interleave = fn_interleave;
     handle->fn_set_tensor = fn_set_tensor;
+    handle->fn_write_d2d  = fn_write_d2d;  // optional: null on backends without the proc
+    handle->fn_read       = fn_read;
     return handle;
 }
 
 void * llama_dflash_cross_ring_gpu_init(llama_context * ctx, int n_layers, int n_embd, int ring_size) {
     return ctx->init_cross_ring_gpu(n_layers, n_embd, ring_size);
+}
+
+void llama_dflash_set_capture_stage_enabled(llama_context * ctx, bool enabled) {
+    ctx->set_capture_stage_enabled(enabled);
+}
+
+int32_t llama_dflash_capture_stage_get(llama_context * ctx, int32_t layer_idx, const void ** data) {
+    return ctx->dflash_capture_stage_get(layer_idx, data);
 }
 
 void llama_dflash_cross_ring_gpu_free(void * handle) {
@@ -5556,6 +5689,22 @@ void llama_dflash_cross_ring_gpu_write(void * handle, int layer, int ring_pos, c
     if (!handle) return;
     auto * h = (dflash_cross_ring_handle *)handle;
     h->fn_write(h->gpu_ring, layer, ring_pos, data, n_tokens, n_embd);
+}
+
+bool llama_dflash_cross_ring_gpu_write_d2d(void * handle, int layer, int ring_pos, const void * dev_src, int n_tokens, int n_embd) {
+    if (!handle) return false;
+    auto * h = (dflash_cross_ring_handle *)handle;
+    if (!h->fn_write_d2d) return false;
+    h->fn_write_d2d(h->gpu_ring, layer, ring_pos, dev_src, n_tokens, n_embd);
+    return true;
+}
+
+bool llama_dflash_cross_ring_gpu_read(void * handle, int layer, int ring_pos, float * host_dst, int n_tokens, int n_embd) {
+    if (!handle) return false;
+    auto * h = (dflash_cross_ring_handle *)handle;
+    if (!h->fn_read) return false;
+    h->fn_read(h->gpu_ring, layer, ring_pos, host_dst, n_tokens, n_embd);
+    return true;
 }
 
 void llama_dflash_cross_ring_gpu_set_cross(
