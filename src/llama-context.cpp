@@ -1215,7 +1215,15 @@ static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_d
                 // Only QKV mixed needs eval callback (for CPU-side conv state rebuild).
                 // Multi-seq is supported — tensor stored with per-seq metadata.
                 auto it = cap->tape_name_map.find(t->name);
-                return (it != cap->tape_name_map.end() && it->second.second == DFLASH_TAPE_QKV);
+                if (it == cap->tape_name_map.end() || it->second.second != DFLASH_TAPE_QKV) {
+                    return false;
+                }
+                // Tensor split: QKV is graph-staged too (single-seq) — the callback's
+                // meta get_tensor gather would misorder the segmented channels, and the
+                // chop would force a per-layer all-device sync
+                dflash_tape_gpu * tg = cap->active_tape();
+                const bool qkv_staged = !tg->layers.empty() && tg->layers[0].qkv != nullptr && n_seqs_unq <= 1;
+                return !qkv_staged;
             }
             // CPU tape fallback: no multi-seq support
             if (n_seqs_unq > 1) {
@@ -1503,6 +1511,7 @@ void llama_context::dflash_reset_hidden_capture() {
     // Staging validity is per-decode: the decode loop re-arms it for staged ubatches.
     dflash_capture->stage_active = false;
     dflash_capture->stage_n_tokens = 0;
+    dflash_capture->tape_stage_n_tokens = 0;
 }
 
 // idempotent: populates recurrent-layer ids + tape name map the first time it's called.
@@ -1668,6 +1677,17 @@ void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
             ggml_format_name(tl.v,    "dflash_tape_v_l%d",   il);
             ggml_format_name(tl.gate, "dflash_tape_g_l%d",   il);
             ggml_format_name(tl.beta, "dflash_tape_b_l%d",   il);
+            if (meta_backend) {
+                // qkv staging (meta only): the conv rebuild's eval-callback capture reads
+                // the qkv compute tensor via meta get_tensor, whose INFERRED split state
+                // can lose the channel-segment interleave (canonically misordered gather
+                // → corrupted conv window). Stage it in a tape tensor instead — its
+                // name-rule split is authoritative, so write and gather agree. Also
+                // removes the per-recurrent-layer graph chop the callback forced.
+                const int64_t conv_ch = (int64_t) hparams.n_embd_r() / (hparams.ssm_d_conv - 1);
+                tl.qkv = ggml_new_tensor_2d(tape_ctx, GGML_TYPE_F32, conv_ch, (int64_t)max_tokens);
+                ggml_format_name(tl.qkv, "dflash_tape_qkv_l%d", il);
+            }
         }
 
         tape->buf = ggml_backend_alloc_ctx_tensors(tape_ctx, gpu_backend ? gpu_backend : meta_backend);
@@ -1845,6 +1865,14 @@ void llama_context::tape_replay_meta(ggml_backend_t meta_backend, llama_memory_r
         LLAMA_LOG_WARN("%s: no tape for seq %d — GDN replay skipped, recurrent state will be stale\n", __func__, seq_id);
         tape_replay_conv(mem_recurrent, cell_idx, n_accepted, seq_id);
         return;
+    }
+
+    // with graph-staged qkv the eval callback no longer sets per-layer token counts —
+    // every recurrent layer of a staged decode covers the same tokens
+    if (!tgpu->layers.empty() && tgpu->layers[0].qkv && dflash_capture->tape_stage_n_tokens > 0) {
+        for (auto & tape : tape_layers) {
+            tape.n_tokens = dflash_capture->tape_stage_n_tokens;
+        }
     }
 
     const int64_t S = hparams.ssm_d_state;
@@ -2237,6 +2265,14 @@ void llama_context::tape_replay_conv(llama_memory_recurrent * mem_recurrent, int
     auto & tape_layers   = dflash_capture->tape_layers;
     const uint32_t n_embd_r = hparams.n_embd_r();
 
+    // debug probe: isolate conv-rebuild errors from GDN-replay errors (state write
+    // skipped, position still advances)
+    static const bool skip_conv = getenv("DFLASH_SKIP_CONV_REBUILD") != nullptr;
+    if (skip_conv) {
+        mem_recurrent->cells[cell_idx].pos += n_accepted;
+        return;
+    }
+
     // rebuild conv state from qkv_mixed tape (small, CPU is fine)
     for (size_t li = 0; li < rec_ids.size(); ++li) {
         int il = rec_ids[li];
@@ -2305,6 +2341,31 @@ void llama_context::tape_replay_sync() {
         ggml_backend_buffer_free(buf);
     }
     dflash_capture->replay_meta_bufs.clear();
+
+    // qkv staged on GPU (tensor split): gather it for the host conv rebuild. The tape
+    // tensor's name-rule split state makes this gather channel-order-correct — reading
+    // the qkv compute tensor directly (old path) misordered the segment interleave.
+    {
+        dflash_tape_gpu * tg = nullptr;
+        const llama_seq_id rsid = dflash_capture->replay_seq_id;
+        if (rsid >= 0 && rsid < (llama_seq_id) dflash_capture->tapes.size()) {
+            tg = dflash_capture->tapes[rsid].get();
+        }
+        const int n_tok = dflash_capture->tape_stage_n_tokens;
+        if (tg && !tg->layers.empty() && tg->layers[0].qkv && n_tok > 0) {
+            for (size_t li = 0; li < tg->layers.size(); ++li) {
+                ggml_tensor * qkv = tg->layers[li].qkv;
+                auto & tape = dflash_capture->tape_layers[li];
+                const int64_t conv_ch = qkv->ne[0];
+                tape.qkv_mixed.resize((size_t) conv_ch * n_tok);
+                ggml_backend_tensor_get(qkv, tape.qkv_mixed.data(), 0, (size_t) n_tok * qkv->nb[1]);
+                tape.conv_channels = conv_ch;
+                tape.n_tokens = n_tok;
+                tape.n_seqs = 1;
+                tape.seq_ids[0] = rsid;
+            }
+        }
+    }
 
     // finish conv rebuild + position advance
     tape_replay_conv(dflash_capture->replay_mem_recurrent,
@@ -3725,6 +3786,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
                 // sentinel for "GPU tape is enabled"
                 cparams.tape_gpu = cparams.tape_gpu_seqs[0];
+
+                // graph-staged qkv coverage for this decode (mirrors the builder guard:
+                // single-seq and within tape capacity)
+                if (cparams.tape_gpu && ubatch.n_seqs_unq == 1 &&
+                    (int) ubatch.n_tokens <= cparams.tape_gpu->max_tokens) {
+                    dflash_capture->tape_stage_n_tokens = (int) ubatch.n_tokens;
+                }
 
                 // graph nodes hold references to tape tensors — invalidate if set changed
                 if (seqs_changed && gf_res_prev) {

@@ -149,6 +149,10 @@ struct dflash_capture_data {
     bool stage_active = false;
     int stage_n_tokens = 0;
 
+    // tokens covered by the graph-staged qkv tape copies in the last tape-enabled decode
+    // (0 = staging did not cover it; the eval-callback capture holds the data instead)
+    int tape_stage_n_tokens = 0;
+
     dflash_tape_gpu * active_tape() const {
         return (active_tape_idx >= 0 && active_tape_idx < (int) tapes.size())
                    ? tapes[active_tape_idx].get()

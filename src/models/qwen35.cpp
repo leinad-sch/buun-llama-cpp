@@ -497,6 +497,17 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
             ggml_build_forward_expand(gf, ggml_cpy(ctx0, v_cont, v_dst));
             ggml_build_forward_expand(gf, ggml_cpy(ctx0, g_cont, g_dst));
             ggml_build_forward_expand(gf, ggml_cpy(ctx0, b_cont, b_dst));
+
+            // qkv staging (tensor split): conv-rebuild source, replaces the eval-callback
+            // capture whose meta get_tensor gather misorders the segmented channels
+            if (tl.qkv && n_seqs == 1) {
+                ggml_tensor * qkv_slice = ggml_view_2d(ctx0, qkv_mixed,
+                    qkv_mixed->ne[0], n_seq_tokens, qkv_mixed->nb[1], s * qkv_mixed->nb[2]);
+                ggml_tensor * qkv_cont = ggml_cont(ctx0, qkv_slice);
+                ggml_tensor * qkv_dst = ggml_view_2d(ctx0, tl.qkv,
+                    tl.qkv->ne[0], (int64_t)n_seq_tokens, tl.qkv->nb[1], 0);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, qkv_cont, qkv_dst));
+            }
         }
     }
 
