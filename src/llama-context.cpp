@@ -603,8 +603,23 @@ void llama_context::sched_reserve() {
     if (cparams.auto_fgdn) {
         // Fused GDN kernels are only tested on NVIDIA CUDA. Disable on ROCm/MUSA/other.
         bool have_cuda_gpu = false;
+        ggml_backend_dev_t gpu_dev = nullptr;
         if (ggml_backend_t gpu_backend = find_gpu_backend()) {
-            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(gpu_backend));
+            gpu_dev = ggml_backend_get_device(gpu_backend);
+        } else {
+            // --split-mode tensor: the compute device is the meta device, which
+            // find_gpu_backend rejects by type — judge by its first simple device
+            // (the meta backend has a dedicated GDN split handler, head-parallel)
+            for (auto & backend : backends) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+                if (dev && ggml_backend_dev_is_meta(dev)) {
+                    gpu_dev = ggml_backend_meta_dev_simple_dev(dev, 0);
+                    break;
+                }
+            }
+        }
+        if (gpu_dev) {
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(gpu_dev);
             const char * reg_name = ggml_backend_reg_name(reg);
             if (reg_name && (strncmp(reg_name, "CUDA", 4) == 0 || strncmp(reg_name, "ROCm", 4) == 0)) {
                 // HIP builds register as "ROCm": the fused-GDN path compiles and runs there
