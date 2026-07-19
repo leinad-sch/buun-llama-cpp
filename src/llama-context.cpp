@@ -1857,11 +1857,12 @@ void llama_context::tape_replay_meta(ggml_backend_t meta_backend, llama_memory_r
     for (size_t j = 0; j < n_devs; ++j) {
         ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(meta_backend, j);
 
-        // per layer: 4 tape views + q scale + b sigmoid + s view + GDN + result view + s write + cpy
-        size_t ctx_mem = ggml_tensor_overhead() * ((size_t) n_rec * 12 + 4) + ggml_graph_overhead_custom(n_rec * 10, false);
+        // per layer: 4 tape views + q scale + b sigmoid + s view + GDN + result view +
+        // s write + cpy = 11 graph nodes (views are ops); size with headroom
+        size_t ctx_mem = ggml_tensor_overhead() * ((size_t) n_rec * 16 + 4) + ggml_graph_overhead_custom(n_rec * 14, false);
         struct ggml_init_params ctx_params = { ctx_mem, nullptr, true };
         struct ggml_context * ctx = ggml_init(ctx_params);
-        struct ggml_cgraph * graph = ggml_new_graph_custom(ctx, n_rec * 10, false);
+        struct ggml_cgraph * graph = ggml_new_graph_custom(ctx, n_rec * 14, false);
 
         int n_nodes = 0;
         for (int li = 0; li < n_rec; ++li) {
