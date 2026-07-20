@@ -1601,6 +1601,13 @@ private:
             return false;
         }
 
+        // context creation can fail after the model loaded (e.g. KV/compute OOM) —
+        // bail before anything derefs ctx_tgt
+        if (ctx_tgt == nullptr) {
+            SRV_ERR("failed to create context, '%s'\n", params_base.model.path.c_str());
+            return false;
+        }
+
         vocab = llama_model_get_vocab(model_tgt);
 
         needs_reeval = llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt);

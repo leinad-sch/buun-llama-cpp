@@ -1249,7 +1249,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         lora.reset(llama_adapter_lora_init(model, la.path.c_str()));
         if (lora == nullptr) {
             COM_ERR("failed to load lora adapter '%s'\n", la.path.c_str());
-            pimpl->model.reset(model);
+            pimpl->model.reset();
             return;
         }
 
@@ -1313,6 +1313,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
+        // drop the model too: most callers only check model() and would deref the
+        // missing context — any failure past model load must yield an empty result
+        pimpl->samplers.clear();
+        pimpl->samplers_seq_config.clear();
+        pimpl->model.reset();
         return;
     }
 
