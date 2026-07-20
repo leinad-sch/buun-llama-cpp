@@ -62,21 +62,13 @@ static uint32_t turbo_tcq_codebook_crc32(const char * path, size_t n_floats) {
     if (!path || !path[0]) {
         return 0; // no custom codebook → use compiled-in default → hash 0
     }
-    uint32_t crc = 0xFFFFFFFF;
     FILE * f = fopen(path, "rb");
     if (!f) { return 0; }
     float buf[512];
     size_t n = fread(buf, sizeof(float), n_floats, f);
     fclose(f);
     if (n != n_floats) { return 0; }
-    const uint8_t * data = (const uint8_t *)buf;
-    for (size_t i = 0; i < n_floats * sizeof(float); i++) {
-        crc ^= data[i];
-        for (int j = 0; j < 8; j++) {
-            crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
-        }
-    }
-    return crc ^ 0xFFFFFFFF;
+    return llama_crc32((const uint8_t *) buf, n_floats * sizeof(float));
 }
 
 static uint32_t turbo_tcq_fingerprint(void) {

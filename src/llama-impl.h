@@ -2,6 +2,8 @@
 
 #include "ggml.h" // for ggml_log_level
 
+#include <cstddef>
+#include <cstdint>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -74,6 +76,9 @@ struct buffer_view {
 };
 
 void replace_all(std::string & s, const std::string & search, const std::string & replace);
+
+// CRC-32 (IEEE, poly 0xEDB88320) of a byte buffer
+uint32_t llama_crc32(const uint8_t * data, size_t n);
 
 // TODO: rename to llama_format ?
 LLAMA_ATTRIBUTE_FORMAT(1, 2)
