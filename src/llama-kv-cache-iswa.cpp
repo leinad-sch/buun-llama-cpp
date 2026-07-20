@@ -138,6 +138,14 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
             model, hparams, type_k, type_v,
             v_trans, offload, unified, size_swa, n_seq_max, n_pad,
             hparams.n_swa, hparams.swa_type, mem_other_swa, filter_swa, reuse, share, vbr_swa);
+
+    // co-tenancy: the ledger protocol (scan, demand service, marker publication) must run
+    // ONCE per memory tree — two children independently serving the same claim double-shed
+    // and fight over the shared per-process marker file. The base (full-attention) cache
+    // owns it: its KV dominates the tree's bytes, so the base-only offer is a conservative
+    // slight under-advertisement. (Parent-level servicing with footprint-split targets is
+    // the design's end state — P4 cell 13 validates whichever shape is live.)
+    kv_swa->vbr_set_ledger_owner(false);
 }
 
 void llama_kv_cache_iswa::clear(bool data) {

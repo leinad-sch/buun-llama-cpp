@@ -5,6 +5,7 @@
 #include "llama-io.h"
 #include "llama-batch.h"
 #include "llama-model.h"
+#include "llama-vram-demand.h"
 
 #include "ggml-backend.h"
 
@@ -122,7 +123,9 @@ llama_memory_recurrent::llama_memory_recurrent(
                 t->buffer = buf; // the scheduler must not try to allocate the cache tensors
             }
         } else {
-            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+            // co-tenancy hold-aware alloc: hybrid models' recurrent state is often the
+            // second-largest context alloc — same patience as the attention KV twin
+            buf = llama_vram_hold_alloc_ctx_tensors(ctx.get(), buft);
         }
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for rs cache");

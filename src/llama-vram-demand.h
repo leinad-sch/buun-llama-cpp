@@ -33,6 +33,13 @@ void llama_vram_plan_hint_set(const char * device_id, uint64_t bytes);
 // claim's self-measured bytes_now and the amortized grant release on the donor side
 void llama_vram_demand_alloc_landed(ggml_backend_dev_t dev, size_t bytes);
 
+// hold-aware ctx-tensor allocation for load-phase GPU buffers: first try, then (GPU
+// devices only) hold within patience while donors shed, retrying; EVERY success reports
+// its bytes as landed (first-try successes during a held load must feed bytes_now too).
+// Returns nullptr when the hold gives up — callers fail exactly as before.
+ggml_backend_buffer_t llama_vram_hold_alloc_ctx_tensors(struct ggml_context * ctx,
+                                                        ggml_backend_buffer_type_t buft);
+
 // hold after a failed alloc of `bytes` on `dev`. First call opens the attempt (probe);
 // every call sleeps one backoff step. True = retry the alloc; false = attempt over
 // (claims already unlinked, terminal reason logged).

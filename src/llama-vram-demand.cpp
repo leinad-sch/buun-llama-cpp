@@ -18,10 +18,11 @@ namespace {
 
 struct dev_state {
     ggml_backend_dev_t dev = nullptr;
-    uint64_t planned   = 0;    // plan hint (0 = none)
-    uint64_t landed    = 0;    // bytes successfully allocated so far
-    uint64_t bytes_now = 0;    // published self-measured landed bytes
-    bool     demanded  = false; // a failure occurred (or plan remainder > 0) this attempt
+    uint64_t planned     = 0;     // plan hint, or seeded from the first failure
+    uint64_t landed      = 0;     // bytes successfully allocated so far (== published bytes_now)
+    bool     est_partial = false; // planned was seeded from a failure, not a plan hint
+    uint32_t revisions   = 0;     // upward est revisions consumed (spec: exactly one honored)
+    bool     demanded    = false; // a failure occurred (or plan remainder > 0) this attempt
 };
 
 // observation aging for peer heartbeats: freshness is measured by the READER's clock
@@ -52,6 +53,7 @@ struct demander {
     std::map<std::string, dev_state> devs;      // busid -> state
     std::map<std::string, hb_obs>    marker_obs; // "busid-pid" -> aging
     std::map<std::string, uint64_t>  claim_progress; // peer claim key -> last bytes_now (tie-break)
+    std::map<std::string, llama_vram_claim_fields> last_pub; // publish memo (rename on change only)
     uint64_t last_free_seen = 0;    // post-commit progress signal (primary demanded dev)
 };
 
@@ -102,9 +104,12 @@ void unlink_all(demander & d, const char * reason) {
     d.devs.clear();
     d.marker_obs.clear();
     d.claim_progress.clear();
+    d.last_pub.clear();
 }
 
-// write/refresh the claim files for every demanded device at the given phase
+// write/refresh the claim files for every demanded device at the given phase. Rename
+// discipline: a publish with unchanged fields is skipped — a redundant rename would bump
+// the dir mtime and knock every resident donor off its stable fast path per iteration.
 bool publish_claims(demander & d, llama_vram_claim_phase phase) {
     bool any = false;
     for (auto & [busid, ds] : d.devs) {
@@ -113,12 +118,20 @@ bool publish_claims(demander & d, llama_vram_claim_phase phase) {
         }
         llama_vram_claim_fields f = {};
         f.phase                     = phase;
-        f.bytes_total_remaining_est = est_remaining(ds) > 0 ? est_remaining(ds) : 0;
-        f.est_partial               = ds.planned == 0 ? 1u : 0u;
+        f.bytes_total_remaining_est = est_remaining(ds);
+        // spec: the honored upward revision rewrites est and clears est_partial
+        f.est_partial               = (ds.est_partial && ds.revisions == 0) ? 1u : 0u;
         f.ver                       = d.ver;
         f.created_ts_ns             = d.created_ts;
-        any = llama_vram_claim_publish(busid, f) || any;
-        llama_vram_claim_set_bytes(busid, ds.bytes_now);
+        auto last = d.last_pub.find(busid);
+        if (last == d.last_pub.end() ||
+            last->second.phase != f.phase ||
+            last->second.bytes_total_remaining_est != f.bytes_total_remaining_est ||
+            last->second.est_partial != f.est_partial) {
+            any = llama_vram_claim_publish(busid, f) || any;
+            d.last_pub[busid] = f;
+        }
+        llama_vram_claim_set_bytes(busid, ds.landed); // in-place, never a rename
     }
     return any;
 }
@@ -132,6 +145,28 @@ void llama_vram_plan_hint_set(const char * device_id, uint64_t bytes) {
     dm().plan[device_id] = bytes;
 }
 
+ggml_backend_buffer_t llama_vram_hold_alloc_ctx_tensors(ggml_context * ctx,
+                                                        ggml_backend_buffer_type_t buft) {
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+        return buf;
+    }
+    if (buf == nullptr) {
+        size_t need = 0;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            need += ggml_backend_buft_get_alloc_size(buft, t);
+        }
+        while (buf == nullptr && llama_vram_demand_hold(dev, need)) {
+            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        }
+    }
+    if (buf != nullptr) {
+        llama_vram_demand_alloc_landed(dev, ggml_backend_buffer_get_size(buf));
+    }
+    return buf;
+}
+
 void llama_vram_demand_alloc_landed(ggml_backend_dev_t dev, size_t bytes) {
     auto & d = dm();
     if (!d.attempt_open) {
@@ -142,9 +177,8 @@ void llama_vram_demand_alloc_landed(ggml_backend_dev_t dev, size_t bytes) {
     if (it == d.devs.end()) {
         return;
     }
-    it->second.landed    += bytes;
-    it->second.bytes_now += bytes;
-    llama_vram_claim_set_bytes(busid, it->second.bytes_now);
+    it->second.landed += bytes;
+    llama_vram_claim_set_bytes(busid, it->second.landed);
 }
 
 bool llama_vram_demand_hold(ggml_backend_dev_t dev, size_t bytes) {
@@ -200,8 +234,30 @@ bool llama_vram_demand_hold(ggml_backend_dev_t dev, size_t bytes) {
     ds.dev      = dev;
     ds.demanded = true;
     if (ds.planned == 0) {
-        // no hint: current failure size only, est_partial (one upward revision allowed)
-        ds.planned = ds.landed + bytes;
+        // no hint: current failure size only, flagged est_partial (one upward revision
+        // may later be honored)
+        ds.planned     = ds.landed + bytes;
+        ds.est_partial = true;
+    } else if (ds.landed + bytes > ds.planned) {
+        // the estimate was short. An est_partial claim gets exactly ONE honored upward
+        // revision (locally checkable: a third ask is refused); a plan-hinted claim's
+        // shortfall means the hint lied — same single-revision grace.
+        if (ds.revisions == 0) {
+            ds.planned = ds.landed + bytes;
+            ds.revisions = 1;
+            LLAMA_LOG_INFO("vram-demand: est revision on %s -> %.1f MiB remaining\n",
+                    busid.c_str(), est_remaining(ds)/1048576.0);
+            if (d.committed) {
+                // donors size their shed from the claim file — the revised est must land
+                publish_claims(d, LLAMA_VRAM_CLAIM_DEMAND);
+            }
+        } else {
+            LLAMA_LOG_WARN("vram-demand: %s needs %.1f MiB beyond the revised estimate — refusing a third ask\n",
+                    busid.c_str(), (ds.landed + bytes - ds.planned)/1048576.0);
+            unlink_all(d, "estimate exhausted");
+            d.terminal_failed = true;
+            return false;
+        }
     }
     // demanded set may have grown — mark plan-remainder devices demanded too (joint claim)
     for (auto & [b, s] : d.devs) {
@@ -275,7 +331,7 @@ bool llama_vram_demand_hold(ggml_backend_dev_t dev, size_t bytes) {
                 }
                 const uint64_t free_b = dev_free(s.dev);
                 const uint64_t need   = est_remaining(s);
-                const bool offers_needed = free_b < need + LLAMA_VRAM_LEDGER_HEADROOM_BASE;
+                const bool offers_needed = free_b < need + llama_vram_headroom_bytes();
                 if (!offers_needed) {
                     continue; // free covers -> READY
                 }
@@ -312,8 +368,8 @@ bool llama_vram_demand_hold(ggml_backend_dev_t dev, size_t bytes) {
                         }
                     }
                     const uint64_t free_b = dev_free(s.dev);
-                    const uint64_t have   = offers + (free_b > LLAMA_VRAM_LEDGER_HEADROOM_BASE
-                                                      ? free_b - LLAMA_VRAM_LEDGER_HEADROOM_BASE : 0);
+                    const uint64_t headroom = llama_vram_headroom_bytes();
+                    const uint64_t have   = offers + (free_b > headroom ? free_b - headroom : 0);
                     if (have < est_remaining(s)) {
                         LLAMA_LOG_WARN("vram-demand: device %s insufficient even with offers "
                                 "(need %.1f MiB, offers %.1f MiB + free %.1f MiB)\n",
@@ -366,7 +422,7 @@ backoff:
     {
         uint64_t sleep_ms = (uint64_t) LLAMA_VRAM_LEDGER_BEAT_MS
                           + (d.ver + (now / NS_PER_MS)) % (uint64_t) LLAMA_VRAM_LEDGER_BEAT_MS;
-        const uint64_t hard = std::max(d.deadline, d.committed ? d.deadline : cap);
+        const uint64_t hard = d.committed ? d.deadline : cap;
         if (now + sleep_ms * NS_PER_MS > hard) {
             sleep_ms = std::max<uint64_t>(1, (hard - now) / NS_PER_MS);
         }

@@ -34,6 +34,14 @@ constexpr int64_t LLAMA_VRAM_LEDGER_REMOVE_MS         = 3*LLAMA_VRAM_LEDGER_LONG
 constexpr int64_t LLAMA_VRAM_LEDGER_RUNTIME_IGNORE_MS = 5*LLAMA_VRAM_LEDGER_BEAT_MS;
 constexpr int64_t LLAMA_VRAM_LEDGER_HB_STALL_MS       = 3*LLAMA_VRAM_LEDGER_BEAT_MS;
 constexpr int64_t LLAMA_VRAM_LEDGER_EXT_CAP_MS        = 2*LLAMA_VRAM_LEDGER_LONG_MS + 2*LLAMA_VRAM_LEDGER_BEAT_MS;
+// nominal ask for the compute-buffer reserve hold (sched sizes are internal); derived
+// from HEADROOM_BASE so a headroom retune cannot silently make nominal asks unserviceable
+constexpr int64_t LLAMA_VRAM_LEDGER_NOMINAL_ASK       = LLAMA_VRAM_LEDGER_HEADROOM_BASE + 64ll*1024*1024;
+
+// the one headroom number the protocol's two halves must agree on: HEADROOM_BASE with
+// the VBR_VRAM_HEADROOM_MIB env override applied (donor shortfall math AND demander
+// READY/sufficiency both call this)
+size_t llama_vram_headroom_bytes();
 
 enum llama_vram_claim_phase : uint32_t {
     LLAMA_VRAM_CLAIM_PROBE     = 0,

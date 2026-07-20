@@ -1149,26 +1149,9 @@ llama_kv_cache::llama_kv_cache(
             is_vmm_buf = buf != nullptr;
         }
         if (buf == nullptr && !hparams.no_alloc) {
-            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
-            if (buf == nullptr) {
-                ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-                if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-                    // co-tenancy: third load-phase alloc site (weights and compute reserve
-                    // are the others) — a resident donor may free room within patience; the
-                    // ask lands as the claim's one allowed est_partial upward revision
-                    size_t need = 0;
-                    for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr;
-                         t = ggml_get_next_tensor(ctx.get(), t)) {
-                        need += ggml_backend_buft_get_alloc_size(buft, t);
-                    }
-                    while (buf == nullptr && llama_vram_demand_hold(dev, need)) {
-                        buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
-                    }
-                    if (buf != nullptr) {
-                        llama_vram_demand_alloc_landed(dev, ggml_backend_buffer_get_size(buf));
-                    }
-                }
-            }
+            // co-tenancy hold-aware alloc (a failing ask lands as the claim's one allowed
+            // est_partial upward revision)
+            buf = llama_vram_hold_alloc_ctx_tensors(ctx.get(), buft);
         }
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for kv cache");
@@ -2650,10 +2633,7 @@ bool llama_kv_cache::vbr_unit_pooled(size_t ikv, bool is_v) const {
 // references (raw budget vs clamped) made every boundary under a co-tenant clamp promote
 // then re-degrade — two transcodes plus one extra quantization hop on aged rows per flap.
 size_t llama_kv_cache::vbr_budget_eff(const vbr_pool & p) const {
-    static const size_t headroom = [] {
-        const char * e = getenv("VBR_VRAM_HEADROOM_MIB");
-        return (size_t) (e ? strtoull(e, nullptr, 10) : 192) * 1024 * 1024;
-    }();
+    const size_t headroom = llama_vram_headroom_bytes();
     // memoized per boundary: the degrade loop re-evaluates over_budget per step and the promote
     // hysteresis visits every pool, so an uncached get_device_memory here is a driver round-trip
     // multiplied by wave length x pools — and free VRAM cannot meaningfully move within one
@@ -4277,7 +4257,7 @@ void llama_kv_cache::vbr_apply_grant_decrements() {
 // dir-mtime pre-check, every boundary OUTSIDE the stable gate (~1µs stat): a rename in the
 // ledger (new claim, phase flip, peer offer) forces the full controller path this boundary
 void llama_kv_cache::vbr_ledger_precheck() {
-    if (!vbr_vmm_active() || !llama_vram_ledger_armed()) {
+    if (!vbr_ledger_owner_ || !vbr_vmm_active() || !llama_vram_ledger_armed()) {
         return;
     }
     const uint64_t mtime = llama_vram_ledger_dir_mtime_ns();
@@ -4295,7 +4275,7 @@ void llama_kv_cache::vbr_ledger_precheck() {
 void llama_kv_cache::vbr_ledger_scan_service(uint32_t wm_next) {
     // explicit budgets still run the pass — they publish markers (shed_available = 0,
     // demand service skipped) so the demander's presence census stays complete
-    if (!vbr_vmm_active() || !llama_vram_ledger_armed()) {
+    if (!vbr_ledger_owner_ || !vbr_vmm_active() || !llama_vram_ledger_armed()) {
         return;
     }
     vbr_ledger_force_ = false;
@@ -4397,7 +4377,6 @@ void llama_kv_cache::vbr_ledger_scan_service(uint32_t wm_next) {
         }
         // rank-0 among FRESH offering markers on the demanded device (created_ts, pid) —
         // our created_ts is the marker's first-publish time; peers' come from the scan
-        const auto our_pub = vbr_marker_pub_.find(c.busid);
         bool rank0 = true;
         for (const auto & m : peers) {
             if (m.busid != c.busid || m.fields.shed_available == 0) {
@@ -4421,17 +4400,13 @@ void llama_kv_cache::vbr_ledger_scan_service(uint32_t wm_next) {
                 break;
             }
         }
-        GGML_UNUSED(our_pub);
         if (!rank0) {
             continue;
         }
         // shortfall = est − (free − headroom) − Σ peers' grant_pending (bridges shed→flush)
         size_t free_b = 0, total_b = 0;
         demanded_pool->be->get_device_memory(demanded_pool->device, &free_b, &total_b);
-        static const size_t headroom = [] {
-            const char * e = getenv("VBR_VRAM_HEADROOM_MIB");
-            return (size_t) (e ? strtoull(e, nullptr, 10) : 192) * 1024 * 1024;
-        }();
+        const size_t headroom = llama_vram_headroom_bytes();
         uint64_t peers_pending = 0;
         for (const auto & m : peers) {
             if (m.busid == c.busid) {

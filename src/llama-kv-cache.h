@@ -424,6 +424,14 @@ private:
     void   vbr_apply_grant_decrements();          // recompute per-pool sums, bust memos
     size_t vbr_total_grant_decrement() const;     // promote freeze gate
     const std::string & vbr_pool_busid(vbr_pool & p) const;
+
+public:
+    // co-tenancy: exactly one cache per memory tree runs the ledger protocol; composite
+    // parents (iSWA) demote all but one child. Non-owners keep every local mechanism
+    // (budget, band, waves) but never scan, serve, or publish.
+    void vbr_set_ledger_owner(bool owner) { vbr_ledger_owner_ = owner; }
+private:
+    bool vbr_ledger_owner_ = true;
     size_t vbr_floor_cost_bytes_ = 0;                 // page-exact cost of the floor layout at full
                                                       // kv_size (fallback budget in dynamic mode)
     bool   vbr_budget_warned_ = false;                // budget-unmeetable warning fired (terminal)

@@ -4092,10 +4092,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
-    // co-tenancy claim-complete: first successful decode that produced real outputs —
-    // intermediate prefill chunks run n_outputs == 0 and do not count. Unlinking the
-    // satisfied claim is the donors' lift signal (disappearance with live pid).
-    if (n_outputs > 0 && llama_vram_demand_pending_complete()) {
+    // co-tenancy claim-complete: first successful REAL decode that produced outputs —
+    // intermediate prefill chunks run n_outputs == 0 and warmup decodes are not requests
+    // (warmup's tiny batch does not grow the compute pools, so the memory claim is NOT
+    // complete after it). Unlinking the satisfied claim is the donors' lift signal.
+    if (n_outputs > 0 && !cparams.warmup && llama_vram_demand_pending_complete()) {
         llama_vram_demand_complete();
     }
 
@@ -4447,7 +4448,7 @@ ggml_cgraph * llama_context::graph_reserve(
         // its sizes are internal); post-first-decode re-reserves keep the fast-fail wall.
         bool held = false;
         if (!has_evaluated_once && !model.devices.empty() && !model.devices[0].is_meta) {
-            constexpr size_t NOMINAL_COMPUTE_ASK = 256ull*1024*1024;
+            constexpr size_t NOMINAL_COMPUTE_ASK = (size_t) LLAMA_VRAM_LEDGER_NOMINAL_ASK;
             while (!held && llama_vram_demand_hold(model.devices[0].dev, NOMINAL_COMPUTE_ASK)) {
                 held = ggml_backend_sched_reserve(sched.get(), gf);
             }

@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -33,6 +34,15 @@ static constexpr size_t   VRLG_BODY_OFF  = 16;
 static constexpr size_t   VRLG_SLOT_OFF  = 64;
 
 static constexpr const char * VRLG_CLAIM_PREFIX = "ggml-vram-claim-";
+
+size_t llama_vram_headroom_bytes() {
+    static const size_t headroom = [] {
+        const char * e = getenv("VBR_VRAM_HEADROOM_MIB");
+        return e != nullptr ? (size_t) strtoull(e, nullptr, 10) * 1024 * 1024
+                            : (size_t) LLAMA_VRAM_LEDGER_HEADROOM_BASE;
+    }();
+    return headroom;
+}
 
 // presence markers share the 88-byte layout and slot offsets; their body is:
 //   16 u32 vbr  20 u32 serviced  24 i32 pid  28 u32 reserved
