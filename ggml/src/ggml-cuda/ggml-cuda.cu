@@ -4911,6 +4911,7 @@ const ggml_vbr_backend_iface * ggml_backend_cuda_vbr_iface(void) {
         /* .kv_transcode      = */ ggml_backend_cuda_kv_transcode,
         /* .kv_stash_capture  = */ ggml_backend_cuda_kv_stash_capture,
         /* .fence_arm         = */ ggml_backend_cuda_vbr_fence_arm,
+        /* .kv_dequant_scratch_reserve = */ ggml_backend_cuda_kv_dequant_scratch_reserve,
     };
     return &iface;
 }
