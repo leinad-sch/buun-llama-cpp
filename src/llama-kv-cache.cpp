@@ -4515,6 +4515,24 @@ void llama_kv_cache::vbr_ledger_scan_service(uint32_t wm_next) {
     }
 }
 
+void llama_kv_cache::vbr_cotenancy_accum(uint64_t & decrement, uint32_t & grants,
+                                         uint64_t & offer, uint64_t & pending) const {
+    if (!vbr_vmm_active()) {
+        return;
+    }
+    decrement += vbr_total_grant_decrement();
+    grants    += (uint32_t) vbr_grants_.size();
+    std::set<int> devs;
+    for (const auto & p : vbr_pools_) {
+        if (p.vmm != nullptr && devs.insert(p.device).second) {
+            offer += vbr_shed_available(p.device);
+        }
+    }
+    for (const auto & [busid, pend] : vbr_grant_pending_) {
+        pending += pend;
+    }
+}
+
 bool llama_kv_cache::get_can_shift() const {
     // VBR VMM v1: build_graph_shift views the FULL kv_size cells — executing it would touch
     // unmapped VA. TODO(S6+): bound the shift views to the mapped watermark instead.

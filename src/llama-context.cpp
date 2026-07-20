@@ -6189,6 +6189,18 @@ void llama_vram_mark_serviced(void) {
     llama_vram_marker_set_serviced(true);
 }
 
+llama_vram_cotenancy_state llama_vram_cotenancy(const llama_context * ctx) {
+    llama_vram_cotenancy_state st = {};
+    if (ctx != nullptr) {
+        llama_memory_t mem = const_cast<llama_context *>(ctx)->get_memory();
+        if (mem != nullptr) {
+            mem->vbr_cotenancy_accum(st.grant_decrement, st.grants_active,
+                                     st.shed_offer, st.grant_pending);
+        }
+    }
+    return st;
+}
+
 bool llama_memory_seq_rm(
         llama_memory_t mem,
           llama_seq_id seq_id,

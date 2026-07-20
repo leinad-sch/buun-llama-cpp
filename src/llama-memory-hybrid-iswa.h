@@ -69,6 +69,10 @@ public:
     // recurrent state has no deferred maintenance; the attn cache breathes
     void breathe() override { mem_attn->breathe(); }
 
+    void vbr_cotenancy_accum(uint64_t & d, uint32_t & g, uint64_t & o, uint64_t & p) const override {
+        mem_attn->vbr_cotenancy_accum(d, g, o, p);
+    }
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;

@@ -163,6 +163,11 @@ struct llama_memory_i {
     // deferred maintenance at a quiet moment (llama.h: llama_memory_breathe)
     virtual void breathe() {}
 
+    // co-tenancy telemetry accumulator (llama-ext.h: llama_vram_cotenancy): unamortized
+    // grant decrement bytes, live grant rows, current donation offer, unflushed pending
+    virtual void vbr_cotenancy_accum(uint64_t & /*decrement*/, uint32_t & /*grants*/,
+                                     uint64_t & /*offer*/, uint64_t & /*pending*/) const {}
+
     //
     // ops
     //

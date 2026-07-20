@@ -719,6 +719,17 @@ struct server_slot {
             if (kv_bpv >= 0.0) {
                 res["kv_bpv"] = kv_bpv;
             }
+            // co-tenancy state (all-zero = inert): what this server is offering peers,
+            // and what it has yielded that a co-tenant is still claiming
+            const auto ct = llama_vram_cotenancy(ctx_tgt);
+            if (ct.shed_offer > 0 || ct.grants_active > 0 || ct.grant_decrement > 0) {
+                res["cotenancy"] = json {
+                    { "shed_offer",      ct.shed_offer },
+                    { "grants_active",   ct.grants_active },
+                    { "grant_decrement", ct.grant_decrement },
+                    { "grant_pending",   ct.grant_pending },
+                };
+            }
         }
 
         const auto & ptask = task ? task : task_prev;

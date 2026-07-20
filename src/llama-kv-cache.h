@@ -190,6 +190,9 @@ public:
     // lives on the device. Memoized; safe to call between boundaries (marker writes).
     size_t vbr_shed_available(int device) const;
 
+    void vbr_cotenancy_accum(uint64_t & decrement, uint32_t & grants,
+                             uint64_t & offer, uint64_t & pending) const override;
+
     double memory_vbr_floor_bits_per_token(ggml_type entry_k, ggml_type entry_v, double floor_bpv) override;
     double memory_vbr_scratch_bytes_per_token(ggml_type entry_k, ggml_type entry_v, double floor_bpv) override;
 

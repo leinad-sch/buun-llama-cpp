@@ -119,6 +119,15 @@ LLAMA_API void llama_vram_plan_hint(const char * device_id, uint64_t bytes);
 // markers then advertise serviced:1, the qualifying signal for a co-loader's LONG patience.
 LLAMA_API void llama_vram_mark_serviced(void);
 
+// co-tenancy telemetry for /props//slots: all zeros = inert (single tenant, no ledger)
+struct llama_vram_cotenancy_state {
+    uint64_t grant_decrement; // unamortized bytes currently decremented from KV budgets
+    uint32_t grants_active;   // live grant rows
+    uint64_t shed_offer;      // published donation offer, summed over devices
+    uint64_t grant_pending;   // granted-but-not-yet-flushed bytes
+};
+LLAMA_API struct llama_vram_cotenancy_state llama_vram_cotenancy(const struct llama_context * ctx);
+
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
