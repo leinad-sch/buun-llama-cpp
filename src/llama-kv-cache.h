@@ -462,6 +462,7 @@ private:
     uint64_t vbr_runtime_ver_      = 0;
     uint64_t vbr_last_prepare_ns_  = 0; // decode-based idleness input (ticks never update it)
     std::set<std::string> vbr_runtime_live_; // busids with a live runtime claim
+    std::vector<size_t> vbr_pre_deficit_;    // per-pool pre-own-loop deficit (the honest ask)
     void vbr_runtime_demand_update(uint32_t wm_next, bool was_over);
 
     void   vbr_ledger_precheck();                 // every boundary, outside the stable gate

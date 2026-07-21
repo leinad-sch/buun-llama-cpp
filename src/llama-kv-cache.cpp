@@ -2045,7 +2045,20 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             // budget trigger: degrade while ANY pool exceeds its share. A step only shrinks the pool
             // that owns its tensor, but the cursor is a global price order — advancing it while any
             // pool is over budget is the simplest rule that terminates and preserves the price order.
-            const bool vbr_was_over = vbr_over_budget(wm_next); // P3c: pre-loop pressure snapshot
+            // P3c: pre-loop pressure snapshot — the runtime demand's honest ask is what
+            // this boundary was short BEFORE the own ladder's sacrifice resolved it
+            const bool vbr_was_over = vbr_over_budget(wm_next);
+            if (vbr_was_over) {
+                vbr_pre_deficit_.assign(vbr_pools_.size(), 0);
+                for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
+                    const auto & pp = vbr_pools_[pi];
+                    if (pp.vmm != nullptr) {
+                        const size_t proj = vbr_vmm_projected_bytes(pp, wm_next);
+                        const size_t be   = vbr_budget_eff(pp);
+                        vbr_pre_deficit_[pi] = proj > be ? proj - be : 0;
+                    }
+                }
+            }
             while (vbr_over_budget(wm_next)) {
                 vbr_quiet_boundaries_ = 0; // degrade pressure this boundary — cool the promote path
                 if (!vbr_degrade_next(wm_next)) {
@@ -4293,9 +4306,16 @@ void llama_kv_cache::vbr_runtime_demand_update(uint32_t wm_next, bool was_over) 
         // shorted: band spent AND this boundary saw pressure (pre-own-loop), or the ladder
         // is exhausted with projection still over
         const bool   shorted   = window_spent && (was_over || projected > beff);
+        const size_t pool_idx  = (size_t) (&p - vbr_pools_.data());
         const bool live = vbr_runtime_live_.count(p.busid) != 0;
         if (shorted) {
-            const uint64_t wanted = projected - beff;
+            // saturated, pre-loop-honest ask (a post-loop subtraction can underflow — the
+            // own ladder's exit condition already restored projected <= budget_eff)
+            const uint64_t wanted = projected > beff ? projected - beff
+                : (pool_idx < vbr_pre_deficit_.size() ? vbr_pre_deficit_[pool_idx] : 0);
+            if (wanted == 0) {
+                continue;
+            }
             if (!live) {
                 llama_vram_claim_fields f = {};
                 f.phase                     = LLAMA_VRAM_CLAIM_RUNTIME;
