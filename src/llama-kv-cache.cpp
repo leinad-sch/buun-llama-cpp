@@ -4357,21 +4357,7 @@ void llama_kv_cache::vbr_ledger_precheck() {
 // decrement + capped waves), marker publish/beat. Runs inside the !vbr_stable branch after
 // the pool's own degrade loop and before the existing fence-arm (a demand wave queued here
 // is fenced by that same loop).
-void llama_kv_cache::vbr_ledger_scan_service(uint32_t wm_next) {
-    // explicit budgets still run the pass — they publish markers (shed_available = 0,
-    // demand service skipped) so the demander's presence census stays complete
-    if (!vbr_ledger_owner_ || !vbr_vmm_active() || !llama_vram_ledger_armed()) {
-        return;
-    }
-    vbr_ledger_force_ = false;
-    vbr_last_scan_ns_ = llama_vram_ledger_now_ns();
-
-    std::vector<llama_vram_peer_claim> claims;
-    llama_vram_ledger_scan(claims);
-    std::vector<llama_vram_peer_marker> peers;
-    llama_vram_ledger_scan_markers(peers);
-    const uint64_t now = vbr_last_scan_ns_;
-
+void llama_kv_cache::vbr_presence_census(const std::vector<llama_vram_peer_marker> & peers) {
     // ---- P3 presence census: N_live per device = self + live peer markers ----
     vbr_scan_events_++;
     {
@@ -4413,7 +4399,12 @@ void llama_kv_cache::vbr_ledger_scan_service(uint32_t wm_next) {
         }
     }
 
-    // ---- grant upkeep: lift on claim-disappearance-with-live-pid / pid-death /
+}
+
+// P3 census + grant upkeep + demand service + hygiene: the four phases of the full
+// ledger pass, split for readability — vbr_ledger_scan_service composes them.
+bool llama_kv_cache::vbr_grants_upkeep(const std::vector<llama_vram_peer_claim> & claims, uint64_t now) {
+    // lift on claim-disappearance-with-live-pid / pid-death /
     // heartbeat-stall; amortize surviving demanded-device rows by the claim's bytes_now ----
     bool grants_changed = false;
     for (auto it = vbr_grants_.begin(); it != vbr_grants_.end(); ) {
@@ -4467,6 +4458,13 @@ void llama_kv_cache::vbr_ledger_scan_service(uint32_t wm_next) {
         }
     }
 
+    return grants_changed;
+}
+
+bool llama_kv_cache::vbr_service_demands(const std::vector<llama_vram_peer_claim> & claims,
+                                         const std::vector<llama_vram_peer_marker> & peers,
+                                         uint64_t now, uint32_t wm_next) {
+    bool grants_changed = false;
     // ---- demand service: rank-0 shed sizing ----
     // one band per donor per session-generation is enforced by the band cursor itself
     // (monotone: once spent, shed_available stays 0 until vbr_full_reset)
@@ -4600,11 +4598,10 @@ void llama_kv_cache::vbr_ledger_scan_service(uint32_t wm_next) {
                     g.collateral ? " (collateral)" : "");
         }
     }
+    return grants_changed;
+}
 
-    if (grants_changed) {
-        vbr_apply_grant_decrements();
-    }
-
+void llama_kv_cache::vbr_grant_pending_clear() {
     // ---- grant_pending clear: first scan event after the wave's deferred unmaps flushed ----
     for (auto & [busid, pending] : vbr_grant_pending_) {
         if (pending == 0) {
@@ -4622,6 +4619,9 @@ void llama_kv_cache::vbr_ledger_scan_service(uint32_t wm_next) {
         }
     }
 
+}
+
+void llama_kv_cache::vbr_markers_publish(uint64_t now) {
     // ---- marker publish / beat (write discipline: rename only on field change) ----
     for (auto & p : vbr_pools_) {
         if (p.vmm == nullptr) {
@@ -4652,6 +4652,31 @@ void llama_kv_cache::vbr_ledger_scan_service(uint32_t wm_next) {
             llama_vram_marker_beat(busid);
         }
     }
+}
+
+void llama_kv_cache::vbr_ledger_scan_service(uint32_t wm_next) {
+    // explicit budgets still run the pass — they publish markers (shed_available = 0,
+    // demand service skipped) so the demander's presence census stays complete
+    if (!vbr_ledger_owner_ || !vbr_vmm_active() || !llama_vram_ledger_armed()) {
+        return;
+    }
+    vbr_ledger_force_ = false;
+    vbr_last_scan_ns_ = llama_vram_ledger_now_ns();
+
+    std::vector<llama_vram_peer_claim> claims;
+    llama_vram_ledger_scan(claims);
+    std::vector<llama_vram_peer_marker> peers;
+    llama_vram_ledger_scan_markers(peers);
+    const uint64_t now = vbr_last_scan_ns_;
+
+    vbr_presence_census(peers);
+    bool grants_changed = vbr_grants_upkeep(claims, now);
+    grants_changed = vbr_service_demands(claims, peers, now, wm_next) || grants_changed;
+    if (grants_changed) {
+        vbr_apply_grant_decrements();
+    }
+    vbr_grant_pending_clear();
+    vbr_markers_publish(now);
 }
 
 void llama_kv_cache::vbr_cotenancy_accum(uint64_t & decrement, uint32_t & grants,

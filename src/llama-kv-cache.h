@@ -6,6 +6,7 @@
 #include "llama-memory.h"
 
 #include "ggml-vbr.h" // backend interface for turbo KV / dynamic VBR (resolved at init, never linked)
+#include "llama-vram-ledger.h" // co-tenancy peer claim/marker types (P2)
 
 #include <map>
 #include <unordered_map>
@@ -455,7 +456,14 @@ private:
     void vbr_runtime_demand_update(uint32_t wm_next);
 
     void   vbr_ledger_precheck();                 // every boundary, outside the stable gate
-    void   vbr_ledger_scan_service(uint32_t wm_next); // full scan + grant upkeep + demand service
+    void   vbr_ledger_scan_service(uint32_t wm_next); // composes the four phases below
+    void   vbr_presence_census(const std::vector<llama_vram_peer_marker> & peers);
+    bool   vbr_grants_upkeep(const std::vector<llama_vram_peer_claim> & claims, uint64_t now);
+    bool   vbr_service_demands(const std::vector<llama_vram_peer_claim> & claims,
+                               const std::vector<llama_vram_peer_marker> & peers,
+                               uint64_t now, uint32_t wm_next);
+    void   vbr_grant_pending_clear();
+    void   vbr_markers_publish(uint64_t now);
     void   vbr_apply_grant_decrements();          // recompute per-pool sums, bust memos
     size_t vbr_total_grant_decrement() const;     // promote freeze gate
     const std::string & vbr_pool_busid(vbr_pool & p) const;
