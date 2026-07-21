@@ -22,6 +22,13 @@ struct dflash_cross_ring_gpu {
     float ** h_layer_ptrs;    // host: copy of per-layer device pointers
 };
 
+extern "C" void * dflash_cross_ring_gpu_alloc(int n_layers, int n_embd, int ring_size);
+extern "C" void dflash_cross_ring_gpu_free(void * handle);
+extern "C" void dflash_cross_ring_gpu_write(void * handle, int layer, int ring_pos, const float * host_data, int n_tokens, int n_embd);
+extern "C" void dflash_cross_ring_gpu_write_d2d(void * handle, int layer, int ring_pos, const void * dev_src, int n_tokens, int n_embd);
+extern "C" void dflash_cross_ring_gpu_read(void * handle, int layer, int ring_pos, float * host_dst, int n_tokens, int n_embd);
+extern "C" const float * dflash_cross_ring_gpu_interleave(void * handle, int write_pos, int filled, int ctx_window);
+
 // Interleave kernel: reads per-layer circular ring, writes interleaved output.
 // Grid: (cross_len, n_layers), Block: 256
 // Each thread block copies one (token, layer) slice of n_embd floats.
