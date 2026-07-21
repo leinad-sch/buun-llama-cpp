@@ -26,7 +26,7 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
 
     // Turbo forces nstages=0: cp.async can't do ALU dequant, so tiles load synchronously.
     // With nstages=0, tile_K and tile_V share the same shmem region (overlap).
-    constexpr int nstages = 0;
+    [[maybe_unused]] constexpr int nstages = 0;
 
     const int cols_per_warp = std::min(ncols, get_cols_per_warp(cc));
     const int warp_size_host = ggml_cuda_info().devices[ctx.device].warp_size;
