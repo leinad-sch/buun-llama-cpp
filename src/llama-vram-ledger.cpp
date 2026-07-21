@@ -581,6 +581,10 @@ void llama_vram_marker_beat(const std::string & busid) {
     pwrite(e.fd, slot, 4, VRLG_SLOT_OFF);
 }
 
+bool llama_vram_marker_present(const std::string & busid) {
+    return vrlm().markers.count(busid) != 0;
+}
+
 bool llama_vram_marker_withdraw(const std::string & busid) {
     auto & s = vrlm();
     auto it = s.markers.find(busid);
@@ -716,6 +720,7 @@ int llama_vram_ledger_scan(std::vector<llama_vram_peer_claim> & out) { out.clear
 uint64_t llama_vram_ledger_dir_mtime_ns() { return 0; }
 
 bool llama_vram_marker_publish(const std::string &, const llama_vram_marker_fields &) { return false; }
+bool llama_vram_marker_present(const std::string &) { return false; }
 void llama_vram_marker_beat(const std::string &) {}
 bool llama_vram_marker_withdraw(const std::string &) { return false; }
 void llama_vram_marker_withdraw_all() {}

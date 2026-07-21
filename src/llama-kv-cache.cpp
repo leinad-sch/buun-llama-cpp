@@ -2043,7 +2043,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             // co-tenancy: promotes freeze while any unamortized grant remains — a promote
             // would climb back into bytes a demander is still claiming
             if (vbr_promote_on && vbr_degrade_cursor_ > 0 && vbr_quiet_boundaries_ >= 4 &&
-                vbr_total_grant_decrement() == 0) {
+                vbr_total_grant_decrement() == 0 && vbr_presence_quiet()) {
                 vbr_promote_next(wm_next);
             }
             // budget trigger: degrade while ANY pool exceeds its share. A step only shrinks the pool
@@ -2652,7 +2652,25 @@ size_t llama_kv_cache::vbr_budget_eff(const vbr_pool & p) const {
     size_t free_b = 0, total_b = 0;
     p.be->get_device_memory(p.device, &free_b, &total_b);
     const size_t mapped_now = p.be->vmm_pool_mapped(p.vmm);
-    const size_t cap = mapped_now + (free_b > headroom ? free_b - headroom : 0);
+    // P3 fairness: headroom scales with the presence census (every live fork process has
+    // lazy CUDA pools that need room), and at N_live > 1 the budget base relaxes to a
+    // fair share of its own spare — mapped-anchored, 64 MiB-quantized, floored at this
+    // pool's share of the floor-layout cost. N_live == 1 bypasses BOTH (bit-identical
+    // single-tenant behavior; the quantization alone would cost up to 64 MiB).
+    const uint32_t n_live = vbr_pool_n_live(p);
+    const size_t headroom_eff = headroom * n_live;
+    if (n_live > 1) {
+        constexpr size_t quantum = 64ull * 1024 * 1024;
+        size_t va_total = 0;
+        for (const auto & q : vbr_pools_) {
+            va_total += q.vmm != nullptr ? q.size : 0;
+        }
+        const size_t floor_share = va_total > 0
+            ? (size_t) ((double) vbr_floor_cost_bytes_ * (double) p.size / (double) va_total) : 0;
+        const size_t spare = budget_eff > mapped_now ? budget_eff - mapped_now : 0;
+        budget_eff = std::max(floor_share, mapped_now + spare / n_live / quantum * quantum);
+    }
+    const size_t cap = mapped_now + (free_b > headroom_eff ? free_b - headroom_eff : 0);
     if (cap < budget_eff) {
         budget_eff = cap;
     }
@@ -2909,7 +2927,7 @@ void llama_kv_cache::breathe() {
         return e == nullptr || atoi(e) != 0;
     }();
     if (vbr_promote_on && vbr_degrade_cursor_ > 0 && vbr_quiet_boundaries_ >= 4 &&
-        vbr_total_grant_decrement() == 0) {
+        vbr_total_grant_decrement() == 0 && vbr_presence_quiet()) {
         vbr_promote_next(wm_next);
     }
     for (auto & p : vbr_pools_) {
@@ -4239,6 +4257,15 @@ const std::string & llama_kv_cache::vbr_pool_busid(vbr_pool & p) const {
     return p.busid;
 }
 
+uint32_t llama_kv_cache::vbr_pool_n_live(const vbr_pool & p) const {
+    const auto it = vbr_n_live_.find(p.busid);
+    return it != vbr_n_live_.end() && it->second > 0 ? it->second : 1;
+}
+
+bool llama_kv_cache::vbr_presence_quiet() const {
+    return vbr_scan_events_ - vbr_nlive_change_scan_ >= (uint32_t) LLAMA_VRAM_LEDGER_DEBOUNCE;
+}
+
 size_t llama_kv_cache::vbr_total_grant_decrement() const {
     size_t total = 0;
     for (const auto & p : vbr_pools_) {
@@ -4295,6 +4322,47 @@ void llama_kv_cache::vbr_ledger_scan_service(uint32_t wm_next) {
     std::vector<llama_vram_peer_marker> peers;
     llama_vram_ledger_scan_markers(peers);
     const uint64_t now = vbr_last_scan_ns_;
+
+    // ---- P3 presence census: N_live per device = self + live peer markers ----
+    vbr_scan_events_++;
+    {
+        std::map<std::string, uint32_t> raw;
+        for (auto & p : vbr_pools_) {
+            if (p.vmm != nullptr && vbr_pool_busid(p) != "-") {
+                raw[p.busid] = 1; // self
+            }
+        }
+        for (const auto & m : peers) {
+            auto it = raw.find(m.busid);
+            if (it != raw.end()) {
+                it->second++;
+            }
+        }
+        for (auto & [busid, n] : raw) {
+            uint32_t & cur = vbr_n_live_[busid];
+            if (cur == 0) {
+                cur = n; // first sighting: adopt silently (startup, not a change event)
+            } else if (n > cur) {
+                cur = n; // arrival: immediate (growing headroom is the safe direction)
+                vbr_nlive_change_scan_ = vbr_scan_events_;
+                vbr_n_live_stable_[busid] = 0;
+            } else if (n < cur) {
+                // departure: debounce — only after the raw count holds DEBOUNCE scans
+                if (vbr_n_live_raw_[busid] == n) {
+                    if (++vbr_n_live_stable_[busid] >= (uint32_t) LLAMA_VRAM_LEDGER_DEBOUNCE) {
+                        cur = n;
+                        vbr_nlive_change_scan_ = vbr_scan_events_;
+                        vbr_n_live_stable_[busid] = 0;
+                    }
+                } else {
+                    vbr_n_live_stable_[busid] = 0;
+                }
+            } else {
+                vbr_n_live_stable_[busid] = 0;
+            }
+            vbr_n_live_raw_[busid] = n;
+        }
+    }
 
     // ---- grant upkeep: lift on claim-disappearance-with-live-pid / pid-death /
     // heartbeat-stall; amortize surviving demanded-device rows by the claim's bytes_now ----

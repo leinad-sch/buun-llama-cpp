@@ -431,6 +431,19 @@ private:
     uint64_t vbr_marker_created_ts_ = 0;
     std::map<std::string, uint64_t> vbr_grant_pending_;
 
+    // ---- P3 presence census ----
+    // effective N_live per busid (self + live peer markers). Arrivals count immediately
+    // (growing headroom is the safe direction); departures only after the raw count holds
+    // for DEBOUNCE consecutive scan events (a GC'd marker of a crashed-and-restarting peer
+    // must not flap the budgets). Promotes are presence-quiet gated on the change scan.
+    std::map<std::string, uint32_t> vbr_n_live_;
+    std::map<std::string, uint32_t> vbr_n_live_raw_;
+    std::map<std::string, uint32_t> vbr_n_live_stable_;
+    uint32_t vbr_scan_events_          = 0;
+    uint32_t vbr_nlive_change_scan_    = 0;
+    uint32_t vbr_pool_n_live(const vbr_pool & p) const;
+    bool     vbr_presence_quiet() const; // promote gate: no N_live change within DEBOUNCE scans
+
     void   vbr_ledger_precheck();                 // every boundary, outside the stable gate
     void   vbr_ledger_scan_service(uint32_t wm_next); // full scan + grant upkeep + demand service
     void   vbr_apply_grant_decrements();          // recompute per-pool sums, bust memos

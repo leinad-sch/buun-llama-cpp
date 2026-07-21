@@ -124,6 +124,10 @@ struct llama_vram_peer_marker {
 // rename-write the marker (field change — bumps dir mtime; the first write fixes
 // created_ts for the marker's lifetime). Returns false when unarmed or on I/O failure.
 bool llama_vram_marker_publish(const std::string & busid, const llama_vram_marker_fields & fields);
+// true if this process already published a marker for the busid — context init uses it
+// to publish a vbr:0 presence marker only when the VBR side has not (and will not be
+// downgraded by a later non-VBR context in the same process, e.g. a draft model)
+bool llama_vram_marker_present(const std::string & busid);
 // in-place heartbeat, called from the owner's scan events; no-op if never published or
 // if beaten less than BEAT ago
 void llama_vram_marker_beat(const std::string & busid);

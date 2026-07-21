@@ -502,6 +502,28 @@ llama_context::llama_context(
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+
+    // co-tenancy presence (P3): every fork process holding device memory publishes a
+    // marker - vbr:0 here for the general case (peers scale their headroom by the census:
+    // this process's lazy CUDA pools are real pressure too). A VBR cache in this process
+    // REPUBLISHES vbr:1 with offers from its scan path; publish-if-absent keeps a later
+    // non-VBR context (draft model) from downgrading it. Beats ride the decode path.
+    for (const auto & d : model.devices) {
+        if (d.is_meta || d.dev == nullptr) {
+            continue;
+        }
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(d.dev, &props);
+        if (props.device_id != nullptr) {
+            vram_marker_busids_.push_back(props.device_id);
+            if (!llama_vram_marker_present(props.device_id)) {
+                llama_vram_marker_fields f = {};
+                f.vbr      = 0;
+                f.serviced = llama_vram_marker_serviced_flag() ? 1u : 0u;
+                llama_vram_marker_publish(props.device_id, f);
+            }
+        }
+    }
 }
 
 llama_context::~llama_context() {
@@ -4100,6 +4122,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // complete after it). Unlinking the satisfied claim is the donors' lift signal.
     if (n_outputs > 0 && !cparams.warmup && llama_vram_demand_pending_complete()) {
         llama_vram_demand_complete();
+    }
+
+    // co-tenancy presence beat (rate-limited to one per BEAT inside): marker freshness
+    // measures responsiveness, and a decoding process is responsive by definition
+    for (const auto & busid : vram_marker_busids_) {
+        llama_vram_marker_beat(busid);
     }
 
     // wait for the computation to finish (automatically done when obtaining the model output)
