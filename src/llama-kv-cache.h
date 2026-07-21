@@ -197,6 +197,15 @@ public:
     double memory_vbr_floor_bits_per_token(ggml_type entry_k, ggml_type entry_v, double floor_bpv) override;
     double memory_vbr_scratch_bytes_per_token(ggml_type entry_k, ggml_type entry_v, double floor_bpv) override;
 
+    // shared ladder-sim primitives: seed a per-(layer,side) type view + per-step
+    // applicability under vbr_degrade_next's exact skip rules (see impl comment) — the
+    // floor sim, the bpv-if-degraded walk and the co-tenancy offer all ride these
+    void vbr_sim_seed(std::vector<ggml_type> & sim, bool pooled_only,
+                      ggml_type entry_k, ggml_type entry_v,
+                      double * sum_bits, int64_t * sum_vals, size_t * n_pinned) const;
+    bool vbr_sim_step(const std::vector<ggml_type> & sim, size_t i,
+                      size_t & slot, const ggml_tensor *& t, ggml_type & type_B) const;
+
     // shared floor-walk core (runtime clamp + fit capacity math), see impl comment
     struct vbr_floor_sim_result {
         size_t clamp_step     = 0;     // steps applied before the clamp (== order size if unclamped)

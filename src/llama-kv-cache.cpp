@@ -3169,13 +3169,15 @@ static double vbr_resolve_floor_bpv(double min_bits) {
 // pooled_only restricts units to VMM-pooled ones (the runtime); dry-load contexts have no pools
 // and pass false. entry_k/entry_v override each side's tensor type (the fit's cparams types are
 // price-swapped during fitting; it passes the true entry types) — GGML_TYPE_COUNT = tensor type.
-llama_kv_cache::vbr_floor_sim_result llama_kv_cache::vbr_floor_sim(
-        double floor_bpv, bool pooled_only, ggml_type entry_k, ggml_type entry_v) const {
-    vbr_floor_sim_result res;
-    res.end_types.assign(layers.size() * 2, GGML_TYPE_COUNT);
-    auto & sim = res.end_types;
-    double  sum_bits = 0.0;
-    int64_t sum_vals = 0;
+// Shared degrade-ladder simulation core. Every consumer of the price order — the floor
+// clamp/capacity sim, the pressure telemetry's bpv-if-degraded walk, and the co-tenancy
+// offer — walks the same rules or the ADVERTS LIE: seed a per-(layer, side) type view,
+// then per step apply exactly vbr_degrade_next's skip rules. Callers own their loop
+// bounds, stop conditions and accounting; the rules live here once.
+void llama_kv_cache::vbr_sim_seed(std::vector<ggml_type> & sim, bool pooled_only,
+                                  ggml_type entry_k, ggml_type entry_v,
+                                  double * sum_bits, int64_t * sum_vals, size_t * n_pinned) const {
+    sim.assign(layers.size() * 2, GGML_TYPE_COUNT);
     for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
         for (int side = 0; side < 2; ++side) {
             const ggml_tensor * t = side ? layers[ikv].v : layers[ikv].k;
@@ -3187,32 +3189,60 @@ llama_kv_cache::vbr_floor_sim_result llama_kv_cache::vbr_floor_sim(
             // aggregate math on the canonical tensor: shard row sizes are additive across pools
             // (blocks never straddle the split), so this is exact under -sm tensor too
             sim[ikv*2 + side] = entry;
-            sum_bits += 8.0 * ggml_row_size(entry, t->ne[0]);
-            sum_vals += t->ne[0];
-            res.n_pinned += !vbr_unit_movable(entry, side != 0);
+            if (sum_bits != nullptr) {
+                *sum_bits += 8.0 * ggml_row_size(entry, t->ne[0]);
+            }
+            if (sum_vals != nullptr) {
+                *sum_vals += t->ne[0];
+            }
+            if (n_pinned != nullptr) {
+                *n_pinned += !vbr_unit_movable(entry, side != 0);
+            }
         }
     }
+}
+
+// step i applicable? (same skip rules as vbr_degrade_next: unknown layer, absent/pinned
+// unit, same-type or no-gain no-ops). On true, fills the slot/tensor/target for the
+// caller's accounting; the caller applies sim[slot] = type_B when it accepts the step.
+bool llama_kv_cache::vbr_sim_step(const std::vector<ggml_type> & sim, size_t i,
+                                  size_t & slot, const ggml_tensor *& t, ggml_type & type_B) const {
+    const auto & st = vbr_degrade_order_[i];
+    const auto it = map_layer_ids.find(st.il);
+    if (it == map_layer_ids.end()) {
+        return false;
+    }
+    slot = (size_t) it->second * 2 + (st.is_v ? 1 : 0);
+    t    = st.is_v ? layers[it->second].v : layers[it->second].k;
+    if (sim[slot] == GGML_TYPE_COUNT || t == nullptr || !vbr_unit_movable(sim[slot], st.is_v != 0)) {
+        return false; // absent or pinned (runtime skips these steps identically)
+    }
+    type_B = vbr_tier_type(st.tier);
+    if (sim[slot] == type_B ||
+        ggml_row_size(type_B, t->ne[0]) >= ggml_row_size(sim[slot], t->ne[0])) {
+        return false; // same no-op rule as vbr_degrade_next
+    }
+    return true;
+}
+
+llama_kv_cache::vbr_floor_sim_result llama_kv_cache::vbr_floor_sim(
+        double floor_bpv, bool pooled_only, ggml_type entry_k, ggml_type entry_v) const {
+    vbr_floor_sim_result res;
+    auto & sim = res.end_types;
+    double  sum_bits = 0.0;
+    int64_t sum_vals = 0;
+    vbr_sim_seed(sim, pooled_only, entry_k, entry_v, &sum_bits, &sum_vals, &res.n_pinned);
     res.clamp_step = vbr_degrade_order_.size();
     if (sum_vals == 0) {
         return res;
     }
     for (size_t i = 0; i < vbr_degrade_order_.size(); ++i) {
-        const auto & st = vbr_degrade_order_[i];
-        const auto it = map_layer_ids.find(st.il);
-        if (it == map_layer_ids.end()) {
+        size_t slot; const ggml_tensor * t; ggml_type type_B;
+        if (!vbr_sim_step(sim, i, slot, t, type_B)) {
             continue;
         }
-        const size_t slot = (size_t) it->second * 2 + (st.is_v ? 1 : 0);
-        const ggml_tensor * t = st.is_v ? layers[it->second].v : layers[it->second].k;
-        if (sim[slot] == GGML_TYPE_COUNT || t == nullptr || !vbr_unit_movable(sim[slot], st.is_v != 0)) {
-            continue; // absent or pinned (runtime skips these steps identically)
-        }
-        const ggml_type type_B = vbr_tier_type(st.tier);
         const size_t rA = ggml_row_size(sim[slot], t->ne[0]);
         const size_t rB = ggml_row_size(type_B,    t->ne[0]);
-        if (sim[slot] == type_B || rB >= rA) {
-            continue; // same no-op rule as vbr_degrade_next
-        }
         const double bits_next = sum_bits - 8.0*rA + 8.0*rB;
         if (bits_next / sum_vals < floor_bpv - 1e-9) {
             res.clamp_step = i;
@@ -4079,20 +4109,11 @@ llama_memory_vbr_state_data llama_kv_cache::memory_vbr_state(llama_seq_id seq_id
     // vbr_degrade_next until every pool's RAW projection fits (or the floor clamp stops it) —
     // the aggregate the controller would land at if the deficit were paid by tiers alone.
     // Mirrors the vbr_floor_clamp_order simulation; aggregate basis = VMM-pooled units.
-    std::vector<ggml_type> sim(layers.size() * 2, GGML_TYPE_COUNT);
+    std::vector<ggml_type> sim;
     double  sum_bits = 0.0;
     int64_t sum_vals = 0;
-    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
-        for (int side = 0; side < 2; ++side) {
-            const ggml_tensor * t = side ? layers[ikv].v : layers[ikv].k;
-            if (t == nullptr || !vbr_unit_pooled(ikv, side != 0)) {
-                continue;
-            }
-            sim[ikv*2 + side] = t->type;
-            sum_bits += 8.0 * (double) ggml_row_size(t->type, t->ne[0]);
-            sum_vals += t->ne[0];
-        }
-    }
+    vbr_sim_seed(sim, /*pooled_only=*/true, GGML_TYPE_COUNT, GGML_TYPE_COUNT,
+                 &sum_bits, &sum_vals, nullptr);
     auto pools_fit = [&]() {
         for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
             if (vbr_pools_[pi].vmm != nullptr && pool_proj[pi] > (int64_t) vbr_pools_[pi].budget) {
@@ -4103,29 +4124,21 @@ llama_memory_vbr_state_data llama_kv_cache::memory_vbr_state(llama_seq_id seq_id
     };
     for (size_t i = vbr_degrade_cursor_;
          i < std::min(vbr_degrade_order_.size(), vbr_degrade_limit_) && !pools_fit(); ++i) {
+        size_t slot; const ggml_tensor * t; ggml_type type_B;
+        if (!vbr_sim_step(sim, i, slot, t, type_B)) {
+            continue;
+        }
         const auto & stp = vbr_degrade_order_[i];
-        const auto it = map_layer_ids.find(stp.il);
-        if (it == map_layer_ids.end()) {
-            continue;
-        }
-        const size_t slot = (size_t) it->second * 2 + (stp.is_v ? 1 : 0);
-        const ggml_tensor * t = stp.is_v ? layers[it->second].v : layers[it->second].k;
-        if (sim[slot] == GGML_TYPE_COUNT || t == nullptr || !vbr_unit_movable(sim[slot], stp.is_v != 0)) {
-            continue;
-        }
-        const ggml_type type_B = vbr_tier_type(stp.tier);
+        const size_t ikv = slot / 2;
         const size_t rA = ggml_row_size(sim[slot], t->ne[0]);
         const size_t rB = ggml_row_size(type_B,    t->ne[0]);
-        if (sim[slot] == type_B || rB >= rA) {
-            continue;
-        }
         // projection deltas land in EVERY pool holding the unit, priced at each pool's shard width
         for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
             const auto & p = vbr_pools_[pi];
             if (p.vmm == nullptr) {
                 continue;
             }
-            const vbr_extent & e = stp.is_v ? p.v[it->second] : p.k[it->second];
+            const vbr_extent & e = stp.is_v ? p.v[ikv] : p.k[ikv];
             if (e.t == nullptr) {
                 continue;
             }
@@ -4165,39 +4178,24 @@ size_t llama_kv_cache::vbr_shed_available(int device) const {
     if (shed_avail_epoch_ != vbr_tier_epoch_ || shed_avail_wm_ != wm_key) {
         shed_avail_pool_.assign(vbr_pools_.size(), 0);
 
-        std::vector<ggml_type> sim(layers.size() * 2, GGML_TYPE_COUNT);
-        for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
-            for (int side = 0; side < 2; ++side) {
-                const ggml_tensor * t = side ? layers[ikv].v : layers[ikv].k;
-                if (t != nullptr && vbr_unit_pooled(ikv, side != 0)) {
-                    sim[ikv*2 + side] = t->type;
-                }
-            }
-        }
+        std::vector<ggml_type> sim;
+        vbr_sim_seed(sim, /*pooled_only=*/true, GGML_TYPE_COUNT, GGML_TYPE_COUNT,
+                     nullptr, nullptr, nullptr);
         std::vector<int64_t> freed(vbr_pools_.size(), 0);
         const size_t demand_limit = vbr_demand_limit();
         for (size_t i = vbr_degrade_cursor_; i < demand_limit; ++i) {
+            size_t slot; const ggml_tensor * t; ggml_type type_B;
+            if (!vbr_sim_step(sim, i, slot, t, type_B)) {
+                continue;
+            }
             const auto & stp = vbr_degrade_order_[i];
-            const auto it = map_layer_ids.find(stp.il);
-            if (it == map_layer_ids.end()) {
-                continue;
-            }
-            const size_t slot = (size_t) it->second * 2 + (stp.is_v ? 1 : 0);
-            const ggml_tensor * t = stp.is_v ? layers[it->second].v : layers[it->second].k;
-            if (sim[slot] == GGML_TYPE_COUNT || t == nullptr || !vbr_unit_movable(sim[slot], stp.is_v != 0)) {
-                continue;
-            }
-            const ggml_type type_B = vbr_tier_type(stp.tier);
-            if (sim[slot] == type_B ||
-                ggml_row_size(type_B, t->ne[0]) >= ggml_row_size(sim[slot], t->ne[0])) {
-                continue;
-            }
+            const size_t ikv = slot / 2;
             for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
                 const auto & p = vbr_pools_[pi];
                 if (p.vmm == nullptr) {
                     continue;
                 }
-                const vbr_extent & e = stp.is_v ? p.v[it->second] : p.k[it->second];
+                const vbr_extent & e = stp.is_v ? p.v[ikv] : p.k[ikv];
                 if (e.t == nullptr) {
                     continue;
                 }
