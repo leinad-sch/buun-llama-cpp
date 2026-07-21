@@ -2152,8 +2152,6 @@ static __global__ void flash_attn_ext_f16(
 
     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
 
-    constexpr bool is_turbo_kv = (type_K != GGML_TYPE_F16 || type_V != GGML_TYPE_F16);
-
     const int stride_Q1   = nb01 / sizeof(float2);
     const int stride_Q2   = nb02 / sizeof(float2);
     // Stride unit is PER SIDE, keyed on each side's own type — not the combined is_turbo_kv flag.
