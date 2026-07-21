@@ -68,6 +68,12 @@ static bool vrlg_is_tmpfs(const char * path) {
 }
 
 static std::string vrlg_resolve_dir() {
+    // LLAMA_VRAM_LEDGER=0: single coherent kill switch — armed() gates every producer and
+    // consumer on both protocol halves, so disarming here disables the whole feature
+    // (markers, claims, demands, donations) for embedders that must not touch tmpfs
+    if (const char * e = getenv("LLAMA_VRAM_LEDGER"); e != nullptr && atoi(e) == 0) {
+        return "";
+    }
     const char * base = getenv("XDG_RUNTIME_DIR");
     if (base == nullptr || !vrlg_is_tmpfs(base)) {
         base = "/dev/shm";

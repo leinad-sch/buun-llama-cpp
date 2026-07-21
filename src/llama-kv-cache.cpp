@@ -2115,6 +2115,11 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         if (!vbr_vmm_try_map(wm_next)) {
             LLAMA_LOG_ERROR("%s: VBR VMM: physical map to %u cells failed (device memory exhausted) — "
                     "failing this batch recoverably\n", __func__, wm_next);
+            // co-tenancy (spec: try_map-failed runtime-demand disjunct): route the NEXT
+            // boundary to the full controller path — a stable-path resident squeezed by a
+            // rename-free co-tenant would otherwise never publish its runtime demand and
+            // livelock on failing batches
+            vbr_ledger_force_ = true;
             return {};
         }
         // free-running boundary counter: drives the auto-budget re-derive throttle above and the
@@ -2132,6 +2137,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         if (!vbr_scratch_reserve(vbr_watermark_cells(n_tokens))) {
             LLAMA_LOG_ERROR("%s: f16 dequant scratch reserve failed (device memory exhausted) — "
                     "failing this batch recoverably\n", __func__);
+            vbr_ledger_force_ = true; // same routing as the try_map failure above
             return {};
         }
     }
@@ -4536,14 +4542,16 @@ bool llama_kv_cache::vbr_service_demands(const std::vector<llama_vram_peer_claim
         // shortfall = est − (free − headroom) − Σ peers' grant_pending (bridges shed→flush)
         size_t free_b = 0, total_b = 0;
         demanded_pool->be->get_device_memory(demanded_pool->device, &free_b, &total_b);
-        const size_t headroom = llama_vram_headroom_bytes();
+        // headroom_eff = base x N_live (spec normative — flat base would undershed by
+        // (N_live-1) x base exactly when the census matters)
+        const size_t headroom_eff = llama_vram_headroom_bytes() * vbr_pool_n_live(*demanded_pool);
         uint64_t peers_pending = 0;
         for (const auto & m : peers) {
             if (m.busid == c.busid) {
                 peers_pending += m.fields.grant_pending;
             }
         }
-        const uint64_t covered = (free_b > headroom ? free_b - headroom : 0) + peers_pending;
+        const uint64_t covered = (free_b > headroom_eff ? free_b - headroom_eff : 0) + peers_pending;
         if (c.fields.bytes_total_remaining_est <= covered) {
             continue; // shortfall ≤ 0: free (or peers' in-flight sheds) already cover it
         }

@@ -110,8 +110,7 @@ void unlink_all(demander & d, const char * reason) {
 // write/refresh the claim files for every demanded device at the given phase. Rename
 // discipline: a publish with unchanged fields is skipped — a redundant rename would bump
 // the dir mtime and knock every resident donor off its stable fast path per iteration.
-bool publish_claims(demander & d, llama_vram_claim_phase phase) {
-    bool any = false;
+void publish_claims(demander & d, llama_vram_claim_phase phase) {
     for (auto & [busid, ds] : d.devs) {
         if (!ds.demanded) {
             continue;
@@ -128,12 +127,11 @@ bool publish_claims(demander & d, llama_vram_claim_phase phase) {
             last->second.phase != f.phase ||
             last->second.bytes_total_remaining_est != f.bytes_total_remaining_est ||
             last->second.est_partial != f.est_partial) {
-            any = llama_vram_claim_publish(busid, f) || any;
+            llama_vram_claim_publish(busid, f);
             d.last_pub[busid] = f;
         }
         llama_vram_claim_set_bytes(busid, ds.landed); // in-place, never a rename
     }
-    return any;
 }
 
 // ---- the hold loop, decomposed ----
@@ -161,8 +159,10 @@ bool hold_bare() {
 // windows: LONG/2 qualifies a donor beat for the patience upgrade, the selected
 // window/2 gates offer counting — they differ until the upgrade lands.
 struct marker_agg {
-    bool     any_marker        = false;
-    bool     all_fresh         = true;  // every beat inside the offer window
+    uint32_t n_markers         = 0;     // live markers on the device (census: N_live = this + self)
+    bool     all_fresh         = true;  // every POTENTIAL DONOR (vbr:1) beat inside the offer
+                                        // window — a vbr:0 marker can never offer, so its
+                                        // staleness must not hold READY open
     bool     fresh_offer       = false; // ∃ fresh marker with a live offer
     uint64_t offers_fresh_sum  = 0;     // Σ shed_available over fresh offers
     uint64_t grant_pending_sum = 0;
@@ -185,9 +185,11 @@ marker_scan scan_markers_once(demander & d, const std::vector<llama_vram_peer_ma
     for (const auto & m : markers) {
         const uint64_t age = observe_hb(d, m.busid + "-" + std::to_string(m.pid), m.hb_counter, now);
         auto & agg = sc.per_dev[m.busid];
-        agg.any_marker = true;
+        agg.n_markers++;
         if (age >= offer_fresh) {
-            agg.all_fresh = false;
+            if (m.fields.vbr == 1) {
+                agg.all_fresh = false;
+            }
         } else if (m.fields.shed_available > 0) {
             agg.fresh_offer = true;
             agg.offers_fresh_sum += m.fields.shed_available;
@@ -209,7 +211,10 @@ marker_scan scan_markers_once(demander & d, const std::vector<llama_vram_peer_ma
 
 // ---- patience upgrade (sticky): a qualifying beat inside the active window ----
 void apply_patience_upgrade(demander & d, const marker_scan & sc, uint64_t now, uint64_t cap) {
-    if (d.long_window || now >= d.deadline || !sc.beat_seen) {
+    // no deadline clause: a beat landing in the final backoff round must still upgrade
+    // (spec: scan before expiry-check) — commit-at-expiry would otherwise be instantly
+    // terminal before the donor ever gets to act
+    if (d.long_window || !sc.beat_seen) {
         return;
     }
     d.long_window = true;
@@ -237,14 +242,17 @@ bool grant_progress_seen(const demander & d, const marker_scan & sc) {
 bool dev_ready(const dev_state & s, const std::string & busid, const marker_scan & sc) {
     const uint64_t free_b = dev_free(s.dev);
     const uint64_t need   = est_remaining(s);
-    if (free_b >= need + llama_vram_headroom_bytes()) {
+    const auto ita = sc.per_dev.find(busid);
+    const uint64_t headroom_eff = llama_vram_headroom_bytes() *
+        (1 + (ita != sc.per_dev.end() ? ita->second.n_markers : 0));
+    if (free_b >= need + headroom_eff) {
         return true; // free covers
     }
     const auto it = sc.per_dev.find(busid);
     if (it == sc.per_dev.end()) {
         return false; // offers needed, no markers at all
     }
-    return it->second.fresh_offer || (it->second.any_marker && it->second.all_fresh);
+    return it->second.fresh_offer || it->second.all_fresh;
 }
 
 // joint sufficiency across the demanded set — logs every falling-short device
@@ -257,7 +265,8 @@ bool jointly_sufficient(const demander & d, const marker_scan & sc) {
         const auto it = sc.per_dev.find(b);
         const uint64_t offers   = it != sc.per_dev.end() ? it->second.offers_fresh_sum : 0;
         const uint64_t free_b   = dev_free(s.dev);
-        const uint64_t headroom = llama_vram_headroom_bytes();
+        const uint64_t headroom = llama_vram_headroom_bytes() *
+            (1 + (it != sc.per_dev.end() ? it->second.n_markers : 0));
         const uint64_t have     = offers + (free_b > headroom ? free_b - headroom : 0);
         if (have < est_remaining(s)) {
             LLAMA_LOG_WARN("vram-demand: device %s insufficient even with offers "
