@@ -1304,7 +1304,11 @@ llama_kv_cache::llama_kv_cache(
                     t8_band_end_++;
                 }
             }
-            vbr_floor_typed_ = vbr_params_.min_bits_explicit || getenv("VBR_MIN_BITS") != nullptr;
+            // consent comes ONLY from the typed flag (or its documented LLAMA_ARG env,
+            // which sets min_bits_explicit through the arg handler) — the raw VBR_MIN_BITS
+            // developer override still moves the floor VALUE but never grants peer-yield
+            // consent (bare presence of a debug env must not consent to sub-t8 loss)
+            vbr_floor_typed_ = vbr_params_.min_bits_explicit;
             LLAMA_LOG_INFO("%s: co-tenancy: f16->t8 band = %zu of %zu order steps%s%s\n",
                     __func__, t8_band_end_, vbr_degrade_order_.size(),
                     t8_band_end_ == 0 ? " (demand shedding disabled)" : "",
@@ -4115,8 +4119,9 @@ llama_memory_vbr_state_data llama_kv_cache::memory_vbr_state(llama_seq_id seq_id
     return st;
 }
 
-// co-tenancy: the marker-published donation offer. Walks the REMAINING f16->t8 band
-// [cursor, min(limit, t8_band_end_)) with the same skip rules as vbr_degrade_next and sums,
+// co-tenancy: the marker-published donation offer. Walks the REMAINING consent window
+// [cursor, vbr_demand_limit()) — the f16->t8 band, or down to a TYPED floor — with the
+// same skip rules as vbr_degrade_next and sums,
 // per pool, the page-padded bytes the full band would free at the current watermark — then
 // subtracts the projected GROWTH of the #88 f16 dequant scratch those sheds would cost.
 // The scratch projection uses the max-row shape of vbr_scratch_reserve (the widest
@@ -4147,7 +4152,8 @@ size_t llama_kv_cache::vbr_shed_available(int device) const {
             }
         }
         std::vector<int64_t> freed(vbr_pools_.size(), 0);
-        for (size_t i = vbr_degrade_cursor_; i < vbr_demand_limit(); ++i) {
+        const size_t demand_limit = vbr_demand_limit();
+        for (size_t i = vbr_degrade_cursor_; i < demand_limit; ++i) {
             const auto & stp = vbr_degrade_order_[i];
             const auto it = map_layer_ids.find(stp.il);
             if (it == map_layer_ids.end()) {
@@ -4210,7 +4216,7 @@ size_t llama_kv_cache::vbr_shed_available(int device) const {
             dbg_total += s;
         }
         LLAMA_LOG_DEBUG("%s: recompute: band [%zu, %zu) wm %u -> %.1f MiB offerable\n",
-                __func__, vbr_degrade_cursor_, vbr_demand_limit(),
+                __func__, vbr_degrade_cursor_, demand_limit,
                 wm_key, dbg_total/1048576.0);
     }
     size_t total = 0;

@@ -1236,6 +1236,7 @@ struct cmd_params_instance {
     uint32_t           fit_min_ctx;
     bool               vbr;
     double             vbr_min_bits;
+    bool               vbr_min_bits_explicit;
     uint64_t           vbr_budget_bytes;
     bool               vbr_budget_explicit;
 
@@ -1324,6 +1325,7 @@ struct cmd_params_instance {
             cparams.type_v                = GGML_TYPE_F16;
             cparams.vbr_dynamic           = true;
             cparams.vbr_min_bits          = vbr_min_bits;
+            cparams.vbr_min_bits_explicit = vbr_min_bits_explicit;
             cparams.vbr_vram_budget_bytes = vbr_budget_bytes;
             cparams.vbr_budget_explicit   = vbr_budget_explicit;
         }
@@ -1341,6 +1343,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     // canonical parser (shared with the CLI): "auto" -> 0, size specs -> bytes; explicit == a real cap.
     const uint64_t vbr_budget_bytes    = params.vbr ? common_vbr_vram_bytes(params.vbr_vram) : 0;
     const bool     vbr_budget_explicit = vbr_budget_bytes != 0;
+    const bool     vbr_min_bits_explicit = params.vbr && params.vbr_floor != "auto";
 
     // this ordering minimizes the number of times that each model needs to be reloaded
     // clang-format off
@@ -1405,6 +1408,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit_min_ctx  = */ fpc,
                 /* .vbr          = */ params.vbr,
                 /* .vbr_min_bits = */ vbr_min_bits,
+                /* .vbr_min_bits_explicit = */ vbr_min_bits_explicit,
                 /* .vbr_budget_bytes    = */ vbr_budget_bytes,
                 /* .vbr_budget_explicit = */ vbr_budget_explicit,
             };
@@ -1446,6 +1450,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit_min_ctx  = */ fpc,
                 /* .vbr          = */ params.vbr,
                 /* .vbr_min_bits = */ vbr_min_bits,
+                /* .vbr_min_bits_explicit = */ vbr_min_bits_explicit,
                 /* .vbr_budget_bytes    = */ vbr_budget_bytes,
                 /* .vbr_budget_explicit = */ vbr_budget_explicit,
             };
@@ -1487,6 +1492,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit_min_ctx  = */ fpc,
                 /* .vbr          = */ params.vbr,
                 /* .vbr_min_bits = */ vbr_min_bits,
+                /* .vbr_min_bits_explicit = */ vbr_min_bits_explicit,
                 /* .vbr_budget_bytes    = */ vbr_budget_bytes,
                 /* .vbr_budget_explicit = */ vbr_budget_explicit,
             };

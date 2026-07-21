@@ -56,7 +56,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         uint32_t & hp_n_expert,
         ggml_log_level log_level,
         common_vbr_fit_costs * vbr_costs = nullptr,
-        bool plan_hint = true) {
+        bool plan_hint = false) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -180,28 +180,30 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     }
 
     // co-tenancy plan hint: this process intends to allocate model+context+compute on each
-    // device. Every non-probe fit measurement overwrites the previous hint, so the LAST
-    // one — the winning branch's configuration — is what a held demand later publishes as
-    // its joint cross-device estimate. Tiny-ctx probes pass plan_hint=false: their numbers
-    // would understate the real load. Meta devices (SPLIT_MODE_TENSOR) split evenly across
-    // their simple devices, matching the shard rotation's balanced layout.
-    for (size_t i = 0; plan_hint && i < nd; i++) {
-        ggml_backend_dev_t dev = llama_model_get_device(model, i);
-        const uint64_t planned = ret[i].mb.model + ret[i].mb.context + ret[i].mb.compute;
-        if (ggml_backend_dev_is_meta(dev)) {
-            const size_t n_simple = ggml_backend_meta_dev_n_devs(dev);
-            for (size_t j = 0; j < n_simple; j++) {
-                ggml_backend_dev_props props;
-                ggml_backend_dev_get_props(ggml_backend_meta_dev_simple_dev(dev, j), &props);
-                if (props.device_id != nullptr) {
-                    llama_vram_plan_hint(props.device_id, planned / n_simple);
-                }
-            }
-        } else {
+    // device, published as a held demand's joint cross-device estimate. plan_hint defaults
+    // FALSE so a forgotten tag fails toward the designed no-hint/est_partial fallback —
+    // only the requested-full-configuration measurement is tagged (a hint that lies is
+    // worse than none: it carries a one-revision fuse). When the fit later shrinks the
+    // config the standing hint overstates; the satisfied phase caps the harm. Meta devices
+    // (SPLIT_MODE_TENSOR) split evenly, matching the shard rotation's balanced layout.
+    if (plan_hint) {
+        auto hint = [](ggml_backend_dev_t d, uint64_t bytes) {
             ggml_backend_dev_props props;
-            ggml_backend_dev_get_props(dev, &props);
+            ggml_backend_dev_get_props(d, &props);
             if (props.device_id != nullptr) {
-                llama_vram_plan_hint(props.device_id, planned);
+                llama_vram_plan_hint(props.device_id, bytes);
+            }
+        };
+        for (size_t i = 0; i < nd; i++) {
+            ggml_backend_dev_t dev = llama_model_get_device(model, i);
+            const uint64_t planned = ret[i].mb.model + ret[i].mb.context + ret[i].mb.compute;
+            if (ggml_backend_dev_is_meta(dev)) {
+                const size_t n_simple = ggml_backend_meta_dev_n_devs(dev);
+                for (size_t j = 0; j < n_simple; j++) {
+                    hint(ggml_backend_meta_dev_simple_dev(dev, j), planned / n_simple);
+                }
+            } else {
+                hint(dev, planned);
             }
         }
     }
@@ -273,7 +275,7 @@ static void common_params_fit_impl(
     vbr_costs.entry_k = type_k_entry;
     vbr_costs.entry_v = type_v_entry;
     const dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level,
-            cparams->vbr_dynamic ? &vbr_costs : nullptr);
+            cparams->vbr_dynamic ? &vbr_costs : nullptr, /*plan_hint=*/true);
     const size_t nd = devs.size(); // number of devices
 
     // dynamic VBR: measured dry-load KV bytes are PRICE-tier-priced (largest tier <= the floor)
@@ -533,7 +535,7 @@ static void common_params_fit_impl(
         }
 
         cparams->n_ctx = n_ctx_probe;
-        const dmds_t dmds_probe = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level, nullptr, /*plan_hint=*/false);
+        const dmds_t dmds_probe = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
         cparams->n_ctx = 0;
 
         const int64_t ctx_probe = (int64_t) ((double) sum_context_kv_bytes(dmds_probe) * vbr_kv_scale);
@@ -568,7 +570,7 @@ static void common_params_fit_impl(
         }
 
         cparams->n_ctx = n_ctx_probe;
-        const dmds_t dmds_probe = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level, nullptr, /*plan_hint=*/false);
+        const dmds_t dmds_probe = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
         cparams->n_ctx = 0;
 
         uint64_t n_ctx_est = std::numeric_limits<uint64_t>::max();
@@ -758,7 +760,7 @@ static void common_params_fit_impl(
 
                     int64_t sum_projected_used_min_ctx = 0;
                     cparams->n_ctx = n_ctx_min;
-                    const dmds_t dmds_min_ctx = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level, nullptr, /*plan_hint=*/false);
+                    const dmds_t dmds_min_ctx = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
                     if (nd == 0) {
                         sum_projected_used_min_ctx = dmds_min_ctx.back().mb.total();
                     } else {

@@ -2235,12 +2235,12 @@ private:
             }
         }
 
-        // co-tenancy: init-time decodes end HERE. Everything above (common warmup,
-        // speculative compat probes, template detection) is not real traffic and must not
-        // fire claim-complete — a held demand's claim survives to the first real request.
-        // The warmup flag is the existing "this decode isn't real" state; the true bracket
-        // opened in common_init_from_params, and any init probe that flipped it off gets
-        // re-covered by closing it only now.
+        // co-tenancy: init-time decodes end HERE — this closes the bracket opened right
+        // after context creation (common's own warmup bracket already closed inside
+        // common_init_from_params). Everything above (speculative compat probes, template
+        // detection) is not real traffic and must not fire claim-complete: a held demand's
+        // claim survives to the first real request. INVARIANT: no callee between the two
+        // brackets may self-manage warmup on ctx_tgt (drafter code brackets ctx_dft only).
         llama_set_warmup(ctx_tgt, false);
 
         return true;
