@@ -8,12 +8,13 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-// 2: fork op enum (tree ops + TURBO_WHT) diverges from stock upstream 4.0.1 wire ordering —
-//    advertising 4.0.1 would false-match a stock rpc-server; fork-to-fork RPC only.
-#define RPC_PROTO_PATCH_VERSION    2
+// 4: fork op enum (tree ops + TURBO_WHT) diverges from stock upstream wire ordering —
+//    stock patch version is 3; the fork must advertise a different patch version so a
+//    fork client can't false-match a stock rpc-server; fork-to-fork RPC only.
+#define RPC_PROTO_PATCH_VERSION    4
 
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16

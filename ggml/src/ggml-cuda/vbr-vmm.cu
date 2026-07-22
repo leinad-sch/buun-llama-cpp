@@ -75,7 +75,10 @@ bool ggml_backend_cuda_vmm_pool_map(ggml_vbr_vmm_pool * pool, size_t off, size_t
         CUmemAllocationProp prop = {};
         prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
         prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        prop.location.id   = pool->device;
+        // raw driver-API device id must be PHYSICAL — under GGML_CUDA_DEVICES virtual-device
+        // emulation (#25228) pool->device is a ggml (possibly virtual) id (cuMemCreate/cuMemSetAccess
+        // don't go through ggml_cuda_set_device's translation).
+        prop.location.id   = ggml_cuda_info().devices[pool->device].physical_device;
         CUmemGenericAllocationHandle handle;
         if (cuMemCreate(&handle, g, &prop, 0) != CUDA_SUCCESS) {
             return false; // physical exhausted — caller decides (degrade / abort)
@@ -85,7 +88,7 @@ bool ggml_backend_cuda_vmm_pool_map(ggml_vbr_vmm_pool * pool, size_t off, size_t
         CU_CHECK(cuMemRelease(handle)); // physical is freed when the chunk is unmapped
         CUmemAccessDesc access = {};
         access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        access.location.id   = pool->device;
+        access.location.id   = ggml_cuda_info().devices[pool->device].physical_device;
         access.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
         CU_CHECK(cuMemSetAccess(ptr, g, &access, 1));
         // fresh pages start zeroed: same NaN-in-padding guarantee the eager buffer clear gave

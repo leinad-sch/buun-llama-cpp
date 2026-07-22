@@ -111,6 +111,11 @@ export interface ChatStreamCallbacks {
 		content: string,
 		extras?: DatabaseMessageExtra[]
 	) => Promise<DatabaseMessage>;
+	updateToolResultMessage?: (
+		messageId: string,
+		content: string,
+		extras?: DatabaseMessageExtra[]
+	) => Promise<void>;
 	createAssistantMessage?: () => Promise<DatabaseMessage>;
 	onFlowComplete?: (timings?: ChatMessageTimings) => void;
 	onError?: (error: Error) => void;
