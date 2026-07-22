@@ -247,7 +247,11 @@ llama_context::llama_context(
     // the owner's tier flips via the delegated tier epoch (llama_kv_cache::vbr_tier_epoch).
     // Running a second controller in the drafter would double-manage the same pool (and the
     // kv-cache ctor rejects an armed VBR on a share-linked cache), so disarm it here.
-    if (cparams.ctx_other != nullptr &&
+    // An MTP self-draft carries its own extra (nextn) KV layer but shares the target's
+    // backbone KV; running a second VBR controller on that 1-layer cache is pointless and
+    // warns "no measured order". Disarm it (its layer stays static) WITHOUT wiring ctx_other
+    // memory sharing here — that rewires the draft's KV view and hurts acceptance.
+    if ((cparams.ctx_other != nullptr || cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) &&
             (cparams.vbr_dynamic || cparams.vbr_vram_budget_bytes > 0 || cparams.vbr_min_bits > 0.0)) {
         LLAMA_LOG_INFO("%s: shared-KV drafter: VBR is managed by the target context — "
                 "disarming the drafter's own VBR controller (shared layers follow the "
