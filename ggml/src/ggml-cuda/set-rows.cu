@@ -712,6 +712,8 @@ static void load_ragged_content_mask(int device) {
             device, n_windows, n_ctx, path);
 }
 
+extern "C" void ggml_cuda_ragged_set_window(int window);
+
 // Host setter: select the active content-mask window (= KLD chunk index).
 // Called from the perplexity chunk loop. No-op if no mask is loaded.
 extern "C" void ggml_cuda_ragged_set_window(int window) {
