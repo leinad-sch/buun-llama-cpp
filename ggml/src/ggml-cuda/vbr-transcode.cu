@@ -104,8 +104,8 @@ static void vbr_fidelity_report(const char * name, ggml_type tA, ggml_type tB,
 // stream is ordered behind this one's kernels, so that is safe by construction.
 // NOTE: assumes decode-side InnerQ (d_innerq_channel_scale_inv_fattn) is already identity/calibrated
 // from prior decode (true in the live decode-time path).
-void ggml_cuda_vbr_kv_transcode(ggml_backend_cuda_context & ctx,
-                                const ggml_vbr_transcode_params * p) {
+static void ggml_cuda_vbr_kv_transcode(ggml_backend_cuda_context & ctx,
+                                       const ggml_vbr_transcode_params * p) {
     ggml_cuda_set_device(ctx.device); // multi-GPU waves interleave devices; never rely on the caller
     cudaStream_t stream = ctx.stream();
     const ggml_tensor * src_A      = p->src;
