@@ -2366,7 +2366,21 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         // under GGML_TURBO_DECODE_NATIVE so we never route them to an unregistered VEC template.
         const bool turbo8_involved = K->type == GGML_TYPE_TURBO8_0 || V->type == GGML_TYPE_TURBO8_0 ||
                                      K->type == GGML_TYPE_TURBO1_TCQ || V->type == GGML_TYPE_TURBO1_TCQ;
-        const bool do_decode_dequant = (!turbo_decode_native || turbo8_involved) && turbo_kv && (Q->ne[0] <= 256 || (Q->ne[0] <= 512 && both_dequantable_512));
+        // Pre-Volta NVIDIA (sm_60/sm_61) has no working quantized-V vector FA kernel at decode:
+        // flash_attn_ext_vec's cpy_ne=2 / nthreads_KQ=16 K/Q layout runs on no other arch and
+        // produces garbage on sm_60 (the V=q8_0 arithmetic is identical to sm_86, which is fine —
+        // the defect is that untested layout). Route plain q8_0/bf16 K/V through the same
+        // dequant-to-f16 -> TILE path that turbo already uses (proven alive on sm_60), just as we
+        // do for D>256. q8_0/bf16 only: they have dequant kernels below; q4_* still hit VEC (TODO).
+        const int  cc_dec             = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        const bool pre_volta_nv       = GGML_CUDA_CC_IS_NVIDIA(cc_dec) && cc_dec < GGML_CUDA_CC_VOLTA;
+        const bool quant_kv_pre_volta = pre_volta_nv && Q->ne[0] <= 256 &&
+            (K->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q8_0 ||
+             K->type == GGML_TYPE_BF16 || V->type == GGML_TYPE_BF16);
+        const bool do_decode_dequant =
+            ((!turbo_decode_native || turbo8_involved) && turbo_kv &&
+             (Q->ne[0] <= 256 || (Q->ne[0] <= 512 && both_dequantable_512)))
+            || quant_kv_pre_volta;
 
         half * k_fp16_dec = nullptr;
         half * v_fp16_dec = nullptr;
@@ -2387,8 +2401,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             bool mat_k_dec = false;
             bool mat_v_dec = false;
             ggml_vbr_kv_dequant_sides(K->type, V->type, &mat_k_dec, &mat_v_dec);
-            const bool k_needs_dequant = mat_k_dec || ((K->type == GGML_TYPE_Q8_0 || K->type == GGML_TYPE_BF16) && Q->ne[0] > 256);
-            const bool v_needs_dequant = mat_v_dec || ((V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_BF16) && Q->ne[0] > 256);
+            const bool k_needs_dequant = mat_k_dec || ((K->type == GGML_TYPE_Q8_0 || K->type == GGML_TYPE_BF16) && (Q->ne[0] > 256 || quant_kv_pre_volta));
+            const bool v_needs_dequant = mat_v_dec || ((V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_BF16) && (Q->ne[0] > 256 || quant_kv_pre_volta));
             if (k_needs_dequant) {
                 // Size for the CURRENT attended KV range (this call's view) — NOT the full
                 // root/kv_size capacity. The dequant kernel below writes exactly K->ne[1] rows and
