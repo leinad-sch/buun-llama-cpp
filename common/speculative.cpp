@@ -3940,7 +3940,12 @@ common_speculative * common_speculative_init(
         llama_context             * ctx_dft_shared) {
     const bool owns_ctx_dft = (ctx_dft_shared == nullptr);
     llama_context * ctx_dft = ctx_dft_shared;
-    if (ctx_dft == nullptr && params.model_dft) {
+    // Only DFlash consumes this per-slot draft context (see the config loop below). Creating it
+    // for other separate-model drafters is redundant AND crashes: a bare MTP-head draft model has
+    // no trunk weights, so building its (DEFAULT-typed) full-trunk graph derefs a null wqkv in
+    // graph_reserve. draft-mtp speculates through the member MTP context (ctx_type == MTP) wired up
+    // at load, not this one, so skip the creation unless DFlash will actually use it.
+    if (ctx_dft == nullptr && params.model_dft && params.has_type(COMMON_SPECULATIVE_TYPE_DFLASH)) {
         ctx_dft = common_speculative_create_ctx_dft(params);
     }
 
@@ -4017,7 +4022,13 @@ common_speculative * common_speculative_init(
     }
 
     if (impls.empty()) {
-        LOG_WRN("%s", "no implementations specified for speculative decoding\n");
+        // Upstream self-speculation (draft-mtp) is driven by the shared member context set up at
+        // load and consumed via slot.spec_shared, not by a per-slot implementation — so an empty
+        // per-slot impl set is the expected path there, not a misconfiguration. Only warn when a
+        // per-slot (fork-type) drafter was requested and yielded nothing.
+        if (!params.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP)) {
+            LOG_WRN("%s", "no implementations specified for speculative decoding\n");
+        }
         return nullptr;
     }
 
