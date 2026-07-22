@@ -261,13 +261,18 @@ if (CUDAToolkit_FOUND)
 
     if (NOT MSVC)
         list(APPEND CUDA_CXX_FLAGS -Wno-pedantic)
+        # Fix for R_X86_64_PC32 against '.bss' relocation truncated error
+        # when building shared libraries with large CUDA template instantiations on Linux x86_64
+        if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
+            list(APPEND CUDA_CXX_FLAGS -mcmodel=medium)
+        endif()
     else()
         # CCCL 3.2 onwards will require a cpp-standard-compliant preprocessor for MSVC
         # https://github.com/NVIDIA/cccl/pull/6827
         list(APPEND CUDA_CXX_FLAGS /Zc:preprocessor)
     endif()
 
-    list(JOIN   CUDA_CXX_FLAGS " " CUDA_CXX_FLAGS_JOINED)  # pass host compiler flags as a single argument
+    list(JOIN   CUDA_CXX_FLAGS " " CUDA_CXX_FLAGS_JOINED)   # pass host compiler flags as a single argument (for other uses)
 
     if (NOT CUDA_CXX_FLAGS_JOINED STREQUAL "")
         list(APPEND CUDA_FLAGS -Xcompiler ${CUDA_CXX_FLAGS_JOINED})
